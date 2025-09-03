@@ -10,7 +10,7 @@ on:
       full_build:
         description: 'Run full iOS build (downloads Qt, compiles sysroot; long)'
         type: boolean
-        default: false
+        default: true
       xcode:
         description: 'Optional Xcode version (e.g. "16.4")'
         type: string
@@ -79,7 +79,7 @@ jobs:
     name: Full iOS build (manual or “[full-ios]”)
     if: >-
       ${{
-        (github.event_name == 'workflow_dispatch' && fromJson(inputs.full_build || 'true')) ||
+        (github.event_name == 'workflow_dispatch' && fromJson(inputs.full_build || 'false')) ||
         (github.event_name != 'workflow_dispatch' && contains(github.event.head_commit.message || '', '[full-ios]'))
       }}
     runs-on: macos-latest
