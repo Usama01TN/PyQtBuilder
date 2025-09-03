@@ -181,7 +181,7 @@ def downloadSdist(project: str, destDir: Path, version: str = None, filenameCont
                 cand = (u["url"], u["filename"])
                 break
     if not cand:
-        raise RuntimeError("Could not find sdist for {} on PyPI.".format(project))
+        print("Could not find sdist for {} on PyPI.".format(project))
     url, filename = cand
     out = destDir / filename
     if not out.exists():
@@ -438,7 +438,8 @@ def findQmakeIos(userPath, qtVer):
         qp = Path(userPath).expanduser().resolve()
         if qp.exists():
             return qp
-        raise FileNotFoundError("--qt-ios-qmake path not found: {}".format(qp))
+        print("--qt-ios-qmake path not found: {}".format(qp))
+        
     # Try common locations
     candidates = [
         Path.home() / "Qt/{}/ios/bin/qmake".format(qtVer),
@@ -452,7 +453,7 @@ def findQmakeIos(userPath, qtVer):
     w = which_("qmake")
     if w:
         return w
-    raise FileNotFoundError("Could not locate iOS qmake. Provide --qt-ios-qmake.")
+    print("Could not locate iOS qmake. Provide --qt-ios-qmake.")
 
 
 def verifyHost():
@@ -460,11 +461,11 @@ def verifyHost():
     :return:
     """
     if not platform.lower().startswith(('darwin', 'mac')):
-        raise RuntimeError("This script must be run on macOS.")
+        print("This script must be run on macOS.")
     try:
         check_output(["xcode-select", "-p"])
     except Exception:
-        raise RuntimeError("Xcode Command Line Tools not found. Install Xcode + CLT first.")
+        print("Xcode Command Line Tools not found. Install Xcode + CLT first.")
 
 
 def main():
@@ -510,7 +511,7 @@ def main():
         # Some versions place it under 'examples/demo'
         demo_src = extracted / "examples" / "demo"
     if not demo_src.exists():
-        raise RuntimeError("Could not locate 'demo' folder inside pyqtdeploy source.")
+        print("Could not locate 'demo' folder inside pyqtdeploy source.")
     if demo_root.exists():
         print("Clearing existing demo dir…")
         rmtree(demo_root)
@@ -528,7 +529,7 @@ def main():
     # 5) sysroot.toml edits
     sysroot_toml = demo_root / "sysroot.toml"
     if not sysroot_toml.exists():
-        raise RuntimeError("{} not found in demo.".format(sysroot_toml))
+       print("{} not found in demo.".format(sysroot_toml))
     tweakSysrootToml(sysroot_toml, args.pyqt_version, args.qt_version)
     # 6) demo py patch (avoid get_source_code crash)
     demoPy = demo_root / "pyqt-demo.py"
@@ -538,12 +539,12 @@ def main():
     if args.app_entry:
         appEntry = Path(args.app_entry)
         if not appEntry.exists():
-            raise FileNotFoundError("--app-entry not found: {}".format(appEntry))
+            print("--app-entry not found: {}".format(appEntry))
         swapInUserApp(demo_root, appEntry)
     # 8) Build with build-demo.py
     buildScript = demo_root / "build-demo.py"
     if not buildScript.exists():
-        raise RuntimeError("build-demo.py not found in demo.")
+        print("build-demo.py not found in demo.")
     print("\nStarting pyqtdeploy build for iOS (this will take time)…\n")
     cmd = [
         sys.executable, str(buildScript),
@@ -569,6 +570,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[ERROR]", e)
         sys.exit(1)
+
 
 
 
