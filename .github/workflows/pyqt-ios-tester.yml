@@ -77,11 +77,6 @@ jobs:
 
   ios-full-build:
     name: Full iOS build (manual or “[full-ios]”)
-    if: >-
-      ${{
-        (github.event_name == 'workflow_dispatch' && fromJson(inputs.full_build || 'false')) ||
-        (github.event_name != 'workflow_dispatch' && contains(github.event.head_commit.message || '', '[full-ios]'))
-      }}
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
