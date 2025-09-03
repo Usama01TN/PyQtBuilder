@@ -37,11 +37,7 @@ from pathlib import Path
 from tarfile import open
 from json import loads
 import sys
-
-try:
-    from urllib.request import urlopen, urlretrieve
-except:
-    from urllib import urlopen, urlretrieve
+from urllib.request import urlopen, urlretrieve
 
 
 # --------------------------- utilities ---------------------------
@@ -562,3 +558,4 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[ERROR]", e)
         sys.exit(1)
+
