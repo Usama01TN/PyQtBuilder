@@ -139,3 +139,9 @@ jobs:
         with:
           name: pyqt-ios-xcodeproj
           path: ${{ steps.findproj.outputs.proj }}
+
+      - name: Debug dispatch inputs
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "full_build(raw)=${{ github.event.inputs.full_build }}"
+          echo "full_build(bool)=${{ fromJson(github.event.inputs.full_build || 'false') }}"
