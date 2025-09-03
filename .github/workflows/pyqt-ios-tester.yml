@@ -102,7 +102,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'   # no cache
+          python-version: '3.12'
 
       - name: Create tiny app entry (for build)
         run: |
@@ -118,24 +118,38 @@ jobs:
         shell: bash
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
-          ac_cv_func_getentropy: 'no'             # <-- Force CPython configure result
+          # Belt-and-suspenders: force CPython probes for cross-compile
+          ac_cv_func_getentropy: 'no'
+          ac_cv_func_getrandom: 'no'
+          ac_cv_func_openpty: 'no'
+          ac_cv_func_futimens: 'no'
+          ac_cv_func_utimensat: 'no'
           CFLAGS: '-Wno-implicit-function-declaration'
           CFLAGS_NODIST: '-Wno-implicit-function-declaration'
         run: |
+          set -euo pipefail
           "${{ env.pythonLocation }}/bin/python" -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
+          LOGDIR="$RUNNER_TEMP/pyqt_ios_build"
+          mkdir -p "$LOGDIR"
+          echo "Interpreter: $(which python)"
+          # Tee everything to a log so any non-zero exit has full context
           python build_pyqt_ios.py \
             --qt-ios-qmake "$(which qmake)" \
             --qt-version "${{ env.QT_VER }}" \
             --pyqt-version "5.15.11" \
-            --workdir "$RUNNER_TEMP/pyqt_ios_build" \
-            --app-entry "tests/smoke_app.py"
+            --python-version "3.11.9" \
+            --workdir "$LOGDIR" \
+            --app-entry "tests/smoke_app.py" \
+            2>&1 | tee "$LOGDIR/full-build.log"
+          # Keep path available for next step
+          echo "LOGDIR=$LOGDIR" >> "$GITHUB_ENV"
 
       - name: Locate Xcode project (if produced)
         id: findproj
         run: |
-          PROJ="$RUNNER_TEMP/pyqt_ios_build/demo/build-ios-64/pyqt-demo.xcodeproj"
+          PROJ="${{ env.LOGDIR }}/demo/build-ios-64/pyqt-demo.xcodeproj"
           if [ -d "$PROJ" ]; then echo "proj=$PROJ" >> "$GITHUB_OUTPUT"; fi
 
       - name: Upload Xcode project artifact
@@ -144,3 +158,11 @@ jobs:
         with:
           name: pyqt-ios-xcodeproj
           path: ${{ steps.findproj.outputs.proj }}
+
+      - name: Upload full build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyqtdeploy-full-build-log
+          path: ${{ env.LOGDIR }}/full-build.log
+          if-no-files-found: warn
