@@ -49,27 +49,23 @@ jobs:
         run: python build_pyqt_ios.py --help
 
   mac-smoke:
-    name: macOS smoke (qmake & script utilities)
     runs-on: macos-latest
     timeout-minutes: 20
-    env:
-      QT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.qt_version || '5.15.18' }}
-      XCODE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.xcode || '' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: (Optional) Select Xcode
-        if: ${{ env.XCODE_VERSION != '' }}
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: ${{ env.XCODE_VERSION }}
-
-      - name: Install Qt (iOS)
+      - name: Install Qt (iOS) – OSS 5.15.2
+        id: qt_oss
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ env.QT_VERSION }}
+          version: '5.15.2'   # <— change from 5.15.18
           target: ios
           cache: true
+
+      - name: Detect installed Qt version
+        run: |
+          echo "QT_VER=$(qmake -query QT_VERSION)" >> "$GITHUB_ENV"
+          qmake -v
 
       - uses: actions/setup-python@v5
         with:
@@ -79,43 +75,39 @@ jobs:
       - name: Validate environment (qmake + script utilities)
         shell: bash
         run: |
-          which qmake
-          qmake -v
           python - <<'PY'
-          import importlib.util, pathlib
+          import importlib.util, pathlib, os
           p = pathlib.Path('build_pyqt_ios.py').resolve()
           spec = importlib.util.spec_from_file_location('build_pyqt_ios', p)
           m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-          # Exercise light-weight functions without starting a full build:
           print('verifyHost()…'); m.verifyHost()
-          print('findQmakeIos()…', m.findQmakeIos(None, '${{ env.QT_VERSION }}'))
+          print('findQmakeIos()…', m.findQmakeIos(None, os.environ['QT_VER']))
           print('OK')
           PY
 
   ios-full-build:
-    name: Full iOS build (manual)
-    # Only when launched from "Run workflow" AND toggle is enabled
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.full_build || false) }}
     runs-on: macos-latest
     timeout-minutes: 180
-    env:
-      QT_VERSION: ${{ inputs.qt_version }}
-      XCODE_VERSION: ${{ inputs.xcode }}
     steps:
       - uses: actions/checkout@v4
 
       - name: (Optional) Select Xcode
-        if: ${{ env.XCODE_VERSION != '' }}
+        if: ${{ inputs.xcode != '' }}
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: ${{ env.XCODE_VERSION }}
+          xcode-version: ${{ inputs.xcode }}
 
-      - name: Install Qt (iOS)
+      - name: Install Qt (iOS) – OSS 5.15.2
+        id: qt_oss
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ env.QT_VERSION }}
+          version: '5.15.2'   # <— change from 5.15.18
           target: ios
           cache: true
+
+      - name: Detect installed Qt version
+        run: echo "QT_VER=$(qmake -query QT_VERSION)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -126,13 +118,9 @@ jobs:
         run: |
           mkdir -p tests
           cat > tests/smoke_app.py <<'PY'
-          import sys
           from PyQt5.QtWidgets import QApplication, QLabel
-          app = QApplication(sys.argv)
-          label = QLabel("Hello from CI")
-          label.resize(320, 200)
-          label.show()
-          # No event loop needed for pyqtdeploy's entry discovery.
+          import sys
+          app = QApplication(sys.argv); QLabel("Hello from CI").show()
           PY
 
       - name: Run iOS build script (downloads & compiles)
@@ -141,7 +129,7 @@ jobs:
         run: |
           python build_pyqt_ios.py \
             --qt-ios-qmake "$(which qmake)" \
-            --qt-version "${{ env.QT_VERSION }}" \
+            --qt-version "${{ env.QT_VER }}" \
             --pyqt-version "5.15.11" \
             --workdir "$RUNNER_TEMP/pyqt_ios_build" \
             --app-entry "tests/smoke_app.py"
@@ -150,9 +138,7 @@ jobs:
         id: findproj
         run: |
           PROJ="$RUNNER_TEMP/pyqt_ios_build/demo/build-ios-64/pyqt-demo.xcodeproj"
-          if [ -d "$PROJ" ]; then
-            echo "proj=$PROJ" >> "$GITHUB_OUTPUT"
-          fi
+          if [ -d "$PROJ" ]; then echo "proj=$PROJ" >> "$GITHUB_OUTPUT"; fi
 
       - name: Upload Xcode project artifact
         if: ${{ steps.findproj.outputs.proj != '' }}
