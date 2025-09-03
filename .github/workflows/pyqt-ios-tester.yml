@@ -118,14 +118,13 @@ jobs:
         shell: bash
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
+          ac_cv_func_getentropy: 'no'             # <-- Force CPython configure result
+          CFLAGS: '-Wno-implicit-function-declaration'
+          CFLAGS_NODIST: '-Wno-implicit-function-declaration'
         run: |
-          # Use the toolcache Python to create a venv for the build
           "${{ env.pythonLocation }}/bin/python" -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
-          echo "Interpreter:"; which python
-          python -c "import sys,site; print(sys.executable); print('USER_SITE=', site.getusersitepackages()); print('PREFIX=', sys.prefix, 'BASE_PREFIX=', sys.base_prefix)"
-          # Run your script inside the venv so it installs into the venv (no --user) and can import pyqtdeploy
           python build_pyqt_ios.py \
             --qt-ios-qmake "$(which qmake)" \
             --qt-version "${{ env.QT_VER }}" \
