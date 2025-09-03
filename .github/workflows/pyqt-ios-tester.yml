@@ -49,7 +49,6 @@ jobs:
       - name: Install Qt (iOS) – OSS
         uses: jurplel/install-qt-action@v4
         with:
-          # Always provide a version (fallback on non-dispatch runs)
           version: ${{ github.event.inputs.qt_version || '5.15.2' }}
           target: ios
           cache: true
@@ -78,7 +77,6 @@ jobs:
 
   ios-full-build:
     name: Full iOS build (always)
-    # ← no `if:`—this job will not be skipped
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
@@ -93,7 +91,6 @@ jobs:
       - name: Install Qt (iOS) – OSS
         uses: jurplel/install-qt-action@v4
         with:
-          # Always provide a version (fallback on push/PR)
           version: ${{ github.event.inputs.qt_version || '5.15.2' }}
           target: ios
           cache: true
@@ -117,10 +114,18 @@ jobs:
           QLabel("Hello from CI").show()
           PY
 
-      - name: Run iOS build script (downloads & compiles)
+      - name: Run iOS build script (downloads & compiles) in isolated venv
+        shell: bash
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
         run: |
+          # Use the toolcache Python to create a venv for the build
+          "${{ env.pythonLocation }}/bin/python" -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          echo "Interpreter:"; which python
+          python -c "import sys,site; print(sys.executable); print('USER_SITE=', site.getusersitepackages()); print('PREFIX=', sys.prefix, 'BASE_PREFIX=', sys.base_prefix)"
+          # Run your script inside the venv so it installs into the venv (no --user) and can import pyqtdeploy
           python build_pyqt_ios.py \
             --qt-ios-qmake "$(which qmake)" \
             --qt-version "${{ env.QT_VER }}" \
