@@ -76,12 +76,13 @@ jobs:
           PY
 
   ios-full-build:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build == true }}
+    name: Full iOS build (manual)
+    # Run only when manually dispatched AND the toggle is on
+    if: ${{ github.event_name == 'workflow_dispatch' && fromJson(inputs.full_build || 'false') }}
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-
       - name: (Optional) Select Xcode
         if: ${{ inputs.xcode != '' }}
         uses: maxim-lobanov/setup-xcode@v1
