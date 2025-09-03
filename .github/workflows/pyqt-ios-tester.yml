@@ -49,7 +49,8 @@ jobs:
       - name: Install Qt (iOS) – OSS
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ github.event_name == 'workflow_dispatch' && inputs.qt_version || '5.15.2' }}
+          # Fallback to 5.15.2 when not a manual dispatch
+          version: ${{ github.event.inputs.qt_version || '5.15.2' }}
           target: ios
           cache: true
 
@@ -77,25 +78,35 @@ jobs:
 
   ios-full-build:
     name: Full iOS build (manual or “[full-ios]”)
+    # Run when: (A) manual dispatch with toggle ON, or (B) push/PR message contains “[full-ios]”
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && fromJson(github.event.inputs.full_build || 'true')) ||
+        (github.event_name != 'workflow_dispatch' && contains(github.event.head_commit.message || '', '[full-ios]'))
+      }}
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+
       - name: (Optional) Select Xcode
-        if: ${{ inputs.xcode != '' }}
+        if: ${{ (github.event.inputs.xcode || '') != '' }}
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: ${{ inputs.xcode }}
+          xcode-version: ${{ github.event.inputs.xcode }}
 
       - name: Install Qt (iOS) – OSS
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ inputs.qt_version }}
+          # <-- THIS fixes your error: always provide a version
+          version: ${{ github.event.inputs.qt_version || '5.15.2' }}
           target: ios
           cache: true
 
       - name: Detect installed Qt version
-        run: echo "QT_VER=$(qmake -query QT_VERSION)" >> "$GITHUB_ENV"
+        run: |
+          echo "QT_VER=$(qmake -query QT_VERSION)" >> "$GITHUB_ENV"
+          qmake -v
 
       - uses: actions/setup-python@v5
         with:
@@ -138,5 +149,7 @@ jobs:
       - name: Debug dispatch inputs
         run: |
           echo "event_name=${{ github.event_name }}"
+          echo "qt_version(input)=${{ github.event.inputs.qt_version }}"
+          echo "xcode(input)=${{ github.event.inputs.xcode }}"
           echo "full_build(raw)=${{ github.event.inputs.full_build }}"
           echo "full_build(bool)=${{ fromJson(github.event.inputs.full_build || 'false') }}"
