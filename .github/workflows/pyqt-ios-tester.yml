@@ -49,7 +49,7 @@ jobs:
       - name: Install Qt (iOS) – OSS
         uses: jurplel/install-qt-action@v4
         with:
-          # Fallback to 5.15.2 when not a manual dispatch
+          # Always provide a version (fallback on non-dispatch runs)
           version: ${{ github.event.inputs.qt_version || '5.15.2' }}
           target: ios
           cache: true
@@ -77,13 +77,8 @@ jobs:
           PY
 
   ios-full-build:
-    name: Full iOS build (manual or “[full-ios]”)
-    # Run when: (A) manual dispatch with toggle ON, or (B) push/PR message contains “[full-ios]”
-    if: >-
-      ${{
-        (github.event_name == 'workflow_dispatch' && fromJson(github.event.inputs.full_build || 'true')) ||
-        (github.event_name != 'workflow_dispatch' && contains(github.event.head_commit.message || '', '[full-ios]'))
-      }}
+    name: Full iOS build (always)
+    # ← no `if:`—this job will not be skipped
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
@@ -98,7 +93,7 @@ jobs:
       - name: Install Qt (iOS) – OSS
         uses: jurplel/install-qt-action@v4
         with:
-          # <-- THIS fixes your error: always provide a version
+          # Always provide a version (fallback on push/PR)
           version: ${{ github.event.inputs.qt_version || '5.15.2' }}
           target: ios
           cache: true
@@ -145,11 +140,3 @@ jobs:
         with:
           name: pyqt-ios-xcodeproj
           path: ${{ steps.findproj.outputs.proj }}
-
-      - name: Debug dispatch inputs
-        run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "qt_version(input)=${{ github.event.inputs.qt_version }}"
-          echo "xcode(input)=${{ github.event.inputs.xcode }}"
-          echo "full_build(raw)=${{ github.event.inputs.full_build }}"
-          echo "full_build(bool)=${{ fromJson(github.event.inputs.full_build || 'false') }}"
