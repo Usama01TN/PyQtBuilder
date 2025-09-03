@@ -264,9 +264,9 @@ def patchPythonProAddCflag(pythonPro):
     Add:
       - QMAKE_CFLAGS    += -Wno-implicit-function-declaration
       - QMAKE_CFLAGS_C  += -Wno-implicit-function-declaration
-      - CONFIGURE_ARGS  += ac_cv_func_getentropy=no
+      - CONFIGURE_ARGS  += ac_cv_func_getentropy=no ac_cv_func_getrandom=no ac_cv_func_openpty=no ac_cv_func_futimens=no ac_cv_func_utimensat=no
       - CONFIGURE_ENV   += ac_cv_func_getentropy=no
-    to steer CPython's configure away from getentropy() on iOS and
+    to steer CPython's configure away from problematic probes on iOS and
     make Clang ignore any stray implicit-decl diagnostics for C files.
     """
     print("Patching CFLAGS & configure args in {} …".format(pythonPro))
@@ -276,18 +276,16 @@ def patchPythonProAddCflag(pythonPro):
     def ensure_line(txt, needle):
         if needle in txt:
             return txt
-        # Insert near an existing QMAKE_ line if possible; else append.
+        # insert near existing QMAKE_* lines when possible; else append
         return idempotentInsertUnique(txt, needle, r"(^\s*QMAKE_.*$)")
 
     text = ensure_line(text, "QMAKE_CFLAGS += -Wno-implicit-function-declaration")
     text = ensure_line(text, "QMAKE_CFLAGS_C += -Wno-implicit-function-declaration")
-    # Work around CPython getentropy() mis-detection when cross-compiling for iOS
-    text = ensure_line(text, "CONFIGURE_ARGS += ac_cv_func_getentropy=no")
+    text = ensure_line(text, "CONFIGURE_ARGS += ac_cv_func_getentropy=no ac_cv_func_getrandom=no ac_cv_func_openpty=no ac_cv_func_futimens=no ac_cv_func_utimensat=no")
     text = ensure_line(text, "CONFIGURE_ENV += ac_cv_func_getentropy=no")
 
     writeText(pythonPro, text)
     print("  ✓ python.pro patched with getentropy workaround & CFLAGS.")
-
 
 def patchSipCaseInsensitiveGlob(sipPy: Path):
     """
@@ -338,48 +336,52 @@ def patchSipCaseInsensitiveGlob(sipPy: Path):
 
 # --------------------------- sysroot.toml & demo patching ---------------------------
 
-def tweakSysrootToml(sysrootToml: Path, pyqtVer: str, qtVer: str):
+def tweakSysrootToml(sysrootToml: Path, pyqtVer: str, qtVer: str, pythonVer: str | None = None):
     """
     - Set PyQt5 version to pyqtVer
     - Set Qt version to qtVer
+    - Optionally set Python version to pythonVer
     - Comment every line from first 'PyQt3D' occurrence through first 'QScintilla' occurrence
     """
     print("Editing {} …".format(sysrootToml.name))
     backupOnce(sysrootToml)
-    lines = readText(sysrootToml).splitlines()  # type: list[str]
+    lines = readText(sysrootToml).splitlines()
 
-    # normalize simple key = "value" lines
     def replVersion(lines, key, value):
+        from re import compile, escape
         pattern = compile(r'^(\s*{}\s*=\s*)["\']?([^"\']*)["\']?\s*$'.format(escape(key)))
-        out = []
-        done = False
+        out, done = [], False
         for ln in lines:
             m = pattern.match(ln)
-            if m:
-                out.append('{}"{}"'.format(m.group(1), value))
-                done = True
-            else:
-                out.append(ln)
-        return out, done
+            out.append('{}"{}"'.format(m.group(1), value) if m else ln)
+            done = done or bool(m)
+        if not done:
+            out.append('{} = "{}"'.format(key, value))
+        return out
 
-    lines, _ = replVersion(lines, "PyQt", pyqtVer)  # Some demos use "PyQt" key
-    lines, _ = replVersion(lines, "PyQt5", pyqtVer)  # others may use "PyQt5"
-    lines, _ = replVersion(lines, "Qt", qtVer)
-    # Comment block from PyQt3D through QScintilla (inclusive)
+    lines = replVersion(lines, "PyQt", pyqtVer)
+    lines = replVersion(lines, "PyQt5", pyqtVer)
+    lines = replVersion(lines, "Qt", qtVer)
+    if pythonVer:
+        lines = replVersion(lines, "Python", pythonVer)
+
+    # comment block from PyQt3D to QScintilla (inclusive)
     startI = endI = None
+    from re import search as _s
     for i, ln in enumerate(lines):
-        if startI is None and search(r"\bPyQt3D\b", ln):
+        if startI is None and _s(r"\bPyQt3D\b", ln):
             startI = i
-        if startI is not None and search(r"\bQScintilla\b", ln):
+        if startI is not None and _s(r"\bQScintilla\b", ln):
             endI = i
             break
     if startI is not None and endI is not None:
         for i in range(startI, endI + 1):
             if not lines[i].lstrip().startswith("#"):
                 lines[i] = "# " + lines[i]
-    writeText(sysrootToml, "\n".join(lines) + "\n")
-    print("  ✓ sysroot.toml updated (PyQt, Qt versions, modules trimmed).")
 
+    writeText(sysrootToml, "\n".join(lines) + "\n")
+    print("  ✓ sysroot.toml updated (PyQt, Qt, {}modules trimmed{}).".format(
+        "" if not pythonVer else "Python set, ", ""))
 
 def patchDemoPy(demoPy: Path):
     """
@@ -567,5 +569,6 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[ERROR]", e)
         sys.exit(1)
+
 
 
