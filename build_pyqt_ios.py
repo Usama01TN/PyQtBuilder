@@ -261,23 +261,32 @@ def patchPlatformsArm64(platformsPy: Path):
 
 def patchPythonProAddCflag(pythonPro):
     """
-    Add: QMAKE_CFLAGS += -Wno-implicit-function-declaration
-    to fix getentropy implicit declaration error during Python build.
-    :param pythonPro: str | unicode
-    :return: None
+    Add:
+      - QMAKE_CFLAGS    += -Wno-implicit-function-declaration
+      - QMAKE_CFLAGS_C  += -Wno-implicit-function-declaration
+      - CONFIGURE_ARGS  += ac_cv_func_getentropy=no
+      - CONFIGURE_ENV   += ac_cv_func_getentropy=no
+    to steer CPython's configure away from getentropy() on iOS and
+    make Clang ignore any stray implicit-decl diagnostics for C files.
     """
-    print("Patching CFLAGS in {} …".format(pythonPro))
+    print("Patching CFLAGS & configure args in {} …".format(pythonPro))
     backupOnce(pythonPro)
     text = readText(pythonPro)
-    needle = "QMAKE_CFLAGS += -Wno-implicit-function-declaration"
-    if needle in text:
-        print("  … flag already present; no change made.")
-        return
-    # Insert near any existing macOS block or simply append.
-    insertAfter = r"(^.*mac.*\{.*$)|(^\s*QMAKE_.*$)"
-    new = idempotentInsertUnique(text, needle, insertAfter)
-    writeText(pythonPro, new)
-    print("  ✓ python.pro patched with no-implicit-function-declaration.")
+
+    def ensure_line(txt, needle):
+        if needle in txt:
+            return txt
+        # Insert near an existing QMAKE_ line if possible; else append.
+        return idempotentInsertUnique(txt, needle, r"(^\s*QMAKE_.*$)")
+
+    text = ensure_line(text, "QMAKE_CFLAGS += -Wno-implicit-function-declaration")
+    text = ensure_line(text, "QMAKE_CFLAGS_C += -Wno-implicit-function-declaration")
+    # Work around CPython getentropy() mis-detection when cross-compiling for iOS
+    text = ensure_line(text, "CONFIGURE_ARGS += ac_cv_func_getentropy=no")
+    text = ensure_line(text, "CONFIGURE_ENV += ac_cv_func_getentropy=no")
+
+    writeText(pythonPro, text)
+    print("  ✓ python.pro patched with getentropy workaround & CFLAGS.")
 
 
 def patchSipCaseInsensitiveGlob(sipPy: Path):
@@ -558,4 +567,5 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[ERROR]", e)
         sys.exit(1)
+
 
