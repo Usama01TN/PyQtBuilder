@@ -554,7 +554,6 @@ def main():
         sys.executable, str(buildScript),
         "--target", "ios-64",
         "--qmake", str(qmake),
-        "--verbose",
     ]
     sh(cmd, cwd=str(demo_root))
     # 9) Report xcodeproj
@@ -574,6 +573,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[ERROR]", e)
         sys.exit(1)
+
 
 
 
