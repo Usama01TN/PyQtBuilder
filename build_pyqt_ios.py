@@ -128,9 +128,13 @@ def ensurePackages():
     """
     # Install packages as specified in the memo
     # Pin PyQt5 to 5.15.11 (matches the sdist we will download)
-    # pyqtdeploy/pyqt-builder unpinned to get a working recent toolchain
+    # Install pyqtdeploy from the specific GitHub repository
     print("Installing required packages (may take a while)…")
-    pipInstall(["PyQt5==5.15.11", "PyQt5_sip", "pyqtdeploy", "pyqt-builder"])
+    pipInstall(["PyQt5==5.15.11", "PyQt5_sip"])
+    # Install pyqtdeploy from the specific GitHub repository
+    pipInstall(["git+https://github.com/0sh1ma/pyqtdeploy-pyqt6ios-experiment.git"])
+    # Install pyqt-builder (if still needed)
+    pipInstall(["pyqt-builder"])
 
 
 def importPyqtdeploy():
@@ -570,6 +574,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[ERROR]", e)
         sys.exit(1)
+
 
 
 
