@@ -3,6 +3,8 @@
 Helping to get builders tools currently.
 """
 from os.path import isfile, join, exists, split, dirname
+from sys import executable, platform
+
 from cmake import CMAKE_BIN_DIR
 from json import loads
 
@@ -102,9 +104,10 @@ def getCurrentExecutable(name):
     :param name: str | unicode
     :return: str | unicode
     """
+    name = '{}{}'.format(name.rstrip('.exe'), '.exe' if platform.lower() == 'win32' else '')
     if exists(name):
         return name
-    prog = which(name)  # type: str
+    prog = which(name.rstrip('.exe'))  # type: str
     if prog:
         return prog
     # Just guess otherwise.
@@ -167,3 +170,44 @@ def getArmLinuxAndroideabiStripExecutable():
     :return: str | unicode
     """
     return getCurrentExecutable('arm-linux-androideabi-strip')
+
+
+def getUVExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('uv')
+
+
+def getXcodebuildExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('xcodebuild')
+
+
+def getXcrunExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('xcrun')
+
+
+def getXcodeSelectExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('xcode-select')
+
+
+def getPythonExecutable():
+    """
+    :return: str | unicode
+    """
+    if exists(executable):
+        return executable
+    for name in ('python', 'python3', 'python2'):
+        if exists(getCurrentExecutable(name)):
+            return getCurrentExecutable(name)
+    # Just guess otherwise.
+    return getCurrentExecutable(join('bin', 'python'))
