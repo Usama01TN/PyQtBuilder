@@ -61,8 +61,8 @@ Requirements (host machine):
 """
 from os.path import join, isfile, isdir, expanduser, realpath, basename, relpath, getsize, pathsep, dirname, exists
 from os import rename, walk, listdir, chmod, environ, access, X_OK, makedirs, statvfs
-from argparse import RawDescriptionHelpFormatter, ArgumentParser
 from sys import exit, version_info, argv, executable, stdin, path
+from argparse import RawDescriptionHelpFormatter, ArgumentParser
 from logging import basicConfig, getLogger, INFO, DEBUG
 from shutil import rmtree, copytree, copy2
 from zipfile import ZipFile, ZIP_DEFLATED
