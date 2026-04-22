@@ -236,12 +236,12 @@ def _run(cmd, cwd=None, env=None, capture=False, check=True):
     :param check:   (bool) if True, raise BuildError on non-zero exit; default True
     :return:        (str) Stripped stdout string when capture=True, else ''
     """
-    display = " ".join(str(c) for c in cmd)
+    display = " ".join(c for c in cmd)
     log.debug("$ %s", display)
     merged_env = {}
     merged_env.update(dict(environ))
     merged_env.update(env or {})
-    result = run([str(c) for c in cmd], cwd=cwd, env=merged_env, capture_output=capture, text=True)
+    result = run([c for c in cmd], cwd=cwd, env=merged_env, capture_output=capture, text=True)
     if check and result.returncode != 0:
         if capture:
             log.error("STDOUT:\n%s", result.stdout)
