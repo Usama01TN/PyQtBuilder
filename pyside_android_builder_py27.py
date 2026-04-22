@@ -266,7 +266,7 @@ def _run(cmd, cwd=None, env=None, check=True, dry_run=False, capture=False):
     :param capture: bool
     :return: subprocess.Popen-compatible object
     """
-    display = " ".join(str(c) for c in cmd)
+    display = " ".join(c for c in cmd)
     log.debug("$ %s  [cwd=%s]", display, cwd or ".")
     if dry_run:
         log.info("[DRY-RUN] %s", display)
@@ -287,7 +287,7 @@ def _run(cmd, cwd=None, env=None, check=True, dry_run=False, capture=False):
     if capture:
         kwargs["stdout"] = PIPE
         kwargs["stderr"] = PIPE
-    proc = Popen([str(c) for c in cmd], **kwargs)
+    proc = Popen([c for c in cmd], **kwargs)
     stdout, stderr = proc.communicate()
     proc.stdout = stdout or ''
     proc.stderr = stderr or ''
@@ -308,27 +308,27 @@ def _require_tool(name):
     :return: str
     """
     if find_executable is not None:
-        path = find_executable(name)
+        pth = find_executable(name)
     else:
-        path = None
+        pth = None
         for d in environ.get("PATH", "").split(pathsep):
             candidate = join(d, name)
             if isfile(candidate) and access(candidate, X_OK):
-                path = candidate
+                pth = candidate
                 break
-    if not path:
+    if not pth:
         raise EnvironmentError("Required tool '%s' not found on PATH.\nInstall it and re-run." % name)
-    return path
+    return pth
 
 
-def _makedirs(path):
+def _makedirs(pth):
     """
     os.makedirs without exist_ok (Python 2.7 compat).
-    :param path: str
+    :param pth: str
     :return:
     """
     try:
-        makedirs(path)
+        makedirs(pth)
     except OSError as exc:
         if exc.errno != EEXIST:
             raise
@@ -386,17 +386,17 @@ def _extract_tar(archive, dest_dir):
         tf.extractall(dest_dir)
 
 
-def _check_disk_space(path, required_mb=MIN_DISK_MB):
+def _check_disk_space(pth, required_mb=MIN_DISK_MB):
     """
     Warn if free disk space at *path* is below *required_mb* MB.
-    :param path: str
+    :param pth: str
     :param required_mb: int
     :return:
     """
-    stat = statvfs(path if exists(path) else dirname(path))
+    stat = statvfs(pth if exists(pth) else dirname(pth))
     free_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
     if free_mb < required_mb:
-        log.warning('Low disk space: %.0f MB free at %s (recommended >= %d MB).', free_mb, path, required_mb)
+        log.warning('Low disk space: %.0f MB free at %s (recommended >= %d MB).', free_mb, pth, required_mb)
     else:
         log.info('Disk space: %.0f MB free OK', free_mb)
 
@@ -484,8 +484,7 @@ def preflight_checks(cfg):
         ("unzip", "sudo apt-get install unzip")]
     for tool, hint in tools:
         try:
-            path = _require_tool(tool)
-            log.info("Found:    %-12s  %s", tool, path)
+            log.info('Found:    %-12s  %s', tool, _require_tool(tool))
         except EnvironmentError:
             raise EnvironmentError("'%s' not found on PATH.\n  Install with: %s" % (tool, hint))
     # Necessitas SDK.
