@@ -4,7 +4,6 @@ Helping to get builders tools currently.
 """
 from os.path import isfile, join, exists, split, dirname
 from sys import executable, platform
-
 from cmake import CMAKE_BIN_DIR
 from json import loads
 
@@ -211,3 +210,15 @@ def getPythonExecutable():
             return getCurrentExecutable(name)
     # Just guess otherwise.
     return getCurrentExecutable(join('bin', 'python'))
+
+def getPyqtdeploySysrootExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('pyqtdeploy-sysroot')
+
+def getPyqtdeployBuildExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('pyqtdeploy-build')
