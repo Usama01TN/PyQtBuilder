@@ -56,10 +56,10 @@ from os.path import join, exists, dirname, basename, isfile, isdir, pathsep, exp
 from argparse import RawDescriptionHelpFormatter, ArgumentParser
 from os import statvfs, listdir, walk, environ, makedirs, chmod
 from logging import getLogger, DEBUG, basicConfig, INFO
+from sys import exit, version_info, path
 from re import match, compile, DOTALL
 from platform import mac_ver, system
 from subprocess import Popen, PIPE
-from sys import exit, version_info, path
 from textwrap import dedent
 from errno import EEXIST
 import tarfile
