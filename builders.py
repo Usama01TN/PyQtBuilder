@@ -205,11 +205,12 @@ def getPythonExecutable():
     """
     if exists(executable):
         return executable
-    for name in ('python', 'python3', 'python2'):
+    for name in ('python', 'python3', 'python3.4', 'python2'):
         if exists(getCurrentExecutable(name)):
             return getCurrentExecutable(name)
     # Just guess otherwise.
     return getCurrentExecutable(join('bin', 'python'))
+
 
 def getPyqtdeploySysrootExecutable():
     """
@@ -217,8 +218,24 @@ def getPyqtdeploySysrootExecutable():
     """
     return getCurrentExecutable('pyqtdeploy-sysroot')
 
+
 def getPyqtdeployBuildExecutable():
     """
     :return: str | unicode
     """
     return getCurrentExecutable('pyqtdeploy-build')
+
+
+def getHgExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('hg')
+
+
+def getOpenExecutable():
+    """
+    :return: str | unicode
+    """
+    o = getCurrentExecutable('open')  # type: str
+    return o if exists(o) else ''
