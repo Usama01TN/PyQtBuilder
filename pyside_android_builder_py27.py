@@ -1128,7 +1128,7 @@ def _create_main_py_template(main_py):
 
 
 # ===========================================================================
-# Step 9 -- Generate main.h and main.cpp (C++ Python wrapper)
+# Step 9 -- Generate main.h and main.cpp (C++ Python wrapper).
 # ===========================================================================
 
 def generate_cpp_wrapper(cfg):
@@ -1629,8 +1629,7 @@ def main(argv=None):
         build_apk(cfg, env)
         if cfg.install_apk:
             install_via_adb(cfg)
-        apk_path = cfg.apk_path
-        print_summary(cfg, apk_path)
+        print_summary(cfg, cfg.apk_path)
         return 0
     except EnvironmentError as exc:
         log.error('Environment error:\n%s', exc)
@@ -1646,5 +1645,5 @@ def main(argv=None):
         return 130
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     exit(main())
