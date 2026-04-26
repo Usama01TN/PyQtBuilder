@@ -86,12 +86,12 @@ except:
     _DiskUsage = namedtuple('DiskUsage', ['total', 'used', 'free'])
 
 
-    def disk_usage(path):
+    def disk_usage(pth):
         """
-        :param path: str
+        :param pth: str
         :return: _DiskUsage
         """
-        st = statvfs(path)
+        st = statvfs(pth)
         return _DiskUsage(
             st.f_blocks * st.f_frsize, (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_bavail * st.f_frsize)
 
@@ -122,17 +122,17 @@ except:
         check_call(['virtualenv', venv_dir])
 
 
-def _makedirs(path):
+def _makedirs(pth):
     """
     Create *path* and all missing parents; silently ignore if it exists.
-    :param path: str
+    :param pth: str
     :return:
     """
-    if not isdir(path):
+    if not isdir(pth):
         try:
-            makedirs(path)
+            makedirs(pth)
         except OSError:
-            if not isdir(path):
+            if not isdir(pth):
                 raise
 
 
@@ -441,10 +441,10 @@ def _require_tool(name):
     :param name: str
     :return:     str
     """
-    path = which(name)
-    if not path:
+    pth = which(name)
+    if not pth:
         raise EnvironmentError('Required tool "{}" not found on PATH.\nInstall it before re-running.'.format(name))
-    return path  # Plain str; original returned Path(path) which is removed.
+    return pth
 
 
 def _download(url, dest):
@@ -452,7 +452,7 @@ def _download(url, dest):
     Download *url* -> *dest* with simple progress indication.
     :param url:  str
     :param dest: str
-    :return:
+    :return: None
     """
     _makedirs(dirname(dest))
     if exists(dest):
@@ -479,19 +479,19 @@ def _extract(archive, dest_dir):
         tf.extractall(path=dest_dir)
 
 
-def _check_disk_space(path, required_gb=MIN_DISK_GB):
+def _check_disk_space(pth, required_gb=MIN_DISK_GB):
     """
     Warn if free disk space at *path* is below *required_gb* gigabytes.
-    :param path:        str
+    :param pth:        str
     :param required_gb: int
     :return:
     """
-    check_path = path if exists(path) else dirname(path)
+    check_path = pth if exists(pth) else dirname(pth)
     stat = disk_usage(check_path)
     # 1024.0 ** 3 forces float division.
     free_gb = stat.free / 1024.0 ** 3
     if free_gb < required_gb:
-        log.warning('Low disk space: %.1f GB free at %s (recommended >= %d GB).', free_gb, path, required_gb)
+        log.warning('Low disk space: %.1f GB free at %s (recommended >= %d GB).', free_gb, pth, required_gb)
     else:
         log.info('Disk space: %.1f GB free :)', free_gb)
 
@@ -640,11 +640,11 @@ def setup_toolchain(cfg):
             '  Or set --sdk-path to an existing SDK.'.format(
                 ANDROID_API, cfg.sdk_root, ANDROID_API, ANDROID_API, BUILD_TOOLS_VER, NDK_VERSION))
     if not exists(build_tools):
-        issues.append("Build-tools {} not found at {}.\n  Install it via Android Studio SDK Manager.".format(
+        issues.append('Build-tools {} not found at {}.\n  Install it via Android Studio SDK Manager.'.format(
             BUILD_TOOLS_VER, build_tools))
     # -- Qt 5.15.2 Android ----------------------------------------------------
     if exists(cfg.qmake):
-        log.info("qmake found: %s :)", cfg.qmake)
+        log.info('qmake found: %s :)', cfg.qmake)
     else:
         issues.append(
             'Qt {} Android qmake not found at {}.\n'
@@ -894,7 +894,7 @@ def build_apk(cfg):
     pyqt-crom uses build_app.py which does:
       python3 build_app.py --pdt config.pdt --jobs 1 --target android-64 --qmake $QT_DIR/android/bin/qmake --verbose
     :param cfg: BuildConfig
-    :return:    str  (path to the produced APK)
+    :return: str (Path to the produced APK)
     """
     _step('Step 7/8 - Building APK (pyqtdeploy -> qmake -> make)')
     # Locate the .pdt project file.
@@ -1085,8 +1085,7 @@ def build_arg_parser():
             # Use pre-installed Qt / SDK / NDK:
               python pyqt5_android_builder.py --project-dir ./myapp \\
                   --qt-dir ~/Qt5.15.2/5.15.2/android_arm64_v8a \\
-                  --ndk-path ~/Android/Sdk/ndk/21.4.7075529 \\
-                  --sdk-path ~/Android/Sdk
+                  --ndk-path ~/Android/Sdk/ndk/21.4.7075529 --sdk-path ~/Android/Sdk
 
             # Sysroot only (skip APK build - useful for CI caching):
               python pyqt5_android_builder.py --project-dir ./myapp --only-sysroot
@@ -1095,8 +1094,7 @@ def build_arg_parser():
               python pyqt5_android_builder.py --project-dir ./myapp --install-apk
 
             # Include extra Qt modules (e.g. QtSql, QtBluetooth):
-              python pyqt5_android_builder.py --project-dir ./myapp \\
-                  --extra-pyqt-modules QtSql,QtBluetooth
+              python pyqt5_android_builder.py --project-dir ./myapp --extra-pyqt-modules QtSql,QtBluetooth
         """))
     # Paths: use str instead of pathlib.Path – resolved manually in main()
     parser.add_argument('--project-dir', required=True, type=str,
