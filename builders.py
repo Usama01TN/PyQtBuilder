@@ -239,3 +239,10 @@ def getOpenExecutable():
     """
     o = getCurrentExecutable('open')  # type: str
     return o if exists(o) else ''
+
+
+def getJavaExecutable():
+    """
+    :return: str | unicode
+    """
+    return getCurrentExecutable('java')
