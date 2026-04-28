@@ -330,7 +330,7 @@ def _makedirs(pth):
 
 def _download(url, dest):
     """
-    Download *url* → *dest*.
+    Download *url* -> *dest*.
     :param url: str
     :param dest: str
     :return: None
@@ -1077,7 +1077,7 @@ def _patch_pyqt5_cfg_inline(cfg_file, keep_modules):
 
 
 # =============================================================================
-# Step 13 -- pyqtdeploy project + build (freeze Python code → .xcodeproj).
+# Step 13 -- pyqtdeploy project + build (freeze Python code -> .xcodeproj).
 # =============================================================================
 
 def pyqtdeploy_build(cfg):
@@ -1293,7 +1293,7 @@ def deploy_with_xcode(cfg):
         "     From plashless Part 1:\n"
         "       'Follow Qt5 Tutorial: Pushing Example App to iOS Simulator'\n"
         "     In Qt Maintenance Tool, install 'Qt {qt} -> iOS -> iOS Simulator'.\n"
-        "     In Xcode: change scheme to iPhone Simulator → Product → Run.\n"
+        "     In Xcode: change scheme to iPhone Simulator -> Product -> Run.\n"
         "\n"
         "  3. (Real Device) Sign up for Apple Developer Program:\n"
         "     https://developer.apple.com/programs/\n"
@@ -1307,10 +1307,10 @@ def deploy_with_xcode(cfg):
         "  5. Open the .xcodeproj:\n"
         "       open {xcodeproj}\n"
         "\n"
-        "  6. In Xcode title bar: click 'Scheme' → choose your device.\n"
+        "  6. In Xcode title bar: click 'Scheme' -> choose your device.\n"
         "     From Part 3: 'A list of devices (real and simulator) appears.'\n"
         "\n"
-        "  7. Product → Run (Cmd+R).\n"
+        "  7. Product -> Run (Cmd+R).\n"
         "     Dialogs may appear for codesigning and device unlock.\n"
         "\n"
         "  8. Your app appears on the device.\n"
@@ -1318,18 +1318,18 @@ def deploy_with_xcode(cfg):
         "\n"
         "  9. To run later: pan left/right on the home screen to find the app.\n"
         "\n"
-        "  ── FAQ (from plashless Part 3) ────────────────────────────────\n"
-        "  • 'No QPrintSupport on iOS' → do NOT import PyQt5.QtPrintSupport\n"
+        "  -- FAQ (from plashless Part 3) --------------------------------\n"
+        "  • 'No QPrintSupport on iOS' -> do NOT import PyQt5.QtPrintSupport\n"
         "    (it causes a link error; already excluded from the module list)\n"
         "\n"
-        "  • 'Touch events' → Qt translates touch to mouse by default.\n"
+        "  • 'Touch events' -> Qt translates touch to mouse by default.\n"
         "    If menus/buttons stop working, check this flag:\n"
         "      QApplication.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents, True)\n"
         "\n"
         "  • 'Debug on iOS first' (Part 3):\n"
         "    'Xcode generates better error messages at link time and displays\n"
         "     stdout/stderr in a window.'\n"
-        "  ───────────────────────────────────────────────────────────────".format(qt=QT_VERSION, xcodeproj=xcodeproj)))
+        "  ---------------------------------------------------------------".format(qt=QT_VERSION, xcodeproj=xcodeproj)))
 
 
 # =============================================================================
@@ -1376,7 +1376,7 @@ def print_summary(cfg):
         "==========================================\n"
         "\n"
         "• 'requires a valid repository' in Qt Maintenance Tool\n"
-        "  Fix: Maintenance Tool → Settings → Repositories → User specified\n"
+        "  Fix: Maintenance Tool -> Settings -> Repositories -> User specified\n"
         "       Add: http://download.qt-project.org/online/qt5/mac/x86/online_repository\n"
         "\n"
         "• 'No module named PyQt5' when running pyqtdeploy\n"
