@@ -62,54 +62,29 @@ Python 2/3 compatibility notes:
   - print(..., flush=True) replaced with explicit sys.stdout.flush().
   - Keyword-only arguments (*) removed; all args positional/keyword.
 """
-from os.path import exists, dirname, basename, abspath, join, isdir
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from os import environ, rename, utime, walk, makedirs, getcwd
+from os.path import exists, dirname, basename, abspath, join
 from logging import basicConfig, INFO, getLogger, DEBUG
+from os import environ, rename, utime, getcwd
 from struct import unpack_from, error
 from platform import system, machine
 from sys import stdout, exit, path
 from textwrap import dedent
-from fnmatch import fnmatch
 from glob import glob
 from re import search
 import tarfile
-import io
-
-# -- urllib ------------------------------------------------------------------
-try:
-    from urllib import urlretrieve  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import run, getCurrentExecutable, getUVExecutable, getGitExecutable, getCmakeExecutable, \
+    from .builders import getCurrentExecutable, getUVExecutable, getGitExecutable, getCmakeExecutable, \
         getXcrunExecutable, getXcodeSelectExecutable, getXcodebuildExecutable
+    from .build_utils import run, _makedirs, _rglob, _write_text, urlretrieve
 except:
-    from builders import run, getCurrentExecutable, getUVExecutable, getGitExecutable, getCmakeExecutable, \
+    from builders import getCurrentExecutable, getUVExecutable, getGitExecutable, getCmakeExecutable, \
         getXcrunExecutable, getXcodeSelectExecutable, getXcodebuildExecutable
-
-
-# ---------------------------------------------------------------------------
-# Path utility helpers  (replaces all pathlib usage)
-# ---------------------------------------------------------------------------
-
-
-def _makedirs(pth):
-    """
-    Create *path* and all missing intermediate directories.
-    Equivalent to Path.mkdir(parents=True, exist_ok=True).
-    :param pth: str
-    :return:
-    """
-    try:
-        makedirs(pth)
-    except OSError:
-        if not isdir(pth):
-            raise
+    from build_utils import run, _makedirs, _rglob, _write_text, urlretrieve
 
 
 def _touch(pth):
@@ -142,22 +117,8 @@ def _write_bytes(pth, data):
     :param data: bytes
     :return:
     """
-    with open(pth, "wb") as fh:
+    with open(pth, 'wb') as fh:
         fh.write(data)
-
-
-def _write_text(pth, text, encoding='utf-8'):
-    """
-    Write the unicode string *text* to *path*.
-    Uses io.open so the encoding keyword works on both Python 2 and 3.
-    Equivalent to Path.write_text(text, encoding=encoding).
-    :param pth: str
-    :param text: str
-    :param encoding: str
-    :return:
-    """
-    with io.open(pth, 'w', encoding=encoding) as fh:
-        fh.write(text)
 
 
 def _glob(directory, pattern):
@@ -170,23 +131,6 @@ def _glob(directory, pattern):
     :return: list[str]
     """
     return sorted(glob(join(directory, pattern)))
-
-
-def _rglob(directory, pattern):
-    """
-    Recursively search *directory* for entries whose basename matches *pattern*
-    (shell-style wildcards via fnmatch).  Returns a sorted list of full paths.
-    Equivalent to Path.rglob(pattern).
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    matches = []
-    for root, dirs, files in walk(directory):
-        for name in files + dirs:
-            if fnmatch(name, pattern):
-                matches.append(join(root, name))
-    return sorted(matches)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +157,7 @@ N_PEXT = 0x10  # type: int
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -244,10 +188,10 @@ def _run(cmd, cwd=None, env=None, capture=False, check=True):
     result = run([c for c in cmd], cwd=cwd, env=merged_env, capture_output=capture, text=True)
     if check and result.returncode != 0:
         if capture:
-            log.error("STDOUT:\n%s", result.stdout)
-            log.error("STDERR:\n%s", result.stderr)
-        raise BuildError("Command failed (exit {}): {}".format(result.returncode, display))
-    return result.stdout.strip() if capture else ""
+            log.error('STDOUT:\n%s', result.stdout)
+            log.error('STDERR:\n%s', result.stderr)
+        raise BuildError('Command failed (exit {}): {}'.format(result.returncode, display))
+    return result.stdout.strip() if capture else ''
 
 
 def which_required(binary):
@@ -297,14 +241,14 @@ def download(url, dest):
         if total_size > 0:
             pct = min(100, block_count * block_size * 100 // total_size)
             # flush=True not available in Python 2's print(); use explicit flush
-            print("\r     {:3d}%".format(pct), end="")
+            print('\r     {:3d}%'.format(pct), end='')
             stdout.flush()
 
     try:
         urlretrieve(url, dest, _progress)
         print()  # Newline after progress.
     except Exception as exc:
-        raise BuildError("Download failed: {}\nURL: {}".format(exc, url))
+        raise BuildError('Download failed: {}\nURL: {}'.format(exc, url))
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +478,7 @@ def install_python_framework(ctx):
     if not exists(tarball):
         download(url, tarball)
     log.info('  Extracting Python iOS support ...')
-    with tarfile.open(tarball, "r:gz") as tf:
+    with tarfile.open(tarball, 'r:gz') as tf:
         tf.extractall(ctx.python_dir)
     if not exists(ctx.python_framework):
         # The tarball may unpack to a different name; find it.
@@ -564,7 +508,7 @@ def clone_pyside_sources(ctx):
         return
     which_required('git')
     _makedirs(dirname(ctx.pyside_src))
-    _run([getGitExecutable(), 'clone', '--branch', 'v{}'.format(ctx.pyside_version), "--depth", "1", PYSIDE_SETUP_REPO,
+    _run([getGitExecutable(), 'clone', '--branch', 'v{}'.format(ctx.pyside_version), '--depth', '1', PYSIDE_SETUP_REPO,
           ctx.pyside_src])
     log.info('  PySide6 sources cloned to: %s', ctx.pyside_src)
 
@@ -778,7 +722,7 @@ def build_support_libs(ctx):
 
 
 # ---------------------------------------------------------------------------
-# Step 9 - Cross-compile PySide6 modules
+# Step 9 - Cross-compile PySide6 modules.
 # ---------------------------------------------------------------------------
 
 
@@ -788,9 +732,9 @@ def build_pyside6_modules(ctx, modules=None):
     as a *static* library for arm64-iOS via shiboken6 code generation +
     clang cross-compilation.
     Key details from the pyside6-ios report:
-    - PyModuleDef.m_name must be "PySide6.QtCore" (not "QtCore") for type
+    - PyModuleDef.m_name must be 'PySide6.QtCore' (not 'QtCore') for type
       resolution to work across modules.
-    - shouldLazyLoad() in the import machinery needs a "Qt" prefix check.
+    - shouldLazyLoad() in the import machinery needs a 'Qt' prefix check.
     - QProcess is unavailable on iOS (QT_CONFIG(process)==false); generated
       wrappers and headers are patched accordingly.
     :param ctx: BuildContext
@@ -828,7 +772,7 @@ def build_pyside6_modules(ctx, modules=None):
 # ---------------------------------------------------------------------------
 
 
-def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode="widgets", team_id=""):
+def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode='widgets', team_id=''):
     """
     Generate a pyside6-ios.toml config file for the given application.
     This file drives `pyside6-ios generate` to produce the .xcodeproj.
@@ -842,13 +786,13 @@ def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode="widg
     :param app_dir:   str -- path to application directory
     :param app_name:  str
     :param bundle_id: str
-    :param modules:   list of str or None
-    :param ui_mode:   str  ("widgets" or "qml")
+    :param modules:   list[str] | None
+    :param ui_mode:   str  ('widgets' or 'qml')
     :param team_id:   str
     :return: str -- path to the written .toml file
     """
     if modules is None:
-        modules = (['QtCore', "QtGui", 'QtWidgets'] if ui_mode == 'widgets' else [
+        modules = (['QtCore', 'QtGui', 'QtWidgets'] if ui_mode == 'widgets' else [
             'QtCore', 'QtGui', 'QtNetwork', 'QtQml', 'QtQuick'])
     toml_path = join(app_dir, 'pyside6-ios.toml')
     modules_list = "\n".join('    "{}",'.format(m) for m in modules)
@@ -925,7 +869,7 @@ def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode="widg
 
 
 # ---------------------------------------------------------------------------
-# Step 11 - Generate main.mm host app stub
+# Step 11 - Generate main.mm host app stub.
 # ---------------------------------------------------------------------------
 
 
@@ -939,10 +883,10 @@ def generate_main_mm(app_dir, app_module, ui_mode='widgets'):
     - QtWidgets: resize top-level QWidgets from main.mm after reparenting the
       Qt UIView into the iOS UIWindow.
     - QLayout(parent) is broken in static PySide6 modules; use setLayout().
-    :param app_dir:    str -- path to application directory
+    :param app_dir:    (str) Path to application directory.
     :param app_module: str
-    :param ui_mode:    str  ("widgets" or "qml")
-    :return: str -- path to the written main.mm
+    :param ui_mode:    str  ('widgets' or 'qml')
+    :return: (str) Path to the written main.mm
     """
     mm_path = join(app_dir, 'main.mm')
     if ui_mode == 'widgets':
