@@ -60,7 +60,7 @@ Requirements (host machine):
     ~10 GB free disk space
 """
 from os.path import join, isfile, isdir, expanduser, realpath, basename, relpath, getsize, pathsep, dirname, exists
-from os import rename, walk, listdir, chmod, environ, access, X_OK, makedirs, statvfs
+from os import rename, walk, listdir, chmod, environ, access, X_OK, statvfs
 from sys import exit, version_info, argv, executable, stdin, path
 from argparse import RawDescriptionHelpFormatter, ArgumentParser
 from logging import basicConfig, getLogger, INFO, DEBUG
@@ -69,7 +69,6 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from platform import release, system
 from subprocess import PIPE, Popen
 from textwrap import dedent
-from errno import EEXIST
 from re import compile
 import tarfile
 
@@ -78,13 +77,10 @@ if dirname(__file__) not in path:
 
 try:
     from .builders import getGitExecutable, getCmakeExecutable, getAntExecutable, getMakeExecutable
+    from .build_utils import _makedirs, urlopen
 except:
     from builders import getGitExecutable, getCmakeExecutable, getAntExecutable, getMakeExecutable
-
-try:
-    from urllib.request import urlopen
-except:
-    from urllib import urlopen
+    from build_utils import _makedirs, urlopen
 
 # ---------------------------------------------------------------------------
 # Python 2.7 compatibility shims.
@@ -118,9 +114,8 @@ MIN_DISK_MB = 8192
 # ---------------------------------------------------------------------------
 # Logging.
 # ---------------------------------------------------------------------------
-LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(message)s"
-basicConfig(format=LOG_FORMAT, datefmt="%H:%M:%S", level=INFO)
-log = getLogger("pyside-android-builder")
+basicConfig(format='%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S', level=INFO)
+log = getLogger('pyside-android-builder')
 
 
 def step(title):
@@ -134,7 +129,7 @@ def step(title):
 
 
 # ===========================================================================
-# Build configuration (plain class, Python 2.7 has no dataclasses)
+# Build configuration (plain class, Python 2.7 has no dataclasses).
 # ===========================================================================
 
 class BuildConfig(object):
@@ -148,7 +143,7 @@ class BuildConfig(object):
         """
         self.project_dir = realpath(args.project_dir)
         self.app_name = args.app_name or basename(self.project_dir)
-        self.unique_name = args.unique_name or ("com.example.%s" % self.app_name)
+        self.unique_name = args.unique_name or ('com.example.%s' % self.app_name)
         self.necessitas_sdk = expanduser(args.necessitas_sdk)
         self.pyside_stage = expanduser(args.pyside_stage) if args.pyside_stage else None
         self.build_threads = args.build_threads
@@ -158,18 +153,18 @@ class BuildConfig(object):
         self.install_apk = args.install_apk
         self.keep_build = args.keep_build
         # Derived: all work lives under ~/.pyside_android_build
-        self.work_dir = expanduser("~/.pyside_android_build")
-        self.scripts_dir = join(self.work_dir, "android-pyside-build-scripts")
-        self.shiboken_src = join(self.work_dir, "shiboken-android")
-        self.pyside_src = join(self.work_dir, "pyside-android")
-        self.stage_dir = self.pyside_stage or join(self.work_dir, "stage")
-        self.android_python = join(self.work_dir, "android_python")
-        self.project_build = join(self.work_dir, "project")
-        self.downloads_dir = join(self.work_dir, "downloads")
+        self.work_dir = expanduser('~/.pyside_android_build')
+        self.scripts_dir = join(self.work_dir, 'android-pyside-build-scripts')
+        self.shiboken_src = join(self.work_dir, 'shiboken-android')
+        self.pyside_src = join(self.work_dir, 'pyside-android')
+        self.stage_dir = self.pyside_stage or join(self.work_dir, 'stage')
+        self.android_python = join(self.work_dir, 'android_python')
+        self.project_build = join(self.work_dir, 'project')
+        self.downloads_dir = join(self.work_dir, 'downloads')
         # Install path on the Android device.
-        self.install_path = "/data/data/%s" % self.unique_name
+        self.install_path = '/data/data/%s' % self.unique_name
         # APK output.
-        self.apk_path = join(self.project_build, "android", "bin", "%s-debug.apk" % self.app_name)
+        self.apk_path = join(self.project_build, 'android', 'bin', '%s-debug.apk' % self.app_name)
 
     # -----------------------------------------------------------------------
     # Derived paths inside the Necessitas SDK.
@@ -183,10 +178,10 @@ class BuildConfig(object):
         """
         # Necessitas embeds NDK under necessitas/android-ndk-*
         for name in listdir(self.necessitas_sdk):
-            if name.startswith("android-ndk"):
+            if name.startswith('android-ndk'):
                 return join(self.necessitas_sdk, name)
         # Fallback: common location.
-        return join(self.necessitas_sdk, "android-ndk-r8b")
+        return join(self.necessitas_sdk, 'android-ndk-r8b')
 
     @property
     def qt_android_dir(self):
@@ -197,18 +192,18 @@ class BuildConfig(object):
         # Necessitas places Qt under necessitas/NecessitasQt/Qt4.8.x/...
         for root, dirs, _ in walk(self.necessitas_sdk):
             for d in dirs:
-                if d in ["android_armeabi", "android_armeabi-v7a"]:
+                if d in ['android_armeabi', 'android_armeabi-v7a']:
                     return join(root, d)
             break  # only check one level deep.
         # Fallback.
-        return join(self.necessitas_sdk, "NecessitasQt", "qt", "android_armeabi-v7a")
+        return join(self.necessitas_sdk, 'NecessitasQt', 'qt', 'android_armeabi-v7a')
 
     @property
     def qmake(self):
         """
         :return: str
         """
-        return join(self.qt_android_dir, "bin", "qmake")
+        return join(self.qt_android_dir, 'bin', 'qmake')
 
     @property
     def sdk_root(self):
@@ -217,9 +212,9 @@ class BuildConfig(object):
         :return: str
         """
         for name in listdir(self.necessitas_sdk):
-            if name.startswith("android-sdk") or name == "Sdk":
+            if name.startswith('android-sdk') or name == 'Sdk':
                 return join(self.necessitas_sdk, name)
-        return join(self.necessitas_sdk, "android-sdk")
+        return join(self.necessitas_sdk, 'android-sdk')
 
     @property
     def toolchain_bin(self):
@@ -227,11 +222,11 @@ class BuildConfig(object):
         arm-linux-androideabi-* compiler bin directory inside the NDK.
         :return: str
         """
-        candidate = join(self.ndk_root, "toolchains", "arm-linux-androideabi-4.6", "prebuilt", "linux-x86_64", "bin")
+        candidate = join(self.ndk_root, 'toolchains', 'arm-linux-androideabi-4.6', 'prebuilt', 'linux-x86_64', 'bin')
         if isdir(candidate):
             return candidate
         # 32-bit host fallback.
-        candidate32 = candidate.replace("linux-x86_64", "linux-x86")
+        candidate32 = candidate.replace('linux-x86_64', 'linux-x86')
         return candidate32 if isdir(candidate32) else candidate
 
     @property
@@ -239,14 +234,14 @@ class BuildConfig(object):
         """
         :return: str
         """
-        return join(self.ndk_root, "platforms", "android-%s" % REQUIRED_API, "arch-arm")
+        return join(self.ndk_root, 'platforms', 'android-%s' % REQUIRED_API, 'arch-arm')
 
     @property
     def adb_exe(self):
         """
         :return: str
         """
-        return join(self.sdk_root, "platform-tools", "adb")
+        return join(self.sdk_root, 'platform-tools', 'adb')
 
 
 # ===========================================================================
@@ -266,18 +261,18 @@ def _run(cmd, cwd=None, env=None, check=True, dry_run=False, capture=False):
     :param capture: bool
     :return: subprocess.Popen-compatible object
     """
-    display = " ".join(c for c in cmd)
-    log.debug("$ %s  [cwd=%s]", display, cwd or ".")
+    display = ' '.join(c for c in cmd)
+    log.debug('$ %s  [cwd=%s]', display, cwd or '.')
     if dry_run:
-        log.info("[DRY-RUN] %s", display)
+        log.info('[DRY-RUN] %s', display)
 
         class _FakeResult(object):
             """
             _FakeResult class.
             """
             returncode = 0
-            stdout = ""
-            stderr = ""
+            stdout = ''
+            stderr = ''
 
         return _FakeResult()
     merged_env = dict(environ)
@@ -285,19 +280,19 @@ def _run(cmd, cwd=None, env=None, check=True, dry_run=False, capture=False):
         merged_env.update(env)
     kwargs = dict(cwd=cwd, env=merged_env)
     if capture:
-        kwargs["stdout"] = PIPE
-        kwargs["stderr"] = PIPE
+        kwargs['stdout'] = PIPE
+        kwargs['stderr'] = PIPE
     proc = Popen([c for c in cmd], **kwargs)
     stdout, stderr = proc.communicate()
     proc.stdout = stdout or ''
     proc.stderr = stderr or ''
     if check and proc.returncode != 0:
-        log.error("Command failed (exit %d):\n  %s", proc.returncode, display)
+        log.error('Command failed (exit %d):\n  %s', proc.returncode, display)
         if proc.stdout:
-            log.error("stdout:\n%s", proc.stdout[-2000:])
+            log.error('stdout:\n%s', proc.stdout[-2000:])
         if proc.stderr:
-            log.error("stderr:\n%s", proc.stderr[-2000:])
-        raise RuntimeError("Subprocess exited with code %d" % proc.returncode)
+            log.error('stderr:\n%s', proc.stderr[-2000:])
+        raise RuntimeError('Subprocess exited with code %d' % proc.returncode)
     return proc
 
 
@@ -311,27 +306,14 @@ def _require_tool(name):
         pth = find_executable(name)
     else:
         pth = None
-        for d in environ.get("PATH", "").split(pathsep):
+        for d in environ.get('PATH', '').split(pathsep):
             candidate = join(d, name)
             if isfile(candidate) and access(candidate, X_OK):
                 pth = candidate
                 break
     if not pth:
-        raise EnvironmentError("Required tool '%s' not found on PATH.\nInstall it and re-run." % name)
+        raise EnvironmentError('Required tool "%s" not found on PATH.\nInstall it and re-run.' % name)
     return pth
-
-
-def _makedirs(pth):
-    """
-    os.makedirs without exist_ok (Python 2.7 compat).
-    :param pth: str
-    :return:
-    """
-    try:
-        makedirs(pth)
-    except OSError as exc:
-        if exc.errno != EEXIST:
-            raise
 
 
 def _download(url, dest):
@@ -343,21 +325,21 @@ def _download(url, dest):
     """
     _makedirs(dirname(dest))
     if exists(dest):
-        log.info("Cached: %s", basename(dest))
+        log.info('Cached: %s', basename(dest))
         return
-    log.info("Downloading  %s", url)
+    log.info('Downloading  %s', url)
     try:
         response = urlopen(url, timeout=120)
         chunk = 8192
-        with open(dest, "wb") as fh:
+        with open(dest, 'wb') as fh:
             while True:
                 data = response.read(chunk)
                 if not data:
                     break
                 fh.write(data)
-        log.info("Saved:       %s", dest)
+        log.info('Saved:       %s', dest)
     except Exception as exc:
-        raise RuntimeError("Download failed: %s\n%s" % (url, exc))
+        raise RuntimeError('Download failed: %s\n%s' % (url, exc))
 
 
 def _extract_zip(archive, dest_dir):
@@ -368,8 +350,8 @@ def _extract_zip(archive, dest_dir):
     :return:
     """
     _makedirs(dest_dir)
-    log.info("Extracting  %s  ->  %s", basename(archive), dest_dir)
-    with ZipFile(archive, "r") as zf:
+    log.info('Extracting  %s  ->  %s', basename(archive), dest_dir)
+    with ZipFile(archive, 'r') as zf:
         zf.extractall(dest_dir)
 
 
@@ -381,7 +363,7 @@ def _extract_tar(archive, dest_dir):
     :return:
     """
     _makedirs(dest_dir)
-    log.info("Extracting  %s  ->  %s", basename(archive), dest_dir)
+    log.info('Extracting  %s  ->  %s', basename(archive), dest_dir)
     with tarfile.open(archive) as tf:
         tf.extractall(dest_dir)
 
@@ -409,12 +391,12 @@ def _sed_inplace(filepath, old, new):
     :param new: str
     :return:
     """
-    with open(filepath, "r") as fh:
+    with open(filepath, 'r') as fh:
         content = fh.read()
     content = content.replace(old, new)
-    with open(filepath, "w") as fh:
+    with open(filepath, 'w') as fh:
         fh.write(content)
-    log.debug("  sed  '%s' -> '%s'  in  %s", old, new, filepath)
+    log.debug('  sed  "%s" -> "%s"  in  %s', old, new, filepath)
 
 
 def _find_files_containing(directory, pattern):
@@ -428,11 +410,11 @@ def _find_files_containing(directory, pattern):
     matches = []
     for root, dirs, files in walk(directory):
         # skip .git
-        dirs[:] = [d for d in dirs if d != ".git"]
+        dirs[:] = [d for d in dirs if d != '.git']
         for fname in files:
             fpath = join(root, fname)
             try:
-                with open(fpath, "r") as fh:
+                with open(fpath, 'r') as fh:
                     if pattern in fh.read():
                         matches.append(fpath)
             except:
@@ -459,77 +441,77 @@ def preflight_checks(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 1/13 -- Preflight checks")
+    step('Step 1/13 -- Preflight checks')
     # OS -- must be Linux (Ubuntu recommended).
-    if system() != "Linux":
+    if system() != 'Linux':
         raise EnvironmentError(
             'The Necessitas / PySide-Android pipeline requires a Linux host. Detected: %s' % system())
-    log.info("Host OS:  %s %s", system(), release())
+    log.info('Host OS:  %s %s', system(), release())
     # This script itself must be run under Python 2.7.
     major, minor = version_info[:2]
     if (major, minor) != (2, 7):
         raise EnvironmentError(
-            "This script must be run with Python 2.7 (found %d.%d). Try: python2.7 %s" % (major, minor, argv[0]))
-    log.info("Python:   %d.%d (host) OK", major, minor)
+            'This script must be run with Python 2.7 (found %d.%d). Try: python2.7 %s' % (major, minor, argv[0]))
+    log.info('Python:   %d.%d (host) OK', major, minor)
     # Required system tools.
     tools = [
-        ("cmake", "sudo apt-get install cmake"),
-        ("git", "sudo apt-get install git"),
-        ("ant", "sudo apt-get install ant"),
-        ("shiboken", "sudo apt-get install shiboken"),
-        ("make", "sudo apt-get install build-essential"),
-        ("gcc", "sudo apt-get install build-essential"),
-        ("g++", "sudo apt-get install build-essential"),
-        ("zip", "sudo apt-get install zip"),
-        ("unzip", "sudo apt-get install unzip")]
+        ('cmake', 'sudo apt-get install cmake'),
+        ('git', 'sudo apt-get install git'),
+        ('ant', 'sudo apt-get install ant'),
+        ('shiboken', 'sudo apt-get install shiboken'),
+        ('make', 'sudo apt-get install build-essential'),
+        ('gcc', 'sudo apt-get install build-essential'),
+        ('g++', 'sudo apt-get install build-essential'),
+        ('zip', 'sudo apt-get install zip'),
+        ('unzip', 'sudo apt-get install unzip')]
     for tool, hint in tools:
         try:
             log.info('Found:    %-12s  %s', tool, _require_tool(tool))
         except EnvironmentError:
-            raise EnvironmentError("'%s' not found on PATH.\n  Install with: %s" % (tool, hint))
+            raise EnvironmentError('"%s" not found on PATH.\n  Install with: %s' % (tool, hint))
     # Necessitas SDK.
     if not isdir(cfg.necessitas_sdk):
         raise EnvironmentError(
-            "Necessitas SDK directory not found: %s\n"
-            "Download from: http://necessitas.kde.org/necessitas/"
-            "necessitas_sdk_installer.php\n"
-            "Then re-run with --necessitas-sdk /path/to/necessitas"
+            'Necessitas SDK directory not found: %s\n'
+            'Download from: http://necessitas.kde.org/necessitas/'
+            'necessitas_sdk_installer.php\n'
+            'Then re-run with --necessitas-sdk /path/to/necessitas'
             % cfg.necessitas_sdk)
-    log.info("Necessitas SDK:  %s  OK", cfg.necessitas_sdk)
+    log.info('Necessitas SDK:  %s  OK', cfg.necessitas_sdk)
     # Android NDK inside Necessitas.
     if not isdir(cfg.ndk_root):
         raise EnvironmentError(
-            "Android NDK not found under Necessitas SDK at: %s\n"
-            "Expected a directory named android-ndk-* inside: %s" % (cfg.ndk_root, cfg.necessitas_sdk))
-    log.info("NDK:      %s  OK", cfg.ndk_root)
-    # Android SDK + API 14
-    api14_dir = join(cfg.sdk_root, "platforms", "android-%s" % REQUIRED_API)
+            'Android NDK not found under Necessitas SDK at: %s\n'
+            'Expected a directory named android-ndk-* inside: %s' % (cfg.ndk_root, cfg.necessitas_sdk))
+    log.info('NDK:      %s  OK', cfg.ndk_root)
+    # Android SDK + API 14.
+    api14_dir = join(cfg.sdk_root, 'platforms', 'android-%s' % REQUIRED_API)
     if not isdir(api14_dir):
         raise EnvironmentError(
-            "Android SDK API %s not found at: %s\nRun the SDKMaintenanceTool inside Necessitas, select "
-            "'Package manager' and install API %s under Miscellaneous -> Android SDK."
+            'Android SDK API %s not found at: %s\nRun the SDKMaintenanceTool inside Necessitas, select '
+            '"Package manager" and install API %s under Miscellaneous -> Android SDK.'
             % (REQUIRED_API, api14_dir, REQUIRED_API))
-    log.info("Android SDK API %s:  OK", REQUIRED_API)
+    log.info('Android SDK API %s:  OK', REQUIRED_API)
     # Qt Android qmake.
     if not isfile(cfg.qmake):
         log.warning(
-            "Qt Android qmake not found at: %s\n"
-            "  This is expected if you are only building PySide libraries and not the final APK.", cfg.qmake)
+            'Qt Android qmake not found at: %s\n'
+            '  This is expected if you are only building PySide libraries and not the final APK.', cfg.qmake)
     else:
-        log.info("qmake:    %s  OK", cfg.qmake)
+        log.info('qmake:    %s  OK', cfg.qmake)
     # NDK toolchain (arm-linux-androideabi-g++).
-    cxx = join(cfg.toolchain_bin, "arm-linux-androideabi-g++")
+    cxx = join(cfg.toolchain_bin, 'arm-linux-androideabi-g++')
     if not isfile(cxx):
         log.warning('ARM C++ compiler not found at: %s\nThe build will fail at the cmake cross-compile stage.', cxx)
     else:
-        log.info("ARM g++:  %s  OK", cxx)
+        log.info('ARM g++:  %s  OK', cxx)
     # Project directory.
     if not isdir(cfg.project_dir):
-        raise IOError("Project directory not found: %s" % cfg.project_dir)
-    log.info("Project:  %s  OK", cfg.project_dir)
+        raise IOError('Project directory not found: %s' % cfg.project_dir)
+    log.info('Project:  %s  OK', cfg.project_dir)
     # Disk space.
     _check_disk_space(cfg.work_dir if exists(cfg.work_dir) else expanduser("~"))
-    log.info("Preflight passed OK")
+    log.info('Preflight passed OK')
 
 
 # ===========================================================================
@@ -546,7 +528,7 @@ def clone_sources(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 2/13 -- Cloning source repositories")
+    step('Step 2/13 -- Cloning source repositories')
     _makedirs(cfg.work_dir)
     repos = [
         (BUILD_SCRIPTS_REPO, cfg.scripts_dir, 'android-pyside-build-scripts'),
@@ -554,20 +536,20 @@ def clone_sources(cfg):
         (PYSIDE_ANDROID_REPO, cfg.pyside_src, 'pyside-android'),
         (EXAMPLE_PROJECT_REPO, cfg.project_build, 'android-pyside-example-project')]
     for url, dest, label in repos:
-        if isdir(join(dest, ".git")):
+        if isdir(join(dest, '.git')):
             log.info('Already cloned: %s', label)
         else:
             log.info('Cloning %s ...', label)
             _run([getGitExecutable(), 'clone', '--branch', 'android', '--depth', '1', url, dest], dry_run=cfg.dry_run)
     # Create stage directory (M4rtinK build scripts expect ./stage).
-    stage_lib = join(cfg.stage_dir, "lib")
+    stage_lib = join(cfg.stage_dir, 'lib')
     _makedirs(stage_lib)
     log.info('Stage dir: %s  OK', cfg.stage_dir)
     log.info('Sources ready OK')
 
 
 # ===========================================================================
-# Step 3 -- Environment variables (env.sh equivalent)
+# Step 3 -- Environment variables (env.sh equivalent).
 # ===========================================================================
 
 def make_build_env(cfg):
@@ -583,35 +565,35 @@ def make_build_env(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 3/13 -- Build environment")
+    step('Step 3/13 -- Build environment')
     toolchain_bin = cfg.toolchain_bin
     env = {
         # Necessitas
-        "NECESSITAS": cfg.necessitas_sdk,
+        'NECESSITAS': cfg.necessitas_sdk,
         # NDK
-        "ANDROID_NDK": cfg.ndk_root,
-        "ANDROID_NDK_TOOLCHAIN_ROOT": dirname(toolchain_bin),
+        'ANDROID_NDK': cfg.ndk_root,
+        'ANDROID_NDK_TOOLCHAIN_ROOT': dirname(toolchain_bin),
         # Sysroot (target Android filesystem).
-        "SYSROOT": cfg.ndk_sysroot,
+        'SYSROOT': cfg.ndk_sysroot,
         # Stage (install destination for cross-compiled libs).
-        "STAGING": cfg.stage_dir,
+        'STAGING': cfg.stage_dir,
         # Python 2.7 for Android.
-        "ANDROID_PYTHON": cfg.android_python,
+        'ANDROID_PYTHON': cfg.android_python,
         # Thread count.
-        "BUILD_THREAD_COUNT": str(cfg.build_threads),
+        'BUILD_THREAD_COUNT': str(cfg.build_threads),
         # Extend PATH with NDK toolchain.
-        "PATH": toolchain_bin + pathsep + environ.get("PATH", "")}
-    log.info("Build environment:")
+        'PATH': toolchain_bin + pathsep + environ.get('PATH', '')}
+    log.info('Build environment:')
     for k, v in sorted(env.items()):
-        log.info("  %-35s = %s", k, v)
+        log.info('  %-35s = %s', k, v)
     # Write an env.sh for reference / manual use.
-    env_sh = join(cfg.work_dir, "env.sh")
-    with open(env_sh, "w") as fh:
-        fh.write("#!/bin/sh\n# Generated by pyside_android_builder_py27.py\n\n")
+    env_sh = join(cfg.work_dir, 'env.sh')
+    with open(env_sh, 'w') as fh:
+        fh.write('#!/bin/sh\n# Generated by pyside_android_builder_py27.py\n\n')
         for k, v in sorted(env.items()):
             fh.write("export %s='%s'\n" % (k, v))
     chmod(env_sh, 0o755)
-    log.info("env.sh written: %s", env_sh)
+    log.info('env.sh written: %s', env_sh)
     return env
 
 
@@ -631,30 +613,30 @@ def download_android_python(cfg):
     :param cfg: BuildConfig
     :return: str
     """
-    step("Step 4/13 -- Android Python 2.7")
+    step('Step 4/13 -- Android Python 2.7')
     _makedirs(cfg.downloads_dir)
-    zip_dest = join(cfg.downloads_dir, "python2.7_for_android_v1.zip")
+    zip_dest = join(cfg.downloads_dir, 'python2.7_for_android_v1.zip')
     _download(PYTHON_ANDROID_ZIP_URL, zip_dest)
     if not isdir(cfg.android_python):
         _extract_zip(zip_dest, cfg.android_python)
     else:
-        log.info("Android Python already extracted: %s", cfg.android_python)
+        log.info('Android Python already extracted: %s', cfg.android_python)
     # Verify we have the Python include directory (needed for Shiboken cmake).
     python_inc = None
     for root, dirs, files in walk(cfg.android_python):
-        if "Python.h" in files:
+        if 'Python.h' in files:
             python_inc = root
             break
     if python_inc is None and not cfg.dry_run:
-        log.warning("Python.h not found under %s — Shiboken cmake may fail.", cfg.android_python)
+        log.warning('Python.h not found under %s — Shiboken cmake may fail.', cfg.android_python)
     else:
-        log.info("Python.h:  %s  OK", python_inc)
-    log.info("Android Python ready OK")
+        log.info('Python.h:  %s  OK', python_inc)
+    log.info('Android Python ready OK')
     return cfg.android_python
 
 
 # ===========================================================================
-# Step 5 -- Build Shiboken (cross-compile for ARM)
+# Step 5 -- Build Shiboken (cross-compile for ARM).
 # ===========================================================================
 
 def _write_shiboken_toolchain_file(cfg):
@@ -669,17 +651,17 @@ def _write_shiboken_toolchain_file(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    toolchain_cmake = join(cfg.work_dir, "android_toolchain.cmake")
+    toolchain_cmake = join(cfg.work_dir, 'android_toolchain.cmake')
     sysroot = cfg.ndk_sysroot
-    compiler_prefix = join(cfg.toolchain_bin, "arm-linux-androideabi")
+    compiler_prefix = join(cfg.toolchain_bin, 'arm-linux-androideabi')
     # Find Python include + lib paths inside android_python.
-    python_inc = ""
-    python_lib = ""
+    python_inc = ''
+    python_lib = ''
     for root, dirs, files in walk(cfg.android_python):
-        if "Python.h" in files:
+        if 'Python.h' in files:
             python_inc = root
         for f in files:
-            if f.startswith("libpython2.7") and f.endswith(".a"):
+            if f.startswith('libpython2.7') and f.endswith('.a'):
                 python_lib = join(root, f)
     content = dedent("""\
         # CMake toolchain for ARM Android cross-compilation
@@ -713,13 +695,12 @@ def _write_shiboken_toolchain_file(cfg):
         sysroot=sysroot,
         staging=cfg.stage_dir,
         android_python=cfg.android_python,
-        python_exec=executable,  # host python (cmake needs host)
+        python_exec=executable,  # Host python (cmake needs host).
         python_inc=python_inc,
-        python_lib=python_lib,
-    ))
-    with open(toolchain_cmake, "w") as fh:
+        python_lib=python_lib))
+    with open(toolchain_cmake, 'w') as fh:
         fh.write(content)
-    log.info("CMake toolchain written: %s", toolchain_cmake)
+    log.info('CMake toolchain written: %s', toolchain_cmake)
     return toolchain_cmake
 
 
@@ -747,42 +728,42 @@ def build_shiboken(cfg, env):
     :param env: dict[str, str]
     :return: None
     """
-    step("Step 5/13 -- Building Shiboken (ARM cross-compile)")
+    step('Step 5/13 -- Building Shiboken (ARM cross-compile)')
     if cfg.skip_build:
-        log.info("--skip-build set; skipping Shiboken compilation.")
+        log.info('--skip-build set; skipping Shiboken compilation.')
         return
     toolchain_cmake = _write_shiboken_toolchain_file(cfg)
-    build_dir = join(cfg.work_dir, "build", "shiboken")
-    # Clear previous build (mirrors build_shiboken.sh behavior)
+    build_dir = join(cfg.work_dir, 'build', 'shiboken')
+    # Clear previous build (mirrors build_shiboken.sh behavior).
     if isdir(build_dir):
-        log.info("Clearing previous Shiboken build dir ...")
+        log.info('Clearing previous Shiboken build dir ...')
         rmtree(build_dir)
     _makedirs(build_dir)
     cmake_args = [
         getCmakeExecutable(), cfg.shiboken_src,
-        "-DCMAKE_TOOLCHAIN_FILE=%s" % toolchain_cmake,
-        "-DCMAKE_INSTALL_PREFIX=%s" % cfg.stage_dir,
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DENABLE_VERSION_SUFFIX=FALSE",
-        "-DUSE_PYTHON3=FALSE",
+        '-DCMAKE_TOOLCHAIN_FILE=%s' % toolchain_cmake,
+        '-DCMAKE_INSTALL_PREFIX=%s' % cfg.stage_dir,
+        '-DCMAKE_BUILD_TYPE=Release',
+        '-DENABLE_VERSION_SUFFIX=FALSE',
+        '-DUSE_PYTHON3=FALSE',
         # Tell Shiboken not to build its own test suite (saves time).
-        "-DBUILD_TESTS=FALSE",
-        "-DCMAKE_VERBOSE_MAKEFILE=%s" % ("ON" if cfg.verbose else "OFF")]
-    log.info("Running cmake for Shiboken ...")
+        '-DBUILD_TESTS=FALSE',
+        '-DCMAKE_VERBOSE_MAKEFILE=%s' % ('ON' if cfg.verbose else 'OFF')]
+    log.info('Running cmake for Shiboken ...')
     _run(cmake_args, cwd=build_dir, env=env, dry_run=cfg.dry_run)
     # From modrana.org: wait after cmake so user can verify config.
     if not cfg.dry_run:
-        print("\n  Shiboken cmake configured. Press Enter to start make ...", end="")
+        print('\n  Shiboken cmake configured. Press Enter to start make ...', end='')
         stdin.readline()
-    log.info("Building Shiboken (threads=%d) ...", cfg.build_threads)
+    log.info('Building Shiboken (threads=%d) ...', cfg.build_threads)
     _run([getMakeExecutable(), "-j%d" % cfg.build_threads], cwd=build_dir, env=env, dry_run=cfg.dry_run)
-    log.info("Installing Shiboken to %s ...", cfg.stage_dir)
-    _run([getMakeExecutable(), "install"], cwd=build_dir, env=env, dry_run=cfg.dry_run)
-    log.info("Shiboken built OK")
+    log.info('Installing Shiboken to %s ...', cfg.stage_dir)
+    _run([getMakeExecutable(), 'install'], cwd=build_dir, env=env, dry_run=cfg.dry_run)
+    log.info('Shiboken built OK')
 
 
 # ===========================================================================
-# Step 6 -- Build PySide (cross-compile for ARM)
+# Step 6 -- Build PySide (cross-compile for ARM).
 # ===========================================================================
 
 def _fix_pyside_cmake_paths(cfg, build_dir):
@@ -796,23 +777,23 @@ def _fix_pyside_cmake_paths(cfg, build_dir):
     :param build_dir: str
     :return: None
     """
-    cmake_cache = join(build_dir, "CMakeCache.txt")
+    cmake_cache = join(build_dir, 'CMakeCache.txt')
     if not isfile(cmake_cache):
         return
-    log.info("Fixing PySide cmake paths ...")
+    log.info('Fixing PySide cmake paths ...')
     replacements = [
         # Replace host shiboken include with stage include.
-        (compile(r"SHIBOKEN_INCLUDE_DIR:PATH=.*"), "SHIBOKEN_INCLUDE_DIR:PATH=%s/include/shiboken" % cfg.stage_dir),
-        (compile(r"SHIBOKEN_PYTHON_INCLUDE_DIR:PATH=.*"),
-         "SHIBOKEN_PYTHON_INCLUDE_DIR:PATH=%s/include/python2.7" % cfg.android_python),
-        (compile(r"SHIBOKEN_LIBRARY:FILEPATH=.*"), "SHIBOKEN_LIBRARY:FILEPATH=%s/lib/libshiboken.so" % cfg.stage_dir)]
-    with open(cmake_cache, "r") as fh:
+        (compile(r'SHIBOKEN_INCLUDE_DIR:PATH=.*'), 'SHIBOKEN_INCLUDE_DIR:PATH=%s/include/shiboken' % cfg.stage_dir),
+        (compile(r'SHIBOKEN_PYTHON_INCLUDE_DIR:PATH=.*'),
+         'SHIBOKEN_PYTHON_INCLUDE_DIR:PATH=%s/include/python2.7' % cfg.android_python),
+        (compile(r'SHIBOKEN_LIBRARY:FILEPATH=.*'), 'SHIBOKEN_LIBRARY:FILEPATH=%s/lib/libshiboken.so' % cfg.stage_dir)]
+    with open(cmake_cache, 'r') as fh:
         content = fh.read()
     for pattern, replacement in replacements:
         content = pattern.sub(replacement, content)
-    with open(cmake_cache, "w") as fh:
+    with open(cmake_cache, 'w') as fh:
         fh.write(content)
-    log.info("cmake paths fixed in %s", cmake_cache)
+    log.info('cmake paths fixed in %s', cmake_cache)
 
 
 def build_pyside(cfg, env):
@@ -841,58 +822,58 @@ def build_pyside(cfg, env):
     :param env: dict[str, str]
     :return: None
     """
-    step("Step 6/13 -- Building PySide (ARM cross-compile)")
+    step('Step 6/13 -- Building PySide (ARM cross-compile)')
     if cfg.skip_build:
-        log.info("--skip-build set; skipping PySide compilation.")
+        log.info('--skip-build set; skipping PySide compilation.')
         return
-    # Find the toolchain cmake file written in Step 5
-    toolchain_cmake = join(cfg.work_dir, "android_toolchain.cmake")
+    # Find the toolchain cmake file written in Step 5.
+    toolchain_cmake = join(cfg.work_dir, 'android_toolchain.cmake')
     if not isfile(toolchain_cmake) and not cfg.dry_run:
-        raise IOError("Toolchain cmake not found: %s\nRun Step 5 (Shiboken build) first." % toolchain_cmake)
-    # Find Python library
-    python_lib = ""
+        raise IOError('Toolchain cmake not found: %s\nRun Step 5 (Shiboken build) first.' % toolchain_cmake)
+    # Find Python library.
+    python_lib = ''
     for root, dirs, files in walk(cfg.android_python):
         for f in files:
-            if f.startswith("libpython2.7") and f.endswith(".a"):
+            if f.startswith('libpython2.7') and f.endswith('.a'):
                 python_lib = join(root, f)
                 break
-    python_inc = ""
+    python_inc = ''
     for root, dirs, files in walk(cfg.android_python):
-        if "Python.h" in files:
+        if 'Python.h' in files:
             python_inc = root
             break
-    build_dir = join(cfg.work_dir, "build", "pyside")
+    build_dir = join(cfg.work_dir, 'build', 'pyside')
     if isdir(build_dir):
-        log.info("Clearing previous PySide build dir ...")
+        log.info('Clearing previous PySide build dir ...')
         rmtree(build_dir)
     _makedirs(build_dir)
     cmake_args = [
         getCmakeExecutable(),
         cfg.pyside_src,
-        "-DCMAKE_TOOLCHAIN_FILE=%s" % toolchain_cmake,
-        "-DCMAKE_INSTALL_PREFIX=%s" % cfg.stage_dir,
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DSHIBOKEN_INCLUDE_DIR=%s/include/shiboken" % cfg.stage_dir,
-        "-DSHIBOKEN_LIBRARY=%s/lib/libshiboken.so" % cfg.stage_dir,
-        "-DPYTHON_INCLUDE_DIR=%s" % python_inc,
-        "-DPYTHON_LIBRARY=%s" % python_lib,
-        "-DPYSIDE_ENABLE_STDDEBUG=FALSE",
-        "-DBUILD_TESTS=FALSE",
-        "-DCMAKE_VERBOSE_MAKEFILE=%s" % ("ON" if cfg.verbose else "OFF")]
-    log.info("Running cmake for PySide ...")
+        '-DCMAKE_TOOLCHAIN_FILE=%s' % toolchain_cmake,
+        '-DCMAKE_INSTALL_PREFIX=%s' % cfg.stage_dir,
+        '-DCMAKE_BUILD_TYPE=Release',
+        '-DSHIBOKEN_INCLUDE_DIR=%s/include/shiboken' % cfg.stage_dir,
+        '-DSHIBOKEN_LIBRARY=%s/lib/libshiboken.so' % cfg.stage_dir,
+        '-DPYTHON_INCLUDE_DIR=%s' % python_inc,
+        '-DPYTHON_LIBRARY=%s' % python_lib,
+        '-DPYSIDE_ENABLE_STDDEBUG=FALSE',
+        '-DBUILD_TESTS=FALSE',
+        '-DCMAKE_VERBOSE_MAKEFILE=%s' % ('ON' if cfg.verbose else 'OFF')]
+    log.info('Running cmake for PySide ...')
     _run(cmake_args, cwd=build_dir, env=env, dry_run=cfg.dry_run)
     # Fix any absolute host paths baked into the cache.
     if not cfg.dry_run:
         _fix_pyside_cmake_paths(cfg, build_dir)
     # From modrana.org: wait after cmake.
     if not cfg.dry_run:
-        print("\n  PySide cmake configured. Press Enter to start make ...", end="")
+        print('\n  PySide cmake configured. Press Enter to start make ...', end='')
         stdin.readline()
-    log.info("Building PySide (threads=%d) ...", cfg.build_threads)
-    _run([getMakeExecutable(), "-j%d" % cfg.build_threads], cwd=build_dir, env=env, dry_run=cfg.dry_run)
-    log.info("Installing PySide to %s ...", cfg.stage_dir)
-    _run([getMakeExecutable(), "install"], cwd=build_dir, env=env, dry_run=cfg.dry_run)
-    log.info("PySide built OK")
+    log.info('Building PySide (threads=%d) ...', cfg.build_threads)
+    _run([getMakeExecutable(), '-j%d' % cfg.build_threads], cwd=build_dir, env=env, dry_run=cfg.dry_run)
+    log.info('Installing PySide to %s ...', cfg.stage_dir)
+    _run([getMakeExecutable(), 'install'], cwd=build_dir, env=env, dry_run=cfg.dry_run)
+    log.info('PySide built OK')
 
 
 # ===========================================================================
@@ -908,31 +889,31 @@ def strip_binaries(cfg):
     :param cfg: BuildConfig
     :return: None
     """
-    step("Step 7/13 -- Stripping binaries")
+    step('Step 7/13 -- Stripping binaries')
     if cfg.skip_build:
-        log.info("--skip-build set; skipping strip.")
+        log.info('--skip-build set; skipping strip.')
         return
-    strip = join(cfg.toolchain_bin, "arm-linux-androideabi-strip")
+    strip = join(cfg.toolchain_bin, 'arm-linux-androideabi-strip')
     if not isfile(strip):
-        log.warning("strip not found at %s — skipping.", strip)
+        log.warning('strip not found at %s — skipping.', strip)
         return
-    so_dirs = [join(cfg.stage_dir, "lib"), join(cfg.stage_dir, "lib", "python2.7", "site-packages", "PySide")]
+    so_dirs = [join(cfg.stage_dir, 'lib'), join(cfg.stage_dir, 'lib', 'python2.7', 'site-packages', 'PySide')]
     for so_dir in so_dirs:
         if not isdir(so_dir):
             continue
         for fname in listdir(so_dir):
             if fname.endswith(".so"):
                 fpath = join(so_dir, fname)
-                log.info("Stripping: %s", fname)
+                log.info('Stripping: %s', fname)
                 _run([strip, fpath], dry_run=cfg.dry_run)
-    log.info("Strip done OK")
+    log.info('Strip done OK')
 
 
 # ===========================================================================
 # Step 8 -- Package application and Python libraries into ZIPs
 # ===========================================================================
 
-def _zip_directory(source_dir, zip_path, arc_root=""):
+def _zip_directory(source_dir, zip_path, arc_root=''):
     """
     Create *zip_path* from all files under *source_dir*.
     *arc_root* is a prefix inside the ZIP (e.g. "python/" for python27.zip).
@@ -941,14 +922,14 @@ def _zip_directory(source_dir, zip_path, arc_root=""):
     :param arc_root: str
     :return:
     """
-    with ZipFile(zip_path, "w", ZIP_DEFLATED) as zf:
+    with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zf:
         for root, dirs, files in walk(source_dir):
             # skip .pyc files and __pycache__
-            files = [f for f in files if not f.endswith(".pyc")]
+            files = [f for f in files if not f.endswith('.pyc')]
             for fname in files:
                 fpath = join(root, fname)
                 zf.write(fpath, join(arc_root, relpath(fpath, source_dir)))
-    log.info("Created %s  (%d KB)", basename(zip_path), getsize(zip_path) // 1024)
+    log.info('Created %s  (%d KB)', basename(zip_path), getsize(zip_path) // 1024)
 
 
 def package_bundles(cfg):
@@ -975,44 +956,44 @@ def package_bundles(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 8/13 -- Packaging application bundles")
-    res_raw = join(cfg.project_build, "android", "res", "raw")
+    step('Step 8/13 -- Packaging application bundles')
+    res_raw = join(cfg.project_build, 'android', 'res', 'raw')
     _makedirs(res_raw)
     # ------------------------------------------------------------------ #
     # 8a. python27.zip  (Python runtime + PySide libs)                   #
     # ------------------------------------------------------------------ #
-    python27_zip = join(res_raw, "python_27.zip")
+    python27_zip = join(res_raw, 'python_27.zip')
     # Assemble the content in a temp staging area.
-    py27_stage = join(cfg.work_dir, "py27_bundle")
+    py27_stage = join(cfg.work_dir, 'py27_bundle')
     if isdir(py27_stage):
         rmtree(py27_stage)
     _makedirs(py27_stage)
     # Copy Android Python tree.
-    android_py_tree = join(cfg.android_python, "python")
+    android_py_tree = join(cfg.android_python, 'python')
     if isdir(android_py_tree):
-        copytree(android_py_tree, join(py27_stage, "python"))
+        copytree(android_py_tree, join(py27_stage, 'python'))
     # Overlay PySide libraries from stage/
-    pyside_lib_src = join(cfg.stage_dir, "lib")
-    pyside_lib_dst = join(py27_stage, "python", "lib")
+    pyside_lib_src = join(cfg.stage_dir, 'lib')
+    pyside_lib_dst = join(py27_stage, 'python', 'lib')
     _makedirs(pyside_lib_dst)
-    for fname in ("libshiboken.so", "libpyside.so"):
+    for fname in ('libshiboken.so', 'libpyside.so'):
         src = join(pyside_lib_src, fname)
         if isfile(src):
             copy2(src, join(pyside_lib_dst, fname))
-            log.info("Bundled: %s", fname)
+            log.info('Bundled: %s', fname)
     # PySide Python extension modules.
-    pyside_pydir_src = join(cfg.stage_dir, "lib", "python2.7", "site-packages", "PySide")
-    pyside_pydir_dst = join(py27_stage, "python", "lib", "python2.7", "site-packages", "PySide")
+    pyside_pydir_src = join(cfg.stage_dir, 'lib', 'python2.7', 'site-packages', 'PySide')
+    pyside_pydir_dst = join(py27_stage, 'python', 'lib', 'python2.7', 'site-packages', 'PySide')
     if isdir(pyside_pydir_src) and not isdir(pyside_pydir_dst):
         copytree(pyside_pydir_src, pyside_pydir_dst)
-        log.info("Bundled: PySide site-packages")
+        log.info('Bundled: PySide site-packages')
     # Qt Components (imports + themes from modrana.org).
-    qt_comps_zip = join(cfg.downloads_dir, "qt_components_v1.zip")
-    qt_theme_zip = join(cfg.downloads_dir, "qt_components_theme_mini_v1.zip")
+    qt_comps_zip = join(cfg.downloads_dir, 'qt_components_v1.zip')
+    qt_theme_zip = join(cfg.downloads_dir, 'qt_components_theme_mini_v1.zip')
     _download(QT_COMPONENTS_URL, qt_comps_zip)
     _download(QT_COMPONENTS_THEME_URL, qt_theme_zip)
-    imports_dst = join(py27_stage, "python", "imports")
-    themes_dst = join(py27_stage, "python", "themes")
+    imports_dst = join(py27_stage, 'python', 'imports')
+    themes_dst = join(py27_stage, 'python', 'themes')
     if not isdir(imports_dst):
         _extract_zip(qt_comps_zip, imports_dst)
     if not isdir(themes_dst):
@@ -1020,13 +1001,13 @@ def package_bundles(cfg):
     if not cfg.dry_run:
         _zip_directory(py27_stage, python27_zip)
     else:
-        log.info("[DRY-RUN] Would create: %s", python27_zip)
+        log.info('[DRY-RUN] Would create: %s', python27_zip)
     # ------------------------------------------------------------------ #
     # 8b. my_python_project.zip  (application code)                      #
     # ------------------------------------------------------------------ #
-    project_zip = join(res_raw, "my_python_project.zip")
+    project_zip = join(res_raw, 'my_python_project.zip')
     # Collect .py files from the project_dir
-    app_stage = join(cfg.work_dir, "app_bundle")
+    app_stage = join(cfg.work_dir, 'app_bundle')
     if isdir(app_stage):
         rmtree(app_stage)
     _makedirs(app_stage)
@@ -1038,7 +1019,7 @@ def package_bundles(cfg):
     # From modrana.org:
     #   "unless libshiboken.so & libpyside.so are manually loaded,
     #    importing any PySide module fails."
-    main_py = join(app_stage, "main.py")
+    main_py = join(app_stage, 'main.py')
     if isfile(main_py):
         _inject_ctypes_preamble(main_py)
     else:
@@ -1047,8 +1028,8 @@ def package_bundles(cfg):
     if not cfg.dry_run:
         _zip_directory(app_stage, project_zip)
     else:
-        log.info("[DRY-RUN] Would create: %s", project_zip)
-    log.info("Bundles created OK")
+        log.info('[DRY-RUN] Would create: %s', project_zip)
+    log.info('Bundles created OK')
 
 
 def _inject_ctypes_preamble(main_py):
@@ -1076,15 +1057,15 @@ def _inject_ctypes_preamble(main_py):
         CDLL(join(_LIB_DIR, 'libpyside.so'))
         # ---- end preamble
     """)
-    with open(main_py, "r") as fh:
+    with open(main_py, 'r') as fh:
         content = fh.read()
     # Only inject if not already present.
-    if "libshiboken.so" not in content:
-        with open(main_py, "w") as fh:
-            fh.write(preamble + "\n" + content)
-        log.info("ctypes preamble injected into main.py")
+    if 'libshiboken.so' not in content:
+        with open(main_py, 'w') as fh:
+            fh.write(preamble + '\n' + content)
+        log.info('ctypes preamble injected into main.py')
     else:
-        log.info("ctypes preamble already present in main.py")
+        log.info('ctypes preamble already present in main.py')
 
 
 def _create_main_py_template(main_py):
@@ -1116,15 +1097,15 @@ def _create_main_py_template(main_py):
 
         label = QtGui.QLabel("Hello from PySide on Android!")
         label.setAlignment(QtCore.Qt.AlignCenter)
-        label.setWindowTitle("PySide Android")
+        label.setWindowTitle('PySide Android')
         label.resize(320, 240)
         label.show()
 
         sys.exit(app.exec_())
     """)
-    with open(main_py, "w") as fh:
+    with open(main_py, 'w') as fh:
         fh.write(template)
-    log.info("Created main.py template: %s", main_py)
+    log.info('Created main.py template: %s', main_py)
 
 
 # ===========================================================================
@@ -1146,10 +1127,10 @@ def generate_cpp_wrapper(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 9/13 -- C++ wrapper (main.h / main.cpp)")
+    step('Step 9/13 -- C++ wrapper (main.h / main.cpp)')
     install = cfg.install_path
-    files = install + "/files"
-    python = files + "/python"
+    files = install + '/files'
+    python = files + '/python'
     main_h_content = dedent("""\
         #ifndef MAIN_H
         #define MAIN_H
@@ -1196,7 +1177,7 @@ def generate_cpp_wrapper(cfg):
             Py_Initialize();
             PySys_SetArgv(argc, argv);
             /* Run the main Python file */
-            FILE *fp = fopen(MAIN_PYTHON_FILE, "r");
+            FILE *fp = fopen(MAIN_PYTHON_FILE, 'r');
             if (fp == NULL) {{
                 fprintf(stderr, "Cannot open main Python file: %s\\n",
                         MAIN_PYTHON_FILE);
@@ -1211,19 +1192,19 @@ def generate_cpp_wrapper(cfg):
     """)
     out_dir = cfg.project_build
     _makedirs(out_dir)
-    main_h_path = join(out_dir, "main.h")
-    main_cpp_path = join(out_dir, "main.cpp")
+    main_h_path = join(out_dir, 'main.h')
+    main_cpp_path = join(out_dir, 'main.cpp')
     if not cfg.dry_run:
-        with open(main_h_path, "w") as fh:
+        with open(main_h_path, 'w') as fh:
             fh.write(main_h_content)
-        with open(main_cpp_path, "w") as fh:
+        with open(main_cpp_path, 'w') as fh:
             fh.write(main_cpp_content)
     else:
-        log.info("[DRY-RUN] Would write: %s", main_h_path)
-        log.info("[DRY-RUN] Would write: %s", main_cpp_path)
-    log.info("main.h written:   %s", main_h_path)
-    log.info("main.cpp written: %s", main_cpp_path)
-    log.info("C++ wrapper generated OK")
+        log.info('[DRY-RUN] Would write: %s', main_h_path)
+        log.info('[DRY-RUN] Would write: %s', main_cpp_path)
+    log.info('main.h written:   %s', main_h_path)
+    log.info('main.cpp written: %s', main_cpp_path)
+    log.info('C++ wrapper generated OK')
 
 
 # ===========================================================================
@@ -1240,8 +1221,8 @@ def generate_global_constants(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 10/13 -- GlobalConstants.java")
-    java_dir = join(cfg.project_build, "android", "src", "org", "kde", "necessitas", "origo")
+    step('Step 10/13 -- GlobalConstants.java')
+    java_dir = join(cfg.project_build, 'android', 'src', 'org', 'kde', 'necessitas', 'origo')
     _makedirs(java_dir)
     content = dedent("""\
         // Generated by pyside_android_builder_py27.py
@@ -1266,13 +1247,13 @@ def generate_global_constants(cfg):
             public static final String LOG_TAG = "{app_name}APK";
         }}
     """).format(app_name=cfg.app_name)
-    out_path = join(java_dir, "GlobalConstants.java")
+    out_path = join(java_dir, 'GlobalConstants.java')
     if not cfg.dry_run:
-        with open(out_path, "w") as fh:
+        with open(out_path, 'w') as fh:
             fh.write(content)
     else:
-        log.info("[DRY-RUN] Would write: %s", out_path)
-    log.info("GlobalConstants.java written: %s", out_path)
+        log.info('[DRY-RUN] Would write: %s', out_path)
+    log.info('GlobalConstants.java written: %s', out_path)
 
 
 # ===========================================================================
@@ -1294,31 +1275,31 @@ def rename_project(cfg):
     :param cfg: BuildConfig
     :return:
     """
-    step("Step 11/13 -- Renaming project files")
+    step('Step 11/13 -- Renaming project files')
     proj = cfg.project_build
     new_name = cfg.app_name
     new_unique = cfg.unique_name
     # 1. Rename .pro file.
-    old_pro = join(proj, "%s.pro" % EXAMPLE_APP_NAME)
-    new_pro = join(proj, "%s.pro" % new_name)
+    old_pro = join(proj, '%s.pro' % EXAMPLE_APP_NAME)
+    new_pro = join(proj, '%s.pro' % new_name)
     if isfile(old_pro) and old_pro != new_pro:
         rename(old_pro, new_pro)
-        log.info("Renamed: %s.pro  ->  %s.pro", EXAMPLE_APP_NAME, new_name)
+        log.info('Renamed: %s.pro  ->  %s.pro', EXAMPLE_APP_NAME, new_name)
     # Build list of (filepath, old_string, new_string) replacements.
     replacements = []
     # .pro file content.
     if isfile(new_pro):
         replacements.append((new_pro, EXAMPLE_APP_NAME, new_name))
     # main.h
-    main_h = join(proj, "main.h")
+    main_h = join(proj, 'main.h')
     if isfile(main_h):
         replacements.append((main_h, EXAMPLE_UNIQUE_NAME, new_unique))
     # Android files.
-    android_dir = join(proj, "android")
+    android_dir = join(proj, 'android')
     file_patterns = [
         ('src/org/kde/necessitas/origo/QtActivity.java', [(EXAMPLE_UNIQUE_NAME, new_unique)]),
         ('AndroidManifest.xml', [(EXAMPLE_UNIQUE_NAME, new_unique), (EXAMPLE_APP_NAME, new_name)]),
-        ('res/values/strings.xml', [(EXAMPLE_APP_NAME, new_name)]), ("build.xml", [(EXAMPLE_APP_NAME, new_name)])]
+        ('res/values/strings.xml', [(EXAMPLE_APP_NAME, new_name)]), ('build.xml', [(EXAMPLE_APP_NAME, new_name)])]
     for rel_path, pairs in file_patterns:
         fpath = join(android_dir, rel_path)
         if isfile(fpath):
@@ -1333,7 +1314,7 @@ def rename_project(cfg):
     leftovers += _find_files_containing(proj, EXAMPLE_UNIQUE_NAME)
     if leftovers:
         log.warning(
-            'Leftover references to example project names found in:\n%s', "\n".join("  " + f for f in leftovers))
+            'Leftover references to example project names found in:\n%s', '\n'.join('  ' + f for f in leftovers))
     else:
         log.info('All example names replaced OK')
     log.info('Project rename done OK')
@@ -1359,22 +1340,22 @@ def build_apk(cfg, env):
     :return: None
     """
     step('Step 12/13 -- Building APK (ant debug)')
-    android_dir = join(cfg.project_build, "android")
-    build_xml = join(android_dir, "build.xml")
+    android_dir = join(cfg.project_build, 'android')
+    build_xml = join(android_dir, 'build.xml')
     if not isfile(build_xml) and not cfg.dry_run:
         log.warning(
-            "build.xml not found: %s\n  The Necessitas example project may not have been cloned "
-            "correctly. Try opening the .pro in Necessitas Qt Creator to build the APK interactively.", build_xml)
+            'build.xml not found: %s\n  The Necessitas example project may not have been cloned '
+            'correctly. Try opening the .pro in Necessitas Qt Creator to build the APK interactively.', build_xml)
         return
     # ndk-build first (native .so compilation).
-    ndk_build = join(cfg.ndk_root, "ndk-build")
+    ndk_build = join(cfg.ndk_root, 'ndk-build')
     if isfile(ndk_build):
         log.info('Running ndk-build ...')
         _run([ndk_build, "-j%d" % cfg.build_threads], cwd=android_dir, env=env, dry_run=cfg.dry_run)
     else:
         log.warning('ndk-build not found at %s — skipping.', ndk_build)
     # ant debug.
-    log.info("Running ant debug ...")
+    log.info('Running ant debug ...')
     _run([getAntExecutable(), 'debug', '-f', build_xml], cwd=cfg.project_build, env=env, dry_run=cfg.dry_run)
     # Locate APK.
     apk_search_dirs = [join(android_dir, 'bin'), cfg.project_build]
@@ -1382,18 +1363,17 @@ def build_apk(cfg, env):
     for search_dir in apk_search_dirs:
         if isdir(search_dir):
             for fname in listdir(search_dir):
-                if fname.endswith("-debug.apk") or fname.endswith(".apk"):
+                if fname.endswith('-debug.apk') or fname.endswith('.apk'):
                     found_apk = join(search_dir, fname)
                     break
     if found_apk and isfile(found_apk):
-        size_mb = getsize(found_apk) / (1024 * 1024.0)
-        log.info("APK built: %s  (%.1f MB)", found_apk, size_mb)
+        log.info('APK built: %s  (%.1f MB)', found_apk, getsize(found_apk) / (1024 * 1024.0))
         cfg.apk_path = found_apk
     elif cfg.dry_run:
-        log.info("[DRY-RUN] APK would be at: %s", cfg.apk_path)
+        log.info('[DRY-RUN] APK would be at: %s', cfg.apk_path)
     else:
-        log.warning("APK not found after ant build. Check ant output above.")
-    log.info("APK build done OK")
+        log.warning('APK not found after ant build. Check ant output above.')
+    log.info('APK build done OK')
 
 
 # ===========================================================================
@@ -1414,38 +1394,38 @@ def install_via_adb(cfg):
     :param cfg: BuildConfig
     :return: None
     """
-    step("Step 13/13 -- ADB install")
+    step('Step 13/13 -- ADB install')
     adb = cfg.adb_exe
     if not isfile(adb):
         # Fall back to system adb.
         try:
-            adb = _require_tool("adb")
+            adb = _require_tool('adb')
         except EnvironmentError:
-            log.warning("adb not found. Install android-tools-adb:\n"
-                        "  sudo apt-get install android-tools-adb\n  Or use the adb from Necessitas: %s", cfg.adb_exe)
+            log.warning('adb not found. Install android-tools-adb:\n'
+                        '  sudo apt-get install android-tools-adb\n  Or use the adb from Necessitas: %s', cfg.adb_exe)
             return
     # List devices.
-    result = _run([adb, "devices"], capture=True, check=False, dry_run=cfg.dry_run)
-    device_lines = [l for l in (result.stdout or '').splitlines() if l.strip() and "List of devices" not in l]
+    result = _run([adb, 'devices'], capture=True, check=False, dry_run=cfg.dry_run)
+    device_lines = [l for l in (result.stdout or '').splitlines() if l.strip() and 'List of devices' not in l]
     if not device_lines:
         log.warning(
-            "No ADB devices found.\n"
-            "  1. Enable Developer Options on your Android device.\n"
-            "  2. Enable USB Debugging.\n"
-            "  3. Accept the RSA fingerprint prompt, then retry.\n"
-            "\n"
-            "  NOTE: On first launch, Ministro will be required.\n"
-            "  Install it from the Play Store when prompted.")
+            'No ADB devices found.\n'
+            '  1. Enable Developer Options on your Android device.\n'
+            '  2. Enable USB Debugging.\n'
+            '  3. Accept the RSA fingerprint prompt, then retry.\n'
+            '\n'
+            '  NOTE: On first launch, Ministro will be required.\n'
+            '  Install it from the Play Store when prompted.')
         return
-    log.info("Connected devices:\n%s", "\n".join("  " + l for l in device_lines))
+    log.info('Connected devices:\n%s', '\n'.join('  ' + l for l in device_lines))
     apk = cfg.apk_path
     if not isfile(apk) and not cfg.dry_run:
-        log.warning("APK not found at: %s", apk)
+        log.warning('APK not found at: %s', apk)
         return
-    log.info("Installing: %s", basename(apk))
-    _run([adb, "install", "-r", apk], dry_run=cfg.dry_run)
-    log.info("Installation done OK")
-    log.info("Stream device logs:\n  %s logcat -s PythonAPK", adb)
+    log.info('Installing: %s', basename(apk))
+    _run([adb, 'install', '-r', apk], dry_run=cfg.dry_run)
+    log.info('Installation done OK')
+    log.info('Stream device logs:\n  %s logcat -s PythonAPK', adb)
 
 
 # ===========================================================================
@@ -1458,27 +1438,27 @@ def print_summary(cfg, apk_path=None):
     :param apk_path: str | None
     :return:
     """
-    step("Build summary")
+    step('Build summary')
     log.info(
-        "\n"
-        "  App name      : %s\n"
-        "  Unique name   : %s\n"
-        "  Install path  : %s\n"
-        "  Work dir      : %s\n"
-        "  Stage dir     : %s\n"
-        "  NDK           : %s\n"
-        "  APK           : %s",
+        '\n'
+        '  App name      : %s\n'
+        '  Unique name   : %s\n'
+        '  Install path  : %s\n'
+        '  Work dir      : %s\n'
+        '  Stage dir     : %s\n'
+        '  NDK           : %s\n'
+        '  APK           : %s',
         cfg.app_name, cfg.unique_name, cfg.install_path, cfg.work_dir, cfg.stage_dir, cfg.ndk_root,
         apk_path or cfg.apk_path)
     apk = apk_path or cfg.apk_path
     if cfg.dry_run:
-        log.info("\nDry-run complete -- no files produced.")
+        log.info('\nDry-run complete -- no files produced.')
     elif isfile(apk):
-        log.info("\nBuild succeeded!")
+        log.info('\nBuild succeeded!')
         log.info("  Install:  adb install %s", apk)
-        log.info("  Logs:     adb logcat -s PythonAPK")
+        log.info('  Logs:     adb logcat -s PythonAPK')
     else:
-        log.warning("\nAPK not found -- build may have failed.")
+        log.warning('\nAPK not found -- build may have failed.')
     log.info(dedent("""
         -------------------------------------------------------------------
         Error FAQ  (from modrana.org/trac/wiki/PySideForAndroid)
@@ -1521,7 +1501,7 @@ def print_summary(cfg, apk_path=None):
 
 
 # ===========================================================================
-# Argument parser
+# Argument parser.
 # ===========================================================================
 
 def build_arg_parser():
@@ -1529,8 +1509,7 @@ def build_arg_parser():
     :return:
     """
     parser = ArgumentParser(
-        prog="pyside_android_builder_py27.py",
-        formatter_class=RawDescriptionHelpFormatter,
+        prog='pyside_android_builder_py27.py', formatter_class=RawDescriptionHelpFormatter,
         description=dedent("""\
             PySide for Android Builder  (Python 2.7)
             =========================================
@@ -1572,30 +1551,30 @@ def build_arg_parser():
                   --necessitas-sdk ~/necessitas \\
                   --dry-run --verbose
         """))
-    parser.add_argument("--project-dir", required=True, metavar="DIR",
-                        help="Directory containing your PySide Python application (with main.py).")
+    parser.add_argument('--project-dir', required=True, metavar='DIR',
+                        help='Directory containing your PySide Python application (with main.py).')
     parser.add_argument(
-        "--necessitas-sdk", required=True, metavar="DIR", help="Path to your Necessitas SDK installation.")
-    parser.add_argument("--app-name", metavar="NAME", default=None,
-                        help="Application name (default: project directory basename).")
-    parser.add_argument("--unique-name", metavar="NAME", default=None,
-                        help=("Unique Android application name (e.g. com.example.MyApp). "
-                              "This determines the install path on the device. Default: com.example.<app-name>"))
-    parser.add_argument("--pyside-stage", metavar="DIR", default=None,
-                        help=("Use pre-built PySide/Shiboken libraries from this directory "
-                              "(the 'stage' folder from a previous build). "
-                              "Skips cross-compilation when combined with --skip-build."))
+        '--necessitas-sdk', required=True, metavar='DIR', help='Path to your Necessitas SDK installation.')
+    parser.add_argument('--app-name', metavar='NAME', default=None,
+                        help='Application name (default: project directory basename).')
+    parser.add_argument('--unique-name', metavar='NAME', default=None,
+                        help=('Unique Android application name (e.g. com.example.MyApp). '
+                              'This determines the install path on the device. Default: com.example.<app-name>'))
+    parser.add_argument('--pyside-stage', metavar='DIR', default=None,
+                        help=('Use pre-built PySide/Shiboken libraries from this directory '
+                              '(the "stage" folder from a previous build). '
+                              'Skips cross-compilation when combined with --skip-build.'))
     parser.add_argument(
-        "--build-threads", type=int, default=DEFAULT_BUILD_THREADS, metavar="N",
-        help="Number of parallel make jobs (default: %d)."
-             "Set to 1 if you get 'cc1plus: Internal error: Killed'." % DEFAULT_BUILD_THREADS)
-    parser.add_argument("--skip-build", action="store_true",
-                        help="Skip Shiboken and PySide cross-compilation (use --pyside-stage).")
-    parser.add_argument("--install-apk", action="store_true",
-                        help="Install the produced APK on the first ADB-connected device.")
-    parser.add_argument("--keep-build", action="store_true", help="Retain intermediate cmake build directories.")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug-level output.")
+        '--build-threads', type=int, default=DEFAULT_BUILD_THREADS, metavar='N',
+        help='Number of parallel make jobs (default: %d).'
+             'Set to 1 if you get "cc1plus: Internal error: Killed".' % DEFAULT_BUILD_THREADS)
+    parser.add_argument('--skip-build', action='store_true',
+                        help='Skip Shiboken and PySide cross-compilation (use --pyside-stage).')
+    parser.add_argument('--install-apk', action='store_true',
+                        help='Install the produced APK on the first ADB-connected device.')
+    parser.add_argument('--keep-build', action='store_true', help='Retain intermediate cmake build directories.')
+    parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them.')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable debug-level output.')
     return parser
 
 
