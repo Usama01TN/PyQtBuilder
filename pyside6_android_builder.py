@@ -40,82 +40,20 @@ from os.path import isdir, sep, join, dirname, exists, basename, getsize, getmti
     relpath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import basicConfig, getLogger, INFO, DEBUG
-from subprocess import check_call, Popen, PIPE
+from subprocess import Popen, PIPE
 from sys import exit, version_info, path
-from os import statvfs, makedirs, walk
 from platform import release, system
-from collections import namedtuple
 from textwrap import dedent
-from fnmatch import filter
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import which, getAdbExecutable, getGitExecutable
+    from .build_utils import which, _rglob, disk_usage, _makedirs, create, urlretrieve, URLError, FileNotFoundError
+    from .builders import getAdbExecutable, getGitExecutable
 except:
-    from builders import which, getAdbExecutable, getGitExecutable
-
-try:
-    from urllib import urlretrieve  # noqa: F401
-    from urllib2 import URLError  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
-    from urllib.error import URLError  # noqa: F401
-
-try:
-    FileNotFoundError
-except NameError:
-    FileNotFoundError = IOError
-
-try:
-    from shutil import disk_usage
-except ImportError:
-    _DiskUsage = namedtuple('DiskUsage', ['total', 'used', 'free'])
-
-
-    def disk_usage(pth):
-        """
-        Minimal statvfs-based replacement for shutil.disk_usage.
-        :param pth: str
-        :return: namedtuple
-        """
-        st = statvfs(pth)
-        return _DiskUsage(
-            st.f_blocks * st.f_frsize, (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_bavail * st.f_frsize)
-
-# venv.create (Python 3 only; fall back to 'virtualenv' CLI on Python 2)
-try:
-    from venv import create
-except:
-    def create(venv_dir, with_pip=True, clear=True):
-        """
-        Python 2 fallback: delegate to the 'virtualenv' command.
-        :param venv_dir: str
-        :param with_pip: bool
-        :param clear: bool
-        :return:
-        """
-        check_call(['virtualenv', venv_dir])
-
-
-# ---------------------------------------------------------------------------
-# path helpers (replacing pathlib.Path throughout).
-# ---------------------------------------------------------------------------
-
-def _makedirs(pth):
-    """
-    Create *path* and all missing parents; silently ignore if it exists.
-    :param pth: str
-    :return:
-    """
-    if not isdir(pth):
-        try:
-            makedirs(pth)
-        except OSError:
-            # Guard against a race condition where another process created it.
-            if not isdir(pth):
-                raise
+    from build_utils import which, _rglob, disk_usage, _makedirs, create, urlretrieve, URLError, FileNotFoundError
+    from builders import getAdbExecutable, getGitExecutable
 
 
 def _is_relative_to(pth, base):
@@ -131,21 +69,6 @@ def _is_relative_to(pth, base):
     rel = relpath(pth, base)  # type: str
     # relpath returns '..' or '../…' when path escapes base.
     return not (rel == '..' or rel.startswith('..' + sep))
-
-
-def _rglob(directory, pattern):
-    """
-    Recursively yield files under *directory* whose names match *pattern*.
-    Replicates Path.rglob() without pathlib.
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    matches = []
-    for root, _dirs, files in walk(directory):
-        for filename in filter(files, pattern):
-            matches.append(join(root, filename))
-    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +102,7 @@ PYSIDE_SETUP_URL = 'https://code.qt.io/pyside/pyside-setup'
 # Official wheelbase URL (Qt downloads page).
 WHEEL_BASE_URL = 'https://download.qt.io/official_releases/QtForPython'
 # Architecture mapping: script name -> Android ABI
-ARCH_MAP = {'aarch64': 'aarch64', 'x86_64': 'x86_64', "armv7a": 'armv7a', 'i686': 'i686'}
+ARCH_MAP = {'aarch64': 'aarch64', 'x86_64': 'x86_64', 'armv7a': 'armv7a', 'i686': 'i686'}
 # NDK / SDK paths placed by the Qt helper script.
 HOME_DIR = expanduser('~')  # type: str
 DEFAULT_CACHE_DIR = join(HOME_DIR, '.pyside6_android_deploy')  # type: str
@@ -226,7 +149,7 @@ class BuildConfig(object):
         :param sdk_path: str | None
         :param wheel_pyside: str | None
         :param wheel_shiboken: str | None
-        :param mode: (str) 'debug' -> .apk | "release" -> .aab
+        :param mode: (str) 'debug' -> .apk | 'release' -> .aab
         :param verbose: bool
         :param dry_run: bool
         :param keep_build_files: bool
@@ -334,7 +257,7 @@ def _require_tool(name):
     """
     pth = which(name)
     if not pth:
-        raise EnvironmentError("Required tool '{}' not found on PATH. Install it and re-run.".format(name))
+        raise EnvironmentError('Required tool "{}" not found on PATH. Install it and re-run.'.format(name))
     return pth
 
 
@@ -361,7 +284,7 @@ def _check_disk_space(pth, required_gb=MIN_DISK_GB):
     :return:
     """
     usage = disk_usage(pth)
-    free_gb = usage.free / 1024.0 ** 3  # float division.
+    free_gb = usage.free / 1024.0 ** 3  # Float division.
     if free_gb < required_gb:
         log.warning('Low disk space: %.1f GB free at %s (recommended: %d GB)', free_gb, pth, required_gb)
 
@@ -395,22 +318,22 @@ def preflight_checks(cfg):
         log.info('Found: %s -> %s', tool, _require_tool(tool))
     # Java version (JDK 17 required by Qt toolchain).
     java_out = _run(['java', '-version'], capture=True, check=False)
-    raw_output = java_out.stderr or java_out.stdout or ""
+    raw_output = java_out.stderr or java_out.stdout or ''
     output_lines = raw_output.splitlines()
-    version_line = output_lines[0] if output_lines else ""
+    version_line = output_lines[0] if output_lines else ''
     log.info('Java: %s', version_line)
     if '17' not in version_line and '21' not in version_line:
         log.warning("Qt's Android toolchain aligns with JDK 17. Other versions may cause Gradle errors.")
     # Project structure.
-    main_py = join(cfg.project_dir, "main.py")
+    main_py = join(cfg.project_dir, 'main.py')
     if not exists(main_py):
         raise FileNotFoundError(
-            "Entry point not found: {}\npyside6-android-deploy requires the main script to be named 'main.py'.".format(
+            'Entry point not found: {}\npyside6-android-deploy requires the main script to be named "main.py".'.format(
                 main_py))
     log.info('Entry point: %s', main_py)
     # Architecture
     if cfg.arch not in ARCH_MAP:
-        raise ValueError("Unknown architecture '{}'. Choose from: {}".format(cfg.arch, ', '.join(ARCH_MAP)))
+        raise ValueError('Unknown architecture "{}". Choose from: {}'.format(cfg.arch, ', '.join(ARCH_MAP)))
     log.info('Target architecture: %s', cfg.arch)
     log.info('Build mode: %s (%s)', cfg.mode, '.apk (debug)' if cfg.mode == 'debug' else '.aab (release)')
     log.info('Preflight checks passed :)')
@@ -428,7 +351,7 @@ def setup_virtualenv(cfg):
     """
     _step('Step 2/7 - Virtual environment')
     # The venv must NOT be inside the project directory (Qt quirk: it will try
-    # to bundle it, causing a RuntimeError about "too many QML files").
+    # to bundle it, causing a RuntimeError about 'too many QML files').
     if _is_relative_to(cfg.venv_dir, cfg.project_dir):
         raise ValueError(
             'Virtual environment must be outside the project directory. Current venv path: {}'.format(cfg.venv_dir))
@@ -486,7 +409,7 @@ def setup_android_sdk_ndk(cfg):
     else:
         log.info('pyside-setup already cloned at %s', setup_dir)
     # Install helper requirements into our venv.
-    reqs = [join(setup_dir, 'requirements.txt'), join(setup_dir, 'tools', 'cross_compile_android', "requirements.txt")]
+    reqs = [join(setup_dir, 'requirements.txt'), join(setup_dir, 'tools', 'cross_compile_android', 'requirements.txt')]
     for req in reqs:
         if exists(req):
             _run([cfg.pip_exe, 'install', '-r', req, '--quiet'], dry_run=cfg.dry_run)
@@ -550,7 +473,7 @@ def download_wheels(cfg):
     py_minor = cfg.python_version.split('.')[-1]
     pyside_url, shib_url = _wheel_urls(cfg.pyside_version, cfg.arch, py_minor)
     _makedirs(cfg.wheels_dir)
-    # basename works correctly on URL strings (forward-slash paths).
+    # Basename works correctly on URL strings (forward-slash paths).
     pyside_dest = join(cfg.wheels_dir, basename(pyside_url))
     shib_dest = join(cfg.wheels_dir, basename(shib_url))
     for url, dest in [(pyside_url, pyside_dest), (shib_url, shib_dest)]:
@@ -601,11 +524,11 @@ def build_apk(cfg):
     _run(cmd, cwd=cfg.project_dir)  # Must run even in dry_run mode.
     # Locate the produced artifact.
     ext = '.apk' if cfg.mode == 'debug' else '.aab'
-    matches = _rglob(cfg.project_dir, "*{}".format(ext))
+    matches = _rglob(cfg.project_dir, '*{}'.format(ext))
     if not matches:
         if cfg.dry_run:
             log.info('[DRY-RUN] Build skipped; no artifact produced.')
-            return join(cfg.project_dir, "{}{}".format(cfg.app_name, ext))
+            return join(cfg.project_dir, '{}{}'.format(cfg.app_name, ext))
         raise FileNotFoundError('Build completed but no {} file was found under {}.'.format(ext, cfg.project_dir))
     artifact = sorted(matches, key=lambda p: getmtime(p))[-1]
     size_mb = getsize(artifact) / 1024.0 ** 2  # Float division.
@@ -647,7 +570,7 @@ def install_via_adb(cfg, apk_path):
     log.info('Installing %s...', basename(apk_path))
     _run([adb, 'install', '-r', apk_path], dry_run=cfg.dry_run)
     log.info('Installation complete :)')
-    log.info("Tip: stream logs with:\n  %s logcat --regex '%s'", adb, cfg.app_name.lower())
+    log.info('Tip: stream logs with:\n  %s logcat --regex "%s"', adb, cfg.app_name.lower())
 
 
 # ------------------------------------------------------------------------------
@@ -741,9 +664,9 @@ def build_arg_parser():
     parser.add_argument(
         '--pyside-version', default=PYSIDE_VERSION, help='PySide6 version to use (default: {}).'.format(PYSIDE_VERSION))
     parser.add_argument('--python-version', default=PYTHON_VERSION, choices=['3.10', '3.11'],
-                        help="Python version for Android wheels (default: {}).".format(PYTHON_VERSION))
+                        help='Python version for Android wheels (default: {}).'.format(PYTHON_VERSION))
     parser.add_argument('--mode', choices=['debug', 'release'], default='debug',
-                        help="Build mode: 'debug' produces .apk, 'release' produces .aab (default: debug).")
+                        help='Build mode: "debug" produces .apk, "release" produces .aab (default: debug).')
     # Pre-downloaded asset paths.
     parser.add_argument('--ndk-path', type=str, default=None, help='Path to Android NDK root. Auto-detected if absent.')
     parser.add_argument('--sdk-path', type=str, default=None, help='Path to Android SDK root. Auto-detected if absent.')
