@@ -109,10 +109,7 @@ python pyqt5_android_builder.py --project-dir ./myapp --arch android-64
 python pyqt5_android_builder.py --project-dir ./myapp --arch android-32
 
 # Use a pre-installed Qt / SDK / NDK to skip the long downloads:
-python pyqt5_android_builder.py --project-dir ./myapp \
-    --qt-dir  ~/Qt5.15.2/5.15.2/android_arm64_v8a \
-    --ndk-path ~/Android/Sdk/ndk/21.4.7075529 \
-    --sdk-path ~/Android/Sdk
+python pyqt5_android_builder.py --project-dir ./myapp --qt-dir  ~/Qt5.15.2/5.15.2/android_arm64_v8a --ndk-path ~/Android/Sdk/ndk/21.4.7075529 --sdk-path ~/Android/Sdk
 
 # Sysroot only (good for CI caching):
 python pyqt5_android_builder.py --project-dir ./myapp --only-sysroot
@@ -121,8 +118,7 @@ python pyqt5_android_builder.py --project-dir ./myapp --only-sysroot
 python pyqt5_android_builder.py --project-dir ./myapp --install-apk
 
 # Add extra Qt modules:
-python pyqt5_android_builder.py --project-dir ./myapp \
-    --extra-pyqt-modules QtSql,QtBluetooth
+python pyqt5_android_builder.py --project-dir ./myapp --extra-pyqt-modules QtSql,QtBluetooth
 ```
 
 **Key flags.**
@@ -155,11 +151,7 @@ PyQt5 5.15.1 → Android APK following [kviktor/pyqtdeploy-android-build](https:
 
 **Usage.**
 ```bash
-python pyqt5_android_kviktor.py --project-dir ./myapp \
-    --app-name MyApp --package-name com.example.myapp \
-    --qt-dir ~/Qt5.13.2/5.13.2/android_arm64_v8a \
-    --ndk-path ~/Android/Sdk/ndk/20.1.5948944 \
-    --sdk-path ~/Android/Sdk
+python pyqt5_android_kviktor.py --project-dir ./myapp --app-name MyApp --package-name com.example.myapp --qt-dir ~/Qt5.13.2/5.13.2/android_arm64_v8a --ndk-path ~/Android/Sdk/ndk/20.1.5948944 --sdk-path ~/Android/Sdk
 ```
 
 **Key flags.** `--project-dir` (required), `--app-name`, `--package-name`, `--qt-dir`, `--ndk-path`, `--sdk-path`, `--jobs` (default 2 — kviktor uses `-j2`), `--extra-stdlib`, `--skip-sysroot`, `--install-apk`, `--keep-build`, `--dry-run`, `-v`.
@@ -176,9 +168,7 @@ PyQt5 5.3 → Android using the [Plashless 2014](https://plashless.wordpress.com
 
 **Usage.**
 ```bash
-python3.4 pyqt5_android_plashless.py --project-dir ./myapp \
-    --ndk-root ~/android-ndk-r10 \
-    --qt-dir   ~/Qt5.3/5.3/android_armv7
+python3.4 pyqt5_android_plashless.py --project-dir ./myapp --ndk-root ~/android-ndk-r10 --qt-dir   ~/Qt5.3/5.3/android_armv7
 ```
 
 **Key flags.** `--project-dir`, `--app-name`, `--ndk-root`, `--qt-dir`, `--sysroot`, `--work-dir`, `--python-src`, `--sip-src`, `--pyqt5-src`, `--jobs` (default 2), `--skip-static-build`, `--install-apk`, `--keep-build`, `--dry-run`, `-v`.
@@ -194,20 +184,16 @@ Modern PyQt5 → iOS `.xcodeproj` builder for macOS, using `pyqtdeploy` 3.3.x.
 **Usage.**
 ```bash
 # Generate Xcode project:
-python pyqt5_ios_builder.py --project-dir ./myapp \
-    --qmake ~/Qt/5.15.18/ios/bin/qmake
+python pyqt5_ios_builder.py --project-dir ./myapp --qmake ~/Qt/5.15.18/ios/bin/qmake
 
 # Build and open in Xcode automatically:
-python pyqt5_ios_builder.py --project-dir ./myapp \
-    --qmake ~/Qt/5.15.18/ios/bin/qmake --open-xcode
+python pyqt5_ios_builder.py --project-dir ./myapp --qmake ~/Qt/5.15.18/ios/bin/qmake --open-xcode
 
 # Build and run on the iOS Simulator:
-python pyqt5_ios_builder.py --project-dir ./myapp \
-    --qmake ~/Qt/5.15.18/ios/bin/qmake --run-simulator
+python pyqt5_ios_builder.py --project-dir ./myapp --qmake ~/Qt/5.15.18/ios/bin/qmake --run-simulator
 
 # Sysroot only (cache it for CI):
-python pyqt5_ios_builder.py --project-dir ./myapp \
-    --qmake ~/Qt/5.15.18/ios/bin/qmake --only-sysroot
+python pyqt5_ios_builder.py --project-dir ./myapp --qmake ~/Qt/5.15.18/ios/bin/qmake --only-sysroot
 ```
 
 **Key flags.** `--project-dir` (required), `--qmake`, `--qt-version`, `--pyqt-version`, `--python-version`, `--extra-modules`, `--sysroot`, `--only-sysroot`, `--open-xcode`, `--run-simulator`, `--keep-build`, `--dry-run`, `-v`.
@@ -224,12 +210,7 @@ PyQt5 5.3.1 → iOS following the [Plashless macOS / iOS trilogy](https://plashl
 
 **Usage.**
 ```bash
-python pyqt5_ios_plashless.py --project-dir ./myapp \
-    --qt-dir ~/Qt5.3.1/5.3/ios \
-    --python-home ~/python3.4-ios \
-    --sysroot ~/ios/iRoot \
-    --downloads-dir ~/ios/Downloads \
-    --work-dir ~/ios/pensoolBuild
+python pyqt5_ios_plashless.py --project-dir ./myapp --qt-dir ~/Qt5.3.1/5.3/ios --python-home ~/python3.4-ios --sysroot ~/ios/iRoot --downloads-dir ~/ios/Downloads --work-dir ~/ios/pensoolBuild
 ```
 
 **Key flags.** `--project-dir`, `--app-name`, `--qt-dir`, `--python-home`, `--sysroot`, `--downloads-dir`, `--work-dir`, `--python-src`, `--sip-src`, `--pyqt5-src`, `--pyqtdeploy-src`, `--extra-qt-modules`, `--use-qml`, `--simulator`, `--skip-static`, `--jobs` (default 4), `--keep-build`, `--dry-run`, `-v`.
@@ -251,12 +232,10 @@ python pyqt6_ios_builder.py --check-deps
 python pyqt6_ios_builder.py --install-pyqtdeploy
 
 # Build:
-python pyqt6_ios_builder.py --app myapp.py \
-    --qmake /path/to/Qt/6.9.1/ios/bin/qmake
+python pyqt6_ios_builder.py --app myapp.py --qmake /path/to/Qt/6.9.1/ios/bin/qmake
 
 # Override versions:
-python pyqt6_ios_builder.py --app myapp.py \
-    --qmake /path/to/qmake --qt-version 6.9.2 --python-version 3.12.0
+python pyqt6_ios_builder.py --app myapp.py --qmake /path/to/qmake --qt-version 6.9.2 --python-version 3.12.0
 ```
 
 **Key flags (mutually exclusive actions).** `--app SCRIPT`, `--check-deps`, `--install-pyqtdeploy`. **Other flags.** `--qmake`, `--qt-version`, `--python-version`, `--pdt FILE`, `--pyqt-tarball FILE`, `--work-dir`, `--verbose` / `--quiet`, `--debug`.
@@ -283,13 +262,10 @@ python pyside6_android_builder.py --project-dir ./myapp --only-setup-env
 python pyside6_android_builder.py --project-dir ./myapp --arch aarch64 --install-apk
 
 # Use pre-downloaded PySide6 + Shiboken Android wheels:
-python pyside6_android_builder.py --project-dir ./myapp \
-    --wheel-pyside   /path/to/PySide6-...-android_aarch64.whl \
-    --wheel-shiboken /path/to/shiboken6-...-android_aarch64.whl
+python pyside6_android_builder.py --project-dir ./myapp --wheel-pyside   /path/to/PySide6-...-android_aarch64.whl --wheel-shiboken /path/to/shiboken6-...-android_aarch64.whl
 
 # Debug build with intermediate files retained:
-python pyside6_android_builder.py --project-dir ./myapp \
-    --keep-build-files --verbose
+python pyside6_android_builder.py --project-dir ./myapp --keep-build-files --verbose
 ```
 
 **Key flags.** `--project-dir`, `--app-name`, `--arch` (`aarch64` / `armv7a` / `x86_64` / `i686`), `--python-version` (`3.10` or `3.11`), `--mode` (`debug` / `release`), `--ndk-path`, `--sdk-path`, `--wheel-pyside`, `--wheel-shiboken`, `--only-setup-env`, `--install-apk`, `--keep-build-files`, `--dry-run`, `-v`.
@@ -314,11 +290,7 @@ python pyside6_ios_builder.py --check-deps
 
 # Pick up where you are: bootstrap toolchain, then build everything:
 python pyside6_ios_builder.py --bootstrap
-python pyside6_ios_builder.py --build-all \
-    --app /path/to/myapp \
-    --app-name "My PySide6 App" \
-    --bundle-id com.example.myapp \
-    --team-id ABC123XYZ
+python pyside6_ios_builder.py --build-all --app /path/to/myapp --app-name "My PySide6 App" --bundle-id com.example.myapp --team-id ABC123XYZ
 ```
 
 **Pipeline actions (mutually exclusive).** `--check-deps`, `--bootstrap`, `--build-qtruntime`, `--build-support`, `--build-all`, `--generate-only`, `--list-devices`.
@@ -341,14 +313,10 @@ PySide → Android using the **Necessitas SDK** + M4rtinK's [android-pyside-buil
 
 **Usage.**
 ```bash
-python2.7 pyside_android_builder_py27.py --project-dir ./myapp \
-    --necessitas-sdk ~/necessitas \
-    --app-name MyApp \
-    --unique-name com.example.MyApp
+python2.7 pyside_android_builder_py27.py --project-dir ./myapp --necessitas-sdk ~/necessitas --app-name MyApp --unique-name com.example.MyApp
 
 # Use pre-built PySide libs (skip the long Shiboken/PySide compile):
-python2.7 pyside_android_builder_py27.py --project-dir ./myapp \
-    --necessitas-sdk ~/necessitas --pyside-stage ~/prebuilt-pyside-android
+python2.7 pyside_android_builder_py27.py --project-dir ./myapp --necessitas-sdk ~/necessitas --pyside-stage ~/prebuilt-pyside-android
 ```
 
 **Key flags.** `--project-dir`, `--necessitas-sdk`, `--app-name`, `--unique-name`, `--pyside-stage`, `--skip-build`, `--install-apk`, `--keep-build`, `--dry-run`, `-v`.
