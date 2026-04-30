@@ -50,127 +50,26 @@ Requirements (host machine):
 from os.path import join, basename, exists, dirname, isdir, getsize, getmtime, expanduser, realpath, normpath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import getLogger, DEBUG, basicConfig, INFO
-from os import environ, statvfs, walk, makedirs
-from subprocess import Popen, PIPE, check_call
 from platform import system, release
-from collections import namedtuple
+from subprocess import Popen, PIPE
 from sys import version_info, path
 from shutil import rmtree, copy2
 from textwrap import dedent
-from fnmatch import filter
+from os import environ
 from sys import exit
 import tarfile
-import io
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import which, getMakeExecutable, getJavaExecutable
+    from .build_utils import cpu_count, _makedirs, _rglob, _write_text, create, urlretrieve, URLError, disk_usage, \
+        _read_text, which, FileNotFoundError
+    from .builders import getMakeExecutable, getJavaExecutable
 except:
-    from builders import which, getMakeExecutable, getJavaExecutable
-try:
-    from urllib import urlretrieve  # noqa: F401
-    from urllib2 import URLError  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
-    from urllib.error import URLError  # noqa: F401
-try:
-    FileNotFoundError
-except:
-    FileNotFoundError = IOError
-
-try:
-    from shutil import disk_usage
-except:
-    _DiskUsage = namedtuple('DiskUsage', ['total', 'used', 'free'])
-
-
-    def disk_usage(pth):
-        """
-        :param pth: str
-        :return: _DiskUsage
-        """
-        st = statvfs(pth)
-        return _DiskUsage(
-            st.f_blocks * st.f_frsize, (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_bavail * st.f_frsize)
-
-try:
-    from os import cpu_count
-except:
-    def cpu_count():
-        """
-        Fallback cpu_count using /proc/cpuinfo.
-        :return: int | None
-        """
-        try:
-            with open('/proc/cpuinfo') as fh:
-                return sum(1 for line in fh if line.strip().startswith('processor'))
-        except:
-            return None
-
-try:
-    from venv import create
-except:
-    def create(venv_dir, with_pip=True, clear=True):
-        """
-        :param venv_dir: str
-        :param with_pip: bool
-        :param clear: bool
-        :return:
-        """
-        check_call(['virtualenv', venv_dir])
-
-
-def _makedirs(pth):
-    """
-    Create *path* and all missing parents; silently ignore if it exists.
-    :param pth: str
-    :return:
-    """
-    if not isdir(pth):
-        try:
-            makedirs(pth)
-        except OSError:
-            if not isdir(pth):
-                raise
-
-
-def _rglob(directory, pattern):
-    """
-    Recursively yield file paths under *directory* whose names match *pattern*.
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    matches = []  # type: list[str]
-    for root, _dirs, files in walk(directory):
-        for filename in filter(files, pattern):
-            matches.append(join(root, filename))
-    return matches
-
-
-def _read_text(pth, encoding='utf-8'):
-    """
-    Read and return the entire contents of *path* as a Unicode string.
-    :param pth: str
-    :param encoding: str
-    :return:
-    """
-    with io.open(pth, 'r', encoding=encoding) as fh:
-        return fh.read()
-
-
-def _write_text(pth, text, encoding='utf-8'):
-    """
-    Write *text* to *path*, overwriting any existing content.
-    :param pth: str
-    :param text: str
-    :param encoding: str
-    :return:
-    """
-    with io.open(pth, 'w', encoding=encoding) as fh:
-        fh.write(text)
+    from build_utils import cpu_count, _makedirs, _rglob, _write_text, create, urlretrieve, URLError, disk_usage, \
+        _read_text, which, FileNotFoundError
+    from builders import getMakeExecutable, getJavaExecutable
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +120,7 @@ QT_DOWNLOAD_URL = 'https://d13lb3tujbc8s0.cloudfront.net/onlineinstallers/qt-uni
 # Architecture targets recognized by pyqtdeploycli.
 ARCH_MAP = {
     'android-32': 'android_armv7',  # armeabi-v7a (32-bit ARM).
-    'android-64': "android_arm64_v8a",  # arm64-v8a  (64-bit ARM, recommended).
+    'android-64': 'android_arm64_v8a',  # arm64-v8a  (64-bit ARM, recommended).
     'android-x86': 'android_x86',
     'android-x86_64': 'android_x86_64'}
 # Required disk space (GB).
@@ -1121,7 +1020,7 @@ def build_arg_parser():
     # Build control flags.
     parser.add_argument('--only-sysroot', action='store_true', help='Build sysroot only; skip APK packaging.')
     parser.add_argument(
-        '--install-apk', action="store_true", help='Install the produced APK on the first ADB-connected device.')
+        '--install-apk', action='store_true', help='Install the produced APK on the first ADB-connected device.')
     parser.add_argument(
         '--keep-build', action='store_true', help='Keep intermediate build directory after APK is produced.')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them.')
