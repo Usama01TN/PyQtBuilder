@@ -60,148 +60,29 @@ from os.path import isdir, join, basename, dirname, exists, realpath, normpath, 
 from re import DOTALL, compile, finditer, MULTILINE, sub, search, IGNORECASE
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import getLogger, DEBUG, basicConfig, INFO
-from os import environ, makedirs, walk, listdir
-from subprocess import check_call, Popen, PIPE
 from platform import mac_ver, system, machine
 from sys import exit, version_info, path
+from subprocess import Popen, PIPE
 from textwrap import dedent
-from fnmatch import filter
 from json import loads
+from os import environ
 import tarfile
-import io
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import which, getXcrunExecutable, getOpenExecutable, getXcodebuildExecutable, \
-        getXcodeSelectExecutable
+    from .builders import getXcrunExecutable, getOpenExecutable, getXcodebuildExecutable, getXcodeSelectExecutable
+    from .build_utils import which, _rglob, _glob_dir, create, _makedirs, _write_text, _read_text, urlretrieve, \
+        URLError, disk_usage, FileNotFoundError
 except:
-    from builders import which, getXcrunExecutable, getOpenExecutable, getXcodebuildExecutable, getXcodeSelectExecutable
-
-try:
-    from urllib import urlretrieve  # noqa: F401
-    from urllib2 import URLError  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
-    from urllib.error import URLError  # noqa: F401
-
-try:
-    FileNotFoundError
-except:
-    FileNotFoundError = IOError
-
-try:
-    from shutil import disk_usage
-except:
-    from collections import namedtuple
-    from os import statvfs
-
-    _DiskUsage = namedtuple('DiskUsage', ['total', 'used', 'free'])
-
-
-    def disk_usage(pth):
-        """
-        Minimal os.statvfs-based replacement for shutil.disk_usage (Python / macOS).
-        :param pth: str
-        :return: _DiskUsage
-        """
-        st = statvfs(pth)
-        return _DiskUsage(
-            st.f_blocks * st.f_frsize, (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_bavail * st.f_frsize)
-
-try:
-    from venv import create
-except:
-    def create(venv_dir, with_pip=True, clear=True):
-        """
-        Delegate to the 'virtualenv' command.
-        :param venv_dir: str
-        :param with_pip: bool
-        :param clear: bool
-        :return:
-        """
-        check_call(['virtualenv', venv_dir])
+    from builders import getXcrunExecutable, getOpenExecutable, getXcodebuildExecutable, getXcodeSelectExecutable
+    from build_utils import which, _rglob, _glob_dir, create, _makedirs, _write_text, _read_text, urlretrieve, \
+        URLError, disk_usage, FileNotFoundError
 
 
 # ---------------------------------------------------------------------------
-# os.path / io helpers  (replacing pathlib.Path throughout).
-# ---------------------------------------------------------------------------
-
-def _makedirs(pth):
-    """
-    Create *path* and all missing parents; silently ignore if it exists.
-    :param pth: str
-    :return:
-    """
-    if not isdir(pth):
-        try:
-            makedirs(pth)
-        except OSError:
-            if not isdir(pth):
-                raise
-
-
-def _rglob(directory, pattern):
-    """
-    Recursively yield file paths under *directory* whose names match *pattern*.
-    Replaces Path.rglob() without pathlib.
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    matches = []  # type: list[str]
-    for root, _dirs, files in walk(directory):
-        for filename in filter(files, pattern):
-            matches.append(join(root, filename))
-    return matches
-
-
-def _glob_dir(directory, pattern):
-    """
-    List direct children of *directory* whose names match *pattern*.
-    Replaces Path.glob() for a single directory level without pathlib.
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    results = []  # type: list[str]
-    try:
-        entries = listdir(directory)  # type: list[str]
-    except OSError:
-        return results
-    for entry in filter(entries, pattern):
-        results.append(join(directory, entry))
-    return results
-
-
-def _read_text(pth, encoding="utf-8"):
-    """
-    Read and return the entire contents of *path* as a unicode string.
-    Replaces Path.read_text() without pathlib.
-    :param pth: str
-    :param encoding: str
-    :return: str
-    """
-    with io.open(pth, "r", encoding=encoding) as fh:
-        return fh.read()
-
-
-def _write_text(pth, text, encoding="utf-8"):
-    """
-    Write *text* (unicode string) to *path*, overwriting any existing content.
-    Replaces Path.write_text() without pathlib.
-    :param pth: str
-    :param text: str
-    :param encoding: str
-    :return:
-    """
-    with io.open(pth, "w", encoding=encoding) as fh:
-        fh.write(text)
-
-
-# ---------------------------------------------------------------------------
-# subprocess helper  (replacing subprocess.run + CompletedProcess)
+# subprocess helper  (replacing subprocess.run + CompletedProcess).
 # ---------------------------------------------------------------------------
 
 class SimpleProcess(object):
@@ -210,14 +91,20 @@ class SimpleProcess(object):
     """
 
     def __init__(self, args, returncode, stdout='', stderr=''):
-        self.args = args
-        self.returncode = returncode
+        """
+        :param args: list[str]
+        :param returncode: int
+        :param stdout: str
+        :param stderr: str
+        """
+        self.args = args  # type: list[str]
+        self.returncode = returncode  # type: int
         self.stdout = stdout or ''  # type: str
         self.stderr = stderr or ''  # type: str
 
 
 # ------------------------------------------------------------------------------
-# Constants
+# Constants.
 # ------------------------------------------------------------------------------
 # Tested combination that is known to work (OforOshima article).
 QT_VERSION = '5.15.18'  # type: str
@@ -419,7 +306,7 @@ class BuildConfig(object):
 
 
 # ------------------------------------------------------------------------------
-# Subprocess helpers
+# Subprocess helpers.
 # ------------------------------------------------------------------------------
 
 def _run(cmd, cwd=None, env=None, check=True, dry_run=False, capture=False):
@@ -585,7 +472,7 @@ def preflight_checks(cfg):
             'Then pass --qmake ~/Qt/5.15.18/ios/bin/qmake'.format(cfg.qmake_path, QT_VERSION))
     res = _run([cfg.qmake_path, '--version'], capture=True, check=False)
     qmake_lines = (res.stdout or '').splitlines()
-    log.info('qmake   : %s', qmake_lines[0] if qmake_lines else "unknown")
+    log.info('qmake   : %s', qmake_lines[0] if qmake_lines else 'unknown')
     # Project directory.
     if not isdir(cfg.project_dir):
         raise FileNotFoundError('Project directory not found: {}'.format(cfg.project_dir))
@@ -608,7 +495,7 @@ def preflight_checks(cfg):
 
 
 # ------------------------------------------------------------------------------
-# Step 2 - Host virtual environment
+# Step 2 - Host virtual environment.
 # ------------------------------------------------------------------------------
 
 def setup_venv(cfg):
@@ -638,7 +525,7 @@ def setup_venv(cfg):
 
 
 # ------------------------------------------------------------------------------
-# Step 3 - Toolchain validation
+# Step 3 - Toolchain validation.
 # ------------------------------------------------------------------------------
 
 def validate_toolchain(cfg):
@@ -681,7 +568,7 @@ def validate_toolchain(cfg):
 
 
 # ------------------------------------------------------------------------------
-# Step 4 - Download source tarballs
+# Step 4 - Download source tarballs.
 # ------------------------------------------------------------------------------
 
 def download_sources(cfg):
@@ -760,7 +647,7 @@ def patch_platforms_py(cfg):
     elif_match = elif_pattern.search(text)
     patched = False
     if dict_match:
-        # Insert 'arm64': 'macos-64' into the mapping dict
+        # Insert 'arm64': 'macos-64' into the mapping dict.
         new_entry = "    'arm64': 'macos-64',\n    " + _ARM64_PATCH_MARKER + "\n"
         new_text = text[:dict_match.start(2)] + new_entry + text[dict_match.start(2):]
         _write_text(pf, new_text)
@@ -841,6 +728,7 @@ def patch_sip_plugin(cfg):
     character of the pattern into a case-insensitive character class, then
     replace all glob.glob() calls in SIP.py with _iglob().
     :param cfg: BuildConfig
+    :return: None
     """
     _step('Step 5c/9 - Patch: SIP.py (case-insensitive glob)')
     sp = cfg.sip_plugin_py
@@ -928,8 +816,8 @@ def generate_sysroot_toml(cfg):
     """
     _step('Step 6/9 - sysroot.toml')
     if exists(cfg.sysroot_toml):
-        log.info("sysroot.toml already exists: %s", cfg.sysroot_toml)
-        log.info("Tip: edit it to change Qt modules or version pins, then re-run.")
+        log.info('sysroot.toml already exists: %s', cfg.sysroot_toml)
+        log.info('Tip: edit it to change Qt modules or version pins, then re-run.')
         _patch_sysroot_toml_versions(cfg)
         return
     modules_block = "\n".join('    "{}",'.format(m) for m in (DEFAULT_PYQT5_MODULES + cfg.extra_modules))
@@ -1046,9 +934,7 @@ def build_xcodeproj(cfg):
        including the qmake .pro files."
       "For an iOS target qmake generates an Xcode project file."
     From OforOshima build command:
-      python build-demo.py --target ios-64
-                           --qmake /Users/xxxx/Qt/5.15.18/ios/bin/qmake
-                           --verbose
+      python build-demo.py --target ios-64 --qmake /Users/xxxx/Qt/5.15.18/ios/bin/qmake --verbose
     The build-demo.py script calls pyqtdeploy-build then qmake internally;
     we replicate those steps here for any .pdt file.
     :param cfg: BuildConfig
@@ -1165,10 +1051,10 @@ def _run_in_simulator(cfg, xcodeproj):
     if not sim_device_udid:
         log.warning(
             'No available iPhone simulator found.\nInstall iOS Simulator runtimes via:  Xcode -> Settings -> Platforms')
-        # Fall back to a named destination
+        # Fall back to a named destination.
         sim_device_udid = 'platform=iOS Simulator,name=iPhone 16'
     xcodebuild_cmd = [getXcodebuildExecutable(), '-project', xcodeproj, '-scheme', cfg.app_name, '-destination',
-                      "id={}".format(sim_device_udid), '-configuration', 'Debug', 'build']
+                      'id={}'.format(sim_device_udid), '-configuration', 'Debug', 'build']
     if not cfg.verbose:
         xcodebuild_cmd.append('-quiet')
     log.info('Running xcodebuild...')
@@ -1319,7 +1205,7 @@ def build_arg_parser():
     parser.add_argument('--extra-modules', type=str, default='', dest='extra_modules',
                         help='Comma-separated extra Qt modules (e.g. QtSql,QtBluetooth).')
     # Pre-existing paths.
-    parser.add_argument('--sysroot', type=str, default=None, dest="sysroot_path",
+    parser.add_argument('--sysroot', type=str, default=None, dest='sysroot_path',
                         help='Reuse an existing sysroot directory (skip rebuild).')
     # Build control.
     parser.add_argument('--only-sysroot', action='store_true',
