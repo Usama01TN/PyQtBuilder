@@ -42,57 +42,26 @@ Python 2/3 compatibility notes
 from os.path import exists, join, isdir, basename, dirname, abspath, splitext
 from argparse import RawDescriptionHelpFormatter, ArgumentParser
 from logging import basicConfig, INFO, getLogger, DEBUG
-from os import listdir, makedirs
 from tempfile import gettempdir
 from platform import system
 from fnmatch import fnmatch
 from textwrap import dedent
 from zipfile import ZipFile
 from sys import path, exit
+from os import listdir
 from glob import glob
-import io
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import run, which, getXcodeSelectExecutable, getPyqtdeploySysrootExecutable, \
-        getPyqtdeployBuildExecutable, getMakeExecutable, getPythonExecutable
+    from .builders import getXcodeSelectExecutable, getPyqtdeploySysrootExecutable, getPyqtdeployBuildExecutable, \
+        getMakeExecutable, getPythonExecutable
+    from .build_utils import run, which, _write_text, urlretrieve, _makedirs
 except:
-    from builders import run, which, getXcodeSelectExecutable, getPyqtdeploySysrootExecutable, \
-        getPyqtdeployBuildExecutable, getMakeExecutable, getPythonExecutable
-
-# -- urllib ------------------------------------------------------------------
-try:
-    from urllib import urlretrieve  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
-
-
-def _makedirs(pth):
-    """
-    Create *path* and all missing parent directories.
-    Equivalent to Path.mkdir(parents=True, exist_ok=True).
-    """
-    try:
-        makedirs(pth)
-    except OSError:
-        if not isdir(pth):
-            raise
-
-
-def _write_text(pth, text, encoding='utf-8'):
-    """
-    Write the unicode string *text* to *path*.
-    Uses io.open so the encoding keyword.
-    Equivalent to Path.write_text(text, encoding=encoding).
-    :param pth: str
-    :param text: str
-    :param encoding: str
-    :return:
-    """
-    with io.open(pth, 'w', encoding=encoding) as fh:
-        fh.write(text)
+    from builders import getXcodeSelectExecutable, getPyqtdeploySysrootExecutable, getPyqtdeployBuildExecutable, \
+        getMakeExecutable, getPythonExecutable
+    from build_utils import run, which, _write_text, urlretrieve, _makedirs
 
 
 def _glob(directory, pattern):
@@ -108,7 +77,7 @@ def _stem(pth):
     """
     Return the filename stem (no directory, no final extension).
     Equivalent to Path.stem.
-    Example: _stem("/foo/bar/myapp.py") == "myapp"
+    Example: _stem('/foo/bar/myapp.py') == 'myapp'
     :param pth: str
     :return: str
     """
@@ -665,7 +634,7 @@ def parse_args():
     action.add_argument('--install-pyqtdeploy', action='store_true',
                         help='Download and install the modified pyqtdeploy, then exit.')
     # Build options.
-    parser.add_argument('--qmake', metavar="PATH", default=None,
+    parser.add_argument('--qmake', metavar='PATH', default=None,
                         help='Full path to the iOS qmake binary, e.g. ~/Qt/6.9.1/ios/bin/qmake')
     parser.add_argument(
         '--qt-version', metavar='VER', default=DEFAULT_QT_VERSION,
@@ -683,7 +652,7 @@ def parse_args():
         '--skip-sysroot', action='store_true', help='Skip the sysroot build step (use when already built).')
     parser.add_argument(
         '--open-xcode', action='store_true', help='Automatically open the .xcodeproj in Xcode when done.')
-    parser.add_argument('--verbose', action="store_true", default=True,
+    parser.add_argument('--verbose', action='store_true', default=True,
                         help='Pass --verbose to pyqtdeploy tools (default: on).')
     parser.add_argument('--quiet', action='store_true', help='Suppress verbose output from pyqtdeploy tools.')
     parser.add_argument('--work-dir', metavar='DIR',
