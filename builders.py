@@ -2,81 +2,18 @@
 """
 Helping to get builders tools currently.
 """
-from os.path import isfile, join, exists, split, dirname
-from sys import executable, platform
+from os.path import isfile, join, exists, dirname
+from sys import executable, platform, path
 from cmake import CMAKE_BIN_DIR
 from json import loads
 
-# -- shutil.which ------------------------------------------------------------
-try:
-    from shutil import which
-except:
-    from os import pathsep, environ, access, X_OK
-
-
-    def which(name):
-        """
-        Locate an executable on PATH.
-        :param name: str | unicode
-        :return: str | unicode | None
-        """
-
-        def isExecutable(pth):
-            """
-            :param pth: str | unicode
-            :return: bool
-            """
-            return isfile(pth) and access(pth, X_OK)
-
-        path, _ = split(name)
-        if path:
-            if isExecutable(name):
-                return name
-        else:
-            for directory in environ.get('PATH', '').split(pathsep):
-                fullPath = join(directory, name)
-                if isExecutable(fullPath):
-                    return fullPath
-        exts = environ.get('PATHEXT', '').split(pathsep)
-        for directory in environ.get('PATH', '').split(pathsep):
-            for ext in [''] + exts:
-                fullPath = join(directory, name + ext)
-                if isfile(fullPath) and access(fullPath, X_OK):
-                    return fullPath
-        return None
+if dirname(__file__) not in path:
+    path.append(dirname(__file__))
 
 try:
-    from subprocess import run
+    from .build_utils import run, which
 except:
-    from subprocess import Popen, call, PIPE
-
-
-    class _CompletedProcess(object):
-        """
-        Minimal subprocess.CompletedProcess shim.
-        """
-
-        def __init__(self, args, returncode, stdout=None, stderr=None):
-            self.args = args
-            self.returncode = returncode
-            self.stdout = stdout or ''
-            self.stderr = stderr or ''
-
-
-    def run(cmd, cwd=None, env=None, capture_output=False, text=True):
-        """
-        Python shim for subprocess.run(capture_output=...).
-        """
-        if capture_output:
-            proc = Popen(cmd, cwd=cwd, env=env, stdout=PIPE, stderr=PIPE)
-            stdoutBytes, stderrBytes = proc.communicate()
-            if text:
-                stdout = stdoutBytes.decode("utf-8", errors="replace")
-                stderr = stderrBytes.decode("utf-8", errors="replace")
-            else:
-                stdout, stderr = stdoutBytes, stderrBytes
-            return _CompletedProcess(cmd, proc.returncode, stdout, stderr)
-        return _CompletedProcess(cmd, call(cmd, cwd=cwd, env=env))
+    from build_utils import run, which
 
 
 def getCmakeVersion(cmakePath):
@@ -89,8 +26,7 @@ def getCmakeVersion(cmakePath):
         return loads(result.stdout)['version']['string']
     except:
         # In some cases (like Pyodide<0.26's cmake wrapper), `-E` isn't handled
-        # correctly, so let's try `--version`, which is more common so more
-        # likely to be wrapped correctly
+        # correctly, so let's try `--version`, which is more common so more likely to be wrapped correctly.
         try:
             result = run([str(cmakePath), '--version'], capture_output=True, text=True)
             return result.stdout.splitlines()[0].split()[-1].split('-')[0]
@@ -117,8 +53,8 @@ def getCmakeExecutable():
     """
     :return: str | unicode
     """
-    path = '{}/cmake'.format(CMAKE_BIN_DIR)  # type: str
-    cmakeExec = '{}.exe'.format(path) if isfile('{}.exe'.format(path)) else path
+    pth = '{}/cmake'.format(CMAKE_BIN_DIR)  # type: str
+    cmakeExec = '{}.exe'.format(pth) if isfile('{}.exe'.format(pth)) else pth
     if exists(cmakeExec):
         return cmakeExec
     for name in ('cmake', 'cmake3'):
