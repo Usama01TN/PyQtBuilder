@@ -52,137 +52,28 @@ Requirements:
 from os.path import join, exists, getmtime, getsize, realpath, expanduser, basename, normpath, dirname, pathsep, \
     splitext, isdir
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from os import environ, listdir, statvfs, makedirs, walk
 from logging import basicConfig, INFO, getLogger, DEBUG
-from subprocess import Popen, PIPE, check_call
 from sys import version_info, exit, path
 from platform import system, release
+from subprocess import Popen, PIPE
 from textwrap import dedent
 from zipfile import ZipFile
-from fnmatch import filter
 from shutil import copy2
 from json import dumps
+from os import environ
 import tarfile
-import io
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import which, getMakeExecutable, getJavaExecutable
+    from .build_utils import _makedirs, urlretrieve, URLError, _write_text, _read_text, _rglob, _glob_dir, create, \
+        disk_usage, which, FileNotFoundError
+    from .builders import getMakeExecutable, getJavaExecutable
 except:
-    from builders import which, getMakeExecutable, getJavaExecutable
-try:
-    from urllib import urlretrieve  # noqa: F401
-    from urllib2 import URLError  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
-    from urllib.error import URLError  # noqa: F401
-
-# FileNotFoundError does not exist; alias to IOError
-try:
-    FileNotFoundError
-except:
-    FileNotFoundError = IOError
-
-try:
-    from shutil import disk_usage
-except ImportError:
-    from collections import namedtuple
-
-    _DiskUsage = namedtuple('DiskUsage', ['total', 'used', 'free'])
-
-
-    def disk_usage(pth):
-        """
-        os.statvfs-based replacement for shutil.disk_usage (Python 2 / Linux).
-        :param pth: str
-        :return: _DiskUsage
-        """
-        st = statvfs(pth)
-        return _DiskUsage(
-            st.f_blocks * st.f_frsize, (st.f_blocks - st.f_bfree) * st.f_frsize, st.f_bavail * st.f_frsize)
-
-try:
-    from venv import create
-except ImportError:
-    def create(venv_dir, with_pip=True, clear=True):
-        """
-        Delegate to the 'virtualenv' command.
-        :param venv_dir: str
-        :param with_pip: bool
-        :param clear: bool
-        :return:
-        """
-        check_call(['virtualenv', venv_dir])
-
-
-def _makedirs(pth):
-    """
-    Create *path* and all missing parents; silently ignore if it exists.
-    :param pth: str
-    :return:
-    """
-    if not isdir(pth):
-        try:
-            makedirs(pth)
-        except OSError:
-            if not isdir(pth):
-                raise
-
-
-def _rglob(directory, pattern):
-    """
-    Recursively yield file paths under *directory* whose names match *pattern*.
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    matches = []
-    for root, _dirs, files in walk(directory):
-        for filename in filter(files, pattern):
-            matches.append(join(root, filename))
-    return matches
-
-
-def _glob_dir(directory, pattern):
-    """
-    List direct children of *directory* whose names match *pattern*.
-    :param directory: str
-    :param pattern: str
-    :return: list[str]
-    """
-    results = []
-    try:
-        entries = listdir(directory)
-    except OSError:
-        return results
-    for entry in filter(entries, pattern):
-        results.append(join(directory, entry))
-    return results
-
-
-def _read_text(pth, encoding='utf-8'):
-    """
-    Read and return the entire contents of *path* as a unicode string.
-    :param pth: str
-    :param encoding: str
-    :return: str
-    """
-    with io.open(pth, 'r', encoding=encoding) as fh:
-        return fh.read()
-
-
-def _write_text(pth, text, encoding='utf-8'):
-    """
-    Write *text* (unicode string) to *path*, overwriting any existing content.
-    :param pth: str
-    :param text: str
-    :param encoding: str
-    :return:
-    """
-    with io.open(pth, 'w', encoding=encoding) as fh:
-        fh.write(text)
+    from build_utils import _makedirs, urlretrieve, URLError, _write_text, _read_text, _rglob, _glob_dir, create, \
+        disk_usage, which, FileNotFoundError
+    from builders import getMakeExecutable, getJavaExecutable
 
 
 # ---------------------------------------------------------------------------
@@ -520,12 +411,12 @@ def preflight(cfg):
     if system() != 'Linux':
         raise EnvironmentError('This pipeline requires Linux (Ubuntu 20.04 recommended). Detected: {}'.format(system()))
     log.info('Host OS:  %s %s', system(), release())
-    # Python version of this script (must be >= 3.6)
+    # Python version of this script (must be >= 3.6).
     major, minor = version_info[:2]
     if (major, minor) < (3, 6):
         raise EnvironmentError('This script requires Python >= 3.6 (found {}.{}).'.format(major, minor))
     log.info('Script Python: %d.%d', major, minor)
-    # Required system tools (from kviktor README apt-get install)
+    # Required system tools (from kviktor README apt-get install).
     required = {
         'clang': 'sudo apt-get install clang',
         'make': 'sudo apt-get install build-essential',
@@ -677,7 +568,7 @@ def validate_sdk_ndk(cfg):
     if exists(platform_dir):
         log.info('Android API %s: %s :)', ANDROID_API_PLATFORM, platform_dir)
     else:
-        log.warning("Android platform API %s not found at %s.\nInstall with:\n  %s 'platforms;android-%s'",
+        log.warning('Android platform API %s not found at %s.\nInstall with:\n  %s "platforms;android-%s"',
                     ANDROID_API_PLATFORM, platform_dir, cfg.sdkmanager, ANDROID_API_PLATFORM)
     log.info('SDK/NDK validation passed :)')
 
@@ -781,7 +672,7 @@ def generate_sysroot_json(cfg):
         },
         'Qt': {
             'android_abis': ['arm64-v8a'],
-            'edition': "open-source",
+            'edition': 'open-source',
             'installed_copy': {
                 'android': {
                     'dir': '%(QT_DIR)s/{}'.format(QT_ARCH_SUBDIR),
@@ -828,7 +719,7 @@ def generate_app_pdy(cfg):
         _create_main_py_template(cfg)
     # Build extra qmake ANDROID_PACKAGE_SOURCE_DIR variable.
     android_src = cfg.android_source_dir.replace(cfg.project_dir + '/', '')
-    py_target_ver = '.'.join(PYTHON_VERSION.split('.')[:2])  # "3.7"
+    py_target_ver = '.'.join(PYTHON_VERSION.split('.')[:2])  # '3.7'
     pdy_xml = dedent("""\
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE pyqtdeploy>
