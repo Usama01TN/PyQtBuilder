@@ -59,30 +59,25 @@ Usage:
 """
 from os.path import expanduser, basename, realpath, join, isdir, isfile, dirname, getmtime, getsize, exists, pathsep
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from os import environ, chmod, listdir, walk, makedirs, statvfs
 from logging import basicConfig, getLogger, DEBUG, INFO
+from os import environ, chmod, listdir, walk, statvfs
 from sys import exit, version_info, path
 from re import DOTALL, match, compile
 from platform import system, release
 from subprocess import PIPE, Popen
 from textwrap import dedent
 from zipfile import ZipFile
-from errno import EEXIST
 import tarfile
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
 try:
-    from .builders import which, getMakeExecutable, getHgExecutable, getPythonExecutable
+    from .builders import getMakeExecutable, getHgExecutable, getPythonExecutable
+    from .build_utils import which, _makedirs, urlretrieve, URLError
 except:
-    from builders import which, getMakeExecutable, getHgExecutable, getPythonExecutable
-try:
-    from urllib import urlretrieve  # noqa: F401
-    from urllib2 import URLError  # noqa: F401
-except:
-    from urllib.request import urlretrieve  # noqa: F401
-    from urllib.error import URLError  # noqa: F401
+    from builders import getMakeExecutable, getHgExecutable, getPythonExecutable
+    from build_utils import which, _makedirs, urlretrieve, URLError
 
 # =============================================================================
 # Constants -- pinned to plashless guide versions.
@@ -224,7 +219,7 @@ class BuildConfig(object):
         env['ANDROID_NDK_ROOT'] = self.ndk_root
         env['SYSROOT'] = self.sysroot
         # From plashless Part 1:
-        # "PyQt5 installs to /usr/lib/Python3.4/site-packages, and that must be on PYTHONPATH."
+        # 'PyQt5 installs to /usr/lib/Python3.4/site-packages, and that must be on PYTHONPATH.'
         existing_pp = env.get('PYTHONPATH', '')
         env['PYTHONPATH'] = '/usr/lib/python3.4/site-packages' + (pathsep + existing_pp if existing_pp else '')
         # NDK toolchain on PATH
@@ -291,18 +286,6 @@ def _require_tool(name):
     if not pth:
         raise EnvironmentError('Required tool "{0}" not found on PATH.'.format(name))
     return pth
-
-
-def _makedirs(pth):
-    """
-    :param pth: str
-    :return:
-    """
-    try:
-        makedirs(pth)
-    except OSError as exc:
-        if exc.errno != EEXIST:
-            raise
 
 
 def _download(url, dest):
@@ -888,7 +871,7 @@ def patch_python_pro(cfg):
         log.info('Appended %d module source(s) to python.pro', len(new_sources))
     else:
         # Fallback: append at end of file.
-        with open(python_pro, "a") as fh:
+        with open(python_pro, 'a') as fh:
             fh.write('\n# Added by pyqt5_android_plashless.py\n')
             fh.write('SOURCES += \\\n')
             for src_line in new_sources:
@@ -1032,8 +1015,8 @@ def build_sip_static(cfg):
     cfg_file = join(cfg.sip_src, 'sip-android.cfg')
     # 2. python3 configure.py
     log.info('Running SIP configure.py ...')
-    _run([getPythonExecutable(), 'configure.py', '--static', '--sysroot={0}'.format(cfg.sysroot), '--no-tools', '--use-qmake',
-          '--configuration={0}'.format(cfg_file)], cwd=cfg.sip_src, env=env, dry_run=cfg.dry_run)
+    _run([getPythonExecutable(), 'configure.py', '--static', '--sysroot={0}'.format(cfg.sysroot), '--no-tools',
+          '--use-qmake', '--configuration={0}'.format(cfg_file)], cwd=cfg.sip_src, env=env, dry_run=cfg.dry_run)
     # 3. qmake (Android qmake; ANDROID_NDK_ROOT must be set)
     log.info('Running qmake for SIP ...')
     _run([cfg.qmake], cwd=cfg.sip_src, env=env, dry_run=cfg.dry_run)
@@ -1185,7 +1168,7 @@ def create_pdy_project(cfg):
     step('Step 13/15 -- pyqtdeploy project (.pdy)')
     _makedirs(cfg.build_dir)
     if isfile(cfg.pdy_file):
-        log.info("Using existing .pdy: %s", cfg.pdy_file)
+        log.info('Using existing .pdy: %s', cfg.pdy_file)
         # Basic validation: check it references SYSROOT or the sysroot path.
         with open(cfg.pdy_file, 'r') as fh:
             content = fh.read()
@@ -1413,8 +1396,8 @@ def _install_apk(cfg, apk_path):
         log.warning('adb not found; skipping install.')
         return
     result = _run([adb, 'devices'], capture=True, check=False, dry_run=cfg.dry_run)
-    lines = (result.stdout or b'').decode('utf-8', errors="replace").splitlines()
-    devices = [l for l in lines if l.strip() and "List of devices" not in l]
+    lines = (result.stdout or b'').decode('utf-8', errors='replace').splitlines()
+    devices = [l for l in lines if l.strip() and 'List of devices' not in l]
     if not devices:
         log.warning('No ADB devices connected; skipping install.')
         return
@@ -1560,7 +1543,7 @@ def make_parser():
     )
     parser.add_argument('--project-dir', required=True, metavar='DIR',
                         help='Your app directory (must contain or will receive main.py).')
-    parser.add_argument('--app-name', default=None, metavar="NAME",
+    parser.add_argument('--app-name', default=None, metavar='NAME',
                         help='Application name (default: project dir basename).')
     # Toolchain
     parser.add_argument('--ndk-root', default=DEFAULT_NDK_ROOT, metavar='DIR',
