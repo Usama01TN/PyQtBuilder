@@ -14,10 +14,9 @@ except:
     from urllib.request import urlretrieve, urlopen  # noqa: F401
     from urllib.error import URLError  # noqa: F401
 try:
-    FileNotFoundError
+    FileNotFoundError = FileNotFoundError
 except:
     FileNotFoundError = IOError
-
 try:
     from shutil import which
 except:
