@@ -248,14 +248,14 @@ def patch_pyside6_buildozer(venv_dir: str) -> None:
         r'(self\.set_value\(\s*"app"\s*,\s*"requirements"\s*,\s*")'
         r'python3'
         r'(\s*,\s*shiboken6\s*,\s*PySide6\s*"\s*\))',
-        r'\1python3==' + TARGET_PYTHON + r'\2',
+        r'\g<1>python3==' + TARGET_PYTHON + r'\g<2>',
         src, count=1,
     )
     new_src, branch_n = re.subn(
         r'(self\.set_value\(\s*"app"\s*,\s*"p4a\.branch"\s*,\s*")'
         r'develop'
         r'(\s*"\s*\))',
-        r'\1' + P4A_BRANCH + r'\2',
+        r'\g<1>' + P4A_BRANCH + r'\g<2>',
         new_src, count=1,
     )
 
