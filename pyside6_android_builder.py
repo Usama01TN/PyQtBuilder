@@ -422,10 +422,13 @@ def setup_virtualenv(cfg):
     # tell from the build log whether the pin took effect and whether our
     # assumption about that version's default is right.
     _log_p4a_diagnostics(cfg)
-    # Patch PySide6's installed deploy code to embed the version pin directly
-    # in the generated buildozer.spec. This is what actually controls the
-    # Python version that p4a builds, regardless of p4a's own default.
+    # Patch PySide6 source (defensive, in case requirements override matters)
     _patch_pyside6_for_python_311(cfg)
+    # THE KEY FIX: edit p4a's python3 recipe to hardcode Python 3.11.5.
+    # The recipe's `version` class attribute is the source of truth for what
+    # Python version p4a builds; nothing in buildozer.spec or the CLI overrides
+    # it. Direct file edit is the only reliable way.
+    _patch_p4a_python3_recipe(cfg, '3.11.5')
     log.info('Virtual environment ready :)')
 
 
@@ -444,6 +447,73 @@ def _log_p4a_diagnostics(cfg):
                 '    print("ERROR:", e)\n'],
                capture=True, check=False, dry_run=cfg.dry_run)
     log.info('  python3 recipe version : %s', (res.stdout or '?').strip())
+
+
+def _patch_p4a_python3_recipe(cfg, target_version='3.11.5'):
+    """
+    Force python-for-android's python3 recipe to build a specific Python version
+    by editing its source file. This is the ONLY reliable way -- nothing in
+    buildozer.spec, requirements lists, or CLI flags overrides the recipe's
+    hardcoded `version` class attribute.
+
+    Steps:
+      1. Locate <venv>/lib/.../pythonforandroid/recipes/python3/__init__.py
+      2. Replace `version = '3.X.Y'` with `version = '<target_version>'`
+      3. Comment out md5sum / sha256sum (the new tarball would fail any old hash)
+      4. Verify by reimporting the module and reading the new version
+    :param cfg:            BuildConfig
+    :param target_version: str, e.g. '3.11.5'
+    """
+    log.info('Patching p4a python3 recipe to build Python %s...', target_version)
+    res = _run([cfg.python_exe, '-c',
+                'import importlib.util; '
+                's = importlib.util.find_spec("pythonforandroid.recipes.python3"); '
+                'print(s.origin if s else "")'],
+               capture=True, check=False, dry_run=cfg.dry_run)
+    recipe_path = (res.stdout or '').strip()
+    if not recipe_path or not exists(recipe_path):
+        log.error('  python3 recipe file not found; cannot enforce Python version!')
+        return
+    log.info('  Recipe at: %s', recipe_path)
+    with open(recipe_path, 'r', encoding='utf-8') as fh:
+        original = fh.read()
+    # Show current relevant attrs for diagnostics
+    log.info('  --- recipe attributes BEFORE ---')
+    for line in original.split('\n'):
+        s = line.strip()
+        if s and not s.startswith('#') and any(
+                s.startswith(prefix) for prefix in (
+                    'version =', 'version=', 'url =', 'url=',
+                    'md5sum =', 'sha256sum =', 'patches =')):
+            log.info('    %s', s)
+    log.info('  --------------------------------')
+    # Replace `version = '...'` with our target
+    modified, n_ver = _re.subn(
+        r"(\bversion\s*=\s*['\"])3\.\d+\.\d+(['\"])",
+        r"\g<1>" + target_version + r"\g<2>",
+        original, count=1
+    )
+    if n_ver == 0:
+        log.error('  No `version = "3.X.Y"` line in recipe -- ABORTING patch')
+        log.error('  First 80 lines for diagnosis:')
+        for i, line in enumerate(original.split('\n')[:80], 1):
+            log.error('    %3d: %s', i, line)
+        return
+    # Comment out hash checks; the new tarball won't match an old hash.
+    modified = _re.sub(
+        r"^(\s*)(md5sum|sha256sum)(\s*=)",
+        r"\1# \2\3",
+        modified, flags=_re.MULTILINE,
+    )
+    with open(recipe_path, 'w', encoding='utf-8') as fh:
+        fh.write(modified)
+    log.info('  Wrote patched recipe (%d version replacement(s))', n_ver)
+    # Verify by reimporting in a fresh subprocess
+    res = _run([cfg.python_exe, '-c',
+                'from pythonforandroid.recipes.python3 import Python3Recipe; '
+                'print("AFTER PATCH version =", Python3Recipe.version)'],
+               capture=True, check=False, dry_run=cfg.dry_run)
+    log.info('  %s', (res.stdout or '?').strip())
 
 
 def _patch_pyside6_for_python_311(cfg):
@@ -666,6 +736,19 @@ def build_apk(cfg):
         log.info('Removing buildozer p4a clone at %s to force version refresh', cached_p4a)
         from shutil import rmtree as _rmtree
         _rmtree(cached_p4a, ignore_errors=True)
+    # Also drop any cached Python build dirs -- if a previous run built Python
+    # 3.14 they're sitting in build/other_builds/python3 and build/python-installs.
+    # Without removing them, p4a will happily reuse the wrong-version build.
+    bz_platform = join(expanduser('~'), '.buildozer', 'android', 'platform')
+    if isdir(bz_platform):
+        from shutil import rmtree as _rmtree
+        for sub in listdir(bz_platform):
+            for victim in ('build/python-installs', 'build/other_builds/python3',
+                           'build/other_builds/hostpython3'):
+                v = join(bz_platform, sub, *victim.split('/'))
+                if isdir(v):
+                    log.info('  Dropping cached Python build: %s', v)
+                    _rmtree(v, ignore_errors=True)
     cmd = [
         cfg.pyside6_android_deploy, '--name', cfg.app_name, '--wheel-pyside', cfg.wheel_pyside, '--wheel-shiboken',
         cfg.wheel_shiboken, '--ndk-path', cfg.ndk_path, '--sdk-path', cfg.sdk_path, '--force',  # non-interactive.
