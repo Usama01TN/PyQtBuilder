@@ -425,6 +425,74 @@ def download_android_wheels(args):
     return paths['pyside'], paths['shiboken']
 
 
+def _setup_buildozer_sdk_layout() -> None:
+    """
+    Pre-populate buildozer's SDK directory with cmdline-tools symlinked from
+    the system SDK, plus a legacy tools/bin/sdkmanager symlink.
+
+    Why: buildozer 1.5.0's targets/android.py (line 246-247) looks for
+    sdkmanager at the LEGACY path <sdk>/tools/bin/sdkmanager.  Google moved
+    sdkmanager to cmdline-tools years ago, and the commandlinetools-linux
+    archive buildozer downloads doesn't put it at the legacy path.  The
+    result: buildozer finishes its cmdline-tools download, then fails
+    immediately with "sdkmanager not installed".
+
+    The fix:
+      * Symlink <bz_sdk>/cmdline-tools/latest -> /usr/local/.../sdk/cmdline-tools/latest
+        (the runner's system SDK has cmdline-tools already, with licenses)
+      * Symlink <bz_sdk>/tools/bin/sdkmanager  -> .../cmdline-tools/latest/bin/sdkmanager
+        (the legacy path buildozer expects)
+
+    Buildozer's _install_android_sdk() sees the directory already exists and
+    skips its broken download path entirely.  sdkmanager runs with explicit
+    --sdk_root=<bz_sdk>, so build-tools and platforms get installed into
+    buildozer's SDK dir, not back into the system SDK.
+    """
+    bz_sdk = expanduser('~/.buildozer/android/platform/android-sdk')
+    sys_sdk = (os.environ.get('ANDROID_SDK_ROOT')
+               or os.environ.get('ANDROID_HOME')
+               or '/usr/local/lib/android/sdk')
+
+    if not isdir(sys_sdk):
+        log.warning('  System SDK not found at %s — buildozer will try to '
+                    'download cmdline-tools and likely fail.', sys_sdk)
+        return
+    sys_cmdtools = join(sys_sdk, 'cmdline-tools', 'latest')
+    if not isdir(sys_cmdtools):
+        log.warning('  System SDK at %s has no cmdline-tools/latest.', sys_sdk)
+        return
+
+    log.info('  Source SDK: %s', sys_sdk)
+    os.makedirs(bz_sdk, exist_ok=True)
+
+    # 1. Symlink cmdline-tools/latest into buildozer's SDK
+    bz_cmdtools = join(bz_sdk, 'cmdline-tools', 'latest')
+    os.makedirs(dirname(bz_cmdtools), exist_ok=True)
+    if os.path.islink(bz_cmdtools) or exists(bz_cmdtools):
+        try:
+            if os.path.islink(bz_cmdtools):
+                os.unlink(bz_cmdtools)
+            else:
+                shutil.rmtree(bz_cmdtools)
+        except OSError:
+            pass
+    os.symlink(sys_cmdtools, bz_cmdtools)
+    log.info('  symlink: cmdline-tools/latest -> %s', sys_cmdtools)
+
+    # 2. Symlink legacy tools/bin/sdkmanager (what buildozer 1.5 expects)
+    bz_tools_bin = join(bz_sdk, 'tools', 'bin')
+    os.makedirs(bz_tools_bin, exist_ok=True)
+    legacy = join(bz_tools_bin, 'sdkmanager')
+    actual = join(bz_cmdtools, 'bin', 'sdkmanager')
+    if os.path.islink(legacy) or exists(legacy):
+        try:
+            os.unlink(legacy)
+        except OSError:
+            pass
+    os.symlink(actual, legacy)
+    log.info('  symlink: tools/bin/sdkmanager -> %s', actual)
+
+
 def _accept_android_sdk_licenses() -> None:
     """
     Pre-create license files in buildozer's SDK directory so sdkmanager
@@ -521,6 +589,8 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     if not exists(deploy):
         raise RuntimeError('pyside6-android-deploy not found at ' + deploy)
 
+    log.info('Pre-staging Android SDK for buildozer...')
+    _setup_buildozer_sdk_layout()
     log.info('Pre-accepting Android SDK licenses for buildozer...')
     _accept_android_sdk_licenses()
 
