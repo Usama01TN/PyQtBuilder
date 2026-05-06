@@ -38,16 +38,16 @@ Usage:
 """
 from os.path import isdir, sep, join, dirname, exists, basename, getsize, getmtime, normpath, realpath, expanduser, \
     relpath
+from os import environ, pathsep, listdir, walk as _walk
+from shutil import move as _shutil_move
+from zipfile import ZipFile, ZIP_DEFLATED
+import re as _re
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import basicConfig, getLogger, INFO, DEBUG
-from os import environ, pathsep, listdir, walk
-from zipfile import ZipFile, ZIP_DEFLATED
 from sys import exit, version_info, path
 from platform import release, system
 from subprocess import Popen, PIPE
-from re import match, compile
 from textwrap import dedent
-from shutil import move
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
@@ -409,20 +409,109 @@ def setup_virtualenv(cfg):
                     'falling back to a hardcoded minimum set.')
         _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location',
               'pkginfo', 'packaging'], dry_run=cfg.dry_run)
-    # Pin python-for-android to a release that DEFAULTS TO PYTHON 3.11.
-    # PySide6 6.10's Android wheels are tagged cp311 (Python 3.11 ABI). Newer p4a
-    # (2025+) defaults to Python 3.13/3.14, which produces a libpython with the
-    # wrong SONAME and incompatible C ABI -> shiboken6 fails dlopen at app start.
-    # The 2024.1.21 release pins python3 recipe to 3.11.x, which matches the wheels.
-    log.info('Pinning python-for-android to a Python-3.11-default release...')
+    # Pin python-for-android to a release that defaults to Python 3.11. PySide6
+    # 6.10's Android wheels are tagged cp311 (Python 3.11 ABI). Newer p4a
+    # (2025+) defaults to Python 3.13/3.14, which causes shiboken6 to fail
+    # dlopen at runtime. Combined with the PySide6 source patch below, this
+    # gives us a belt-and-suspenders approach to forcing 3.11.
+    log.info('Pinning python-for-android (best guess: 2024.1.21)...')
     _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location',
           '--force-reinstall', '--no-deps', 'python-for-android==2024.1.21'],
          dry_run=cfg.dry_run)
+    # Show what we actually got + what its python3 recipe targets, so we can
+    # tell from the build log whether the pin took effect and whether our
+    # assumption about that version's default is right.
+    _log_p4a_diagnostics(cfg)
+    # Patch PySide6's installed deploy code to embed the version pin directly
+    # in the generated buildozer.spec. This is what actually controls the
+    # Python version that p4a builds, regardless of p4a's own default.
+    _patch_pyside6_for_python_311(cfg)
+    log.info('Virtual environment ready :)')
+
+
+def _log_p4a_diagnostics(cfg):
+    """Log p4a version + python3-recipe target version for build-log diagnosis."""
+    log.info('python-for-android diagnostics:')
     res = _run([cfg.python_exe, '-c',
                 'import pythonforandroid; print(pythonforandroid.__version__)'],
                capture=True, check=False, dry_run=cfg.dry_run)
-    log.info('  python-for-android version in venv: %s', (res.stdout or '?').strip())
-    log.info('Virtual environment ready :)')
+    log.info('  p4a installed version  : %s', (res.stdout or '?').strip())
+    res = _run([cfg.python_exe, '-c',
+                'try:\n'
+                '    from pythonforandroid.recipes.python3 import Python3Recipe;\n'
+                '    print(getattr(Python3Recipe, "version", "?"))\n'
+                'except Exception as e:\n'
+                '    print("ERROR:", e)\n'],
+               capture=True, check=False, dry_run=cfg.dry_run)
+    log.info('  python3 recipe version : %s', (res.stdout or '?').strip())
+
+
+def _patch_pyside6_for_python_311(cfg):
+    """
+    Patch PySide6's Android deploy code to force the generated buildozer.spec to
+    use python3==3.11.5 in its requirements line. PySide6 6.10's wheels are cp311,
+    but the deploy tool ships `requirements = python3` (no version) so p4a uses
+    its default -- which in 2025+ releases is Python 3.13/3.14. The Python ABI
+    mismatch makes libshiboken6.abi3.so fail dlopen at runtime.
+    Strategy: walk PySide6's installed code, replace 'python3' inside requirement
+    contexts with 'python3==3.11.5'. The patterns are conservative (only match
+    when it really looks like a requirements list), so unrelated code is safe.
+    """
+    target_version = '3.11.5'
+    log.info('Patching PySide6 to pin Python==%s in buildozer.spec...', target_version)
+    res = _run([cfg.python_exe, '-c',
+                'import os, PySide6; print(os.path.dirname(PySide6.__file__))'],
+               capture=True, check=False, dry_run=cfg.dry_run)
+    pyside_dir = (res.stdout or '').strip()
+    if not pyside_dir or not isdir(pyside_dir):
+        log.warning('  PySide6 location not found; skipping')
+        return
+    scripts_dir = join(pyside_dir, 'scripts')
+    if not isdir(scripts_dir):
+        log.warning('  %s missing; skipping', scripts_dir)
+        return
+    # Patterns: replace 'python3' with 'python3==<version>' only in clear
+    # requirement contexts -- avoids touching imports or comments.
+    pinned = 'python3==' + target_version
+    file_patches = [
+        # Quoted string 'python3' or "python3" (typical in lists like ['python3', ...])
+        (r'(["\'])python3(["\'])',
+         r'\1' + pinned + r'\2'),
+        # `requirements = python3,` or `requirements = python3 ` (with whitespace)
+        (r'(requirements\s*=\s*)python3([\s,])',
+         r'\1' + pinned + r'\2'),
+        # `requirements = python3` at end of line
+        (r'(requirements\s*=\s*)python3$',
+         r'\1' + pinned),
+    ]
+    total_files = 0
+    total_replacements = 0
+    for root, _dirs, files in _walk(scripts_dir):
+        for f in files:
+            if not f.endswith('.py'):
+                continue
+            path = join(root, f)
+            try:
+                with open(path, 'r', encoding='utf-8') as fh:
+                    orig = fh.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            modified = orig
+            for pat, repl in file_patches:
+                modified = _re.sub(pat, repl, modified, flags=_re.MULTILINE)
+            if modified != orig:
+                added = modified.count(pinned) - orig.count(pinned)
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write(modified)
+                total_files += 1
+                total_replacements += added
+                log.info('  %s: %d replacement(s)', relpath(path, pyside_dir), added)
+    if total_files == 0:
+        log.warning('  *** NO MATCHES *** PySide6 uses a pattern we did not anticipate. '
+                    'After the build, check the generated buildozer.spec to see what '
+                    'requirements line looks like, and we can target it specifically.')
+    else:
+        log.info('  Total: %d files modified, %d replacements', total_files, total_replacements)
 
 
 # ------------------------------------------------------------------------------
@@ -597,6 +686,18 @@ def build_apk(cfg):
     deploy_env['PATH'] = venv_bin + pathsep + deploy_env.get('PATH', '')
     deploy_env['VIRTUAL_ENV'] = cfg.venv_dir
     _run(cmd, cwd=cfg.project_dir, env=deploy_env)  # Must run even in dry_run mode.
+    # Log what requirements line ended up in buildozer.spec. This is the single
+    # most useful diagnostic for "wrong Python version" issues -- if it says
+    # `requirements = python3` (no version), the PySide6 source patch missed
+    # something and the fix is to extend the pattern to match.
+    spec_path = join(cfg.project_dir, 'buildozer.spec')
+    if exists(spec_path):
+        log.info('--- generated buildozer.spec [requirements] ---')
+        with open(spec_path, 'r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                if line.lstrip().startswith(('requirements', 'python_version', 'p4a.', 'android.archs')):
+                    log.info('  %s', line.rstrip())
+        log.info('-----------------------------------------------')
     # Locate the produced artifact.
     ext = '.apk' if cfg.mode == 'debug' else '.aab'
     matches = _rglob(cfg.project_dir, '*{}'.format(ext))
@@ -633,9 +734,9 @@ def _find_libpython_on_host(arch):
     bz_root = join(expanduser('~'), '.buildozer', 'android', 'platform')
     if not isdir(bz_root):
         return None
-    pat = compile(r'^libpython\d+\.\d+\.so($|\..+$)')
+    pat = _re.compile(r'^libpython\d+\.\d+\.so($|\..+$)')
     candidates = []
-    for root, _dirs, files in walk(bz_root):
+    for root, _dirs, files in _walk(bz_root):
         # Only files under a path that mentions our target arch
         if arch not in root:
             continue
@@ -645,7 +746,7 @@ def _find_libpython_on_host(arch):
     if not candidates:
         return None
     # Prefer the unversioned file if available; otherwise newest versioned.
-    unversioned = [c for c in candidates if match(r'^libpython\d+\.\d+\.so$', basename(c))]
+    unversioned = [c for c in candidates if _re.match(r'^libpython\d+\.\d+\.so$', basename(c))]
     pool = unversioned or candidates
     return sorted(pool, key=getmtime)[-1]
 
@@ -684,9 +785,9 @@ def _patch_apk_python_aliases(apk_path, cfg):
                     'bundled it via assets/private.tar instead of as a real .so. Will '
                     'attempt to inject from disk.')
     # 2. Build modification plan.
-    pat_versioned = compile(r'^(lib/[^/]+/libpython\d+\.\d+\.so)\.\d+(?:\.\d+)*$')
-    pat_unversioned = compile(r'^lib/[^/]+/libpython\d+\.\d+\.so$')
-    aliases = {}  # versioned arcname  -> unversioned arcname (intra-zip copy)
+    pat_versioned   = _re.compile(r'^(lib/[^/]+/libpython\d+\.\d+\.so)\.\d+(?:\.\d+)*$')
+    pat_unversioned = _re.compile(r'^lib/[^/]+/libpython\d+\.\d+\.so$')
+    aliases    = {}  # versioned arcname  -> unversioned arcname (intra-zip copy)
     injections = {}  # target arcname     -> host filesystem path  (file from disk)
     for arch in arch_dirs:
         arch_prefix = 'lib/' + arch + '/'
@@ -705,7 +806,7 @@ def _patch_apk_python_aliases(apk_path, cfg):
         if host_lib:
             base = basename(host_lib)
             # Strip any version suffix in case we picked a libpython3.11.so.1.0 from disk
-            m = match(r'^(libpython\d+\.\d+\.so).*$', base)
+            m = _re.match(r'^(libpython\d+\.\d+\.so).*$', base)
             target_name = m.group(1) if m else base
             target_arc = arch_prefix + target_name
             injections[target_arc] = host_lib
@@ -717,7 +818,7 @@ def _patch_apk_python_aliases(apk_path, cfg):
         log.info('  No APK modifications applied.')
         return
     # 3. Rewrite APK; strip old signature blocks so we can re-sign cleanly.
-    sig_pat = compile(r'^META-INF/.*\.(SF|RSA|DSA|EC)$')
+    sig_pat = _re.compile(r'^META-INF/.*\.(SF|RSA|DSA|EC)$')
     tmp = apk_path + '.tmp'
     with ZipFile(apk_path, 'r') as zin, ZipFile(tmp, 'w', ZIP_DEFLATED) as zout:
         for item in zin.infolist():
@@ -729,7 +830,7 @@ def _patch_apk_python_aliases(apk_path, cfg):
         for dst, host_path in injections.items():
             with open(host_path, 'rb') as fh:
                 zout.writestr(dst, fh.read(), ZIP_DEFLATED)
-    move(tmp, apk_path)
+    _shutil_move(tmp, apk_path)
     log.info('  APK rewritten: %d alias(es), %d injection(s).', len(aliases), len(injections))
     # 4. Locate signing tools.
     bt_dir = _find_android_buildtools(cfg)
@@ -742,7 +843,7 @@ def _patch_apk_python_aliases(apk_path, cfg):
     # 5. zipalign.
     aligned = apk_path + '.aligned'
     _run([zipalign, '-f', '-p', '4', apk_path, aligned])
-    move(aligned, apk_path)
+    _shutil_move(aligned, apk_path)
     # 6. Ensure debug keystore exists.
     keystore = join(expanduser('~'), '.android', 'debug.keystore')
     if not exists(keystore):
