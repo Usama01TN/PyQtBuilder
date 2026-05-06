@@ -40,9 +40,9 @@ from os.path import isdir, sep, join, dirname, exists, basename, getsize, getmti
     relpath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import basicConfig, getLogger, INFO, DEBUG
-from subprocess import Popen, PIPE
 from sys import exit, version_info, path
 from platform import release, system
+from subprocess import Popen, PIPE
 from textwrap import dedent
 
 if dirname(__file__) not in path:
@@ -50,10 +50,10 @@ if dirname(__file__) not in path:
 
 try:
     from .build_utils import which, _rglob, disk_usage, _makedirs, create, urlretrieve, URLError, FileNotFoundError
-    from .builders import getAdbExecutable, getGitExecutable
+    from .builders import getAdbExecutable, getGitExecutable, getJavaExecutable
 except:
     from build_utils import which, _rglob, disk_usage, _makedirs, create, urlretrieve, URLError, FileNotFoundError
-    from builders import getAdbExecutable, getGitExecutable
+    from builders import getAdbExecutable, getGitExecutable, getJavaExecutable
 
 
 def _is_relative_to(pth, base):
@@ -111,7 +111,7 @@ DEFAULT_SDK_DIR = join(DEFAULT_CACHE_DIR, 'android-sdk')  # type: str
 # Minimum disk space required (bytes).
 MIN_DISK_GB = 15  # type: int
 # ------------------------------------------------------------------------------
-# Logging
+# Logging.
 # ------------------------------------------------------------------------------
 basicConfig(format='%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S', level=INFO)
 log = getLogger('pyside-android-builder')
@@ -138,7 +138,7 @@ class BuildConfig(object):
 
     def __init__(self, project_dir, app_name, arch, pyside_version=PYSIDE_VERSION, python_version=PYTHON_VERSION,
                  ndk_path=None, sdk_path=None, wheel_pyside=None, wheel_shiboken=None, mode='debug', verbose=False,
-                 dry_run=False, keep_build_files=False, install_apk=False):
+                 dry_run=False, keep_build_files=False, install_apk=False, venv_dir=None):
         """
         :param project_dir: str
         :param app_name: str
@@ -154,6 +154,7 @@ class BuildConfig(object):
         :param dry_run: bool
         :param keep_build_files: bool
         :param install_apk: bool
+        :param venv_dir: str | None
         """
         self.project_dir = project_dir  # type: str
         self.app_name = app_name  # type: str
@@ -170,7 +171,15 @@ class BuildConfig(object):
         self.keep_build_files = keep_build_files  # type: bool
         self.install_apk = install_apk  # type: bool
         # Derived / resolved at runtime.
-        self.venv_dir = join(self.project_dir, '.venv_android_build')  # type: str
+        # The venv MUST live outside the project directory, otherwise pyside6-android-deploy
+        # tries to bundle the entire installed PySide6 (thousands of QML files) into the APK.
+        # Default: a sibling of the project named .venv_<project_name>_android_build.
+        # Override via --venv-dir.
+        if venv_dir:
+            self.venv_dir = realpath(venv_dir)  # type: str
+        else:
+            self.venv_dir = join(dirname(self.project_dir),
+                                 '.venv_' + basename(self.project_dir) + '_android_build')
         self.pyside_setup_dir = join(DEFAULT_CACHE_DIR, 'pyside-setup')  # type: str
         self.wheels_dir = join(DEFAULT_CACHE_DIR, 'wheels')  # type: str
 
@@ -317,7 +326,7 @@ def preflight_checks(cfg):
     for tool in ('git', 'java', 'zip', 'unzip'):
         log.info('Found: %s -> %s', tool, _require_tool(tool))
     # Java version (JDK 17 required by Qt toolchain).
-    java_out = _run(['java', '-version'], capture=True, check=False)
+    java_out = _run([getJavaExecutable(), '-version'], capture=True, check=False)
     raw_output = java_out.stderr or java_out.stdout or ''
     output_lines = raw_output.splitlines()
     version_line = output_lines[0] if output_lines else ''
@@ -679,6 +688,10 @@ def build_arg_parser():
                         help='Only set up the virtual environment + SDK/NDK; skip building.')
     parser.add_argument('--install-apk', action='store_true',
                         help='Install the resulting APK on the first ADB-connected device.')
+    parser.add_argument('--venv-dir', type=str, default=None,
+                        help='Path for the build-tooling virtual environment. MUST be outside the '
+                             'project directory. Defaults to a sibling of the project. Pinning '
+                             'this in CI lets you cache the venv across runs.')
     parser.add_argument('--keep-build-files', action='store_true',
                         help='Retain intermediate buildozer / Gradle files after the build.')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them.')
@@ -687,7 +700,7 @@ def build_arg_parser():
 
 
 # ------------------------------------------------------------------------------
-# Main entry point
+# Main entry point.
 # ------------------------------------------------------------------------------
 
 def main(argv=None):
@@ -722,7 +735,8 @@ def main(argv=None):
         verbose=args.verbose,
         dry_run=args.dry_run,
         keep_build_files=args.keep_build_files,
-        install_apk=args.install_apk)
+        install_apk=args.install_apk,
+        venv_dir=args.venv_dir)
     artifact = None  # type: str | None
     try:
         # -- Pipeline --------------------------------------------------------
