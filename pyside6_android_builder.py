@@ -99,6 +99,7 @@ EXTRA_VENV_PACKAGES = (
 
 DEFAULT_VENV_DIR = '~/.cache/pyside6-android-builder/venv-{arch}'
 DEFAULT_WHEELS_DIR = '~/.cache/pyside6-android-builder/wheels'
+DEFAULT_P4A_DIR = '~/.cache/pyside6-android-builder/p4a-pinned'
 DEFAULT_NDK_VERSION = '27.2.12479018'   # Recommended by Qt for 6.10.x
 DEFAULT_API = '34'
 
@@ -148,7 +149,7 @@ def section(title: str) -> None:
 
 def preflight(args) -> None:
     """Validate environment before doing any expensive work."""
-    section('Step 1/7 — Preflight')
+    section('Step 1/8 — Preflight')
 
     # Host Python must be 3.11.x.
     if sys.version_info[:2] != (3, 11):
@@ -187,7 +188,7 @@ def preflight(args) -> None:
 
 def setup_venv(args):
     """Create venv, install PySide6 and all build-time deps. Returns paths."""
-    section('Step 2/7 — Virtual environment')
+    section('Step 2/8 — Virtual environment')
     venv_dir = os.path.abspath(args.venv_dir)
     py_exe   = join(venv_dir, 'bin', 'python')
     pip_exe  = join(venv_dir, 'bin', 'pip')
@@ -223,19 +224,78 @@ def setup_venv(args):
     return venv_dir, py_exe
 
 
-# ─── Step 3 — patch PySide6's buildozer.py (the load-bearing fix) ─────────────
+# ─── Step 3 — pre-clone python-for-android at the pinned commit ───────────────
 
-def patch_pyside6_buildozer(venv_dir: str) -> None:
+def prepare_p4a_pinned() -> str:
+    """
+    Clone (or update) python-for-android at the commit that has BOTH:
+      - the qt bootstrap fix PySide6 needs (commit b92522f, March 2024)
+      - the Python 3.11.5 recipe (next commit on develop bumps to 3.14)
+    Returns the absolute path to the local clone.
+
+    Why we do this ourselves instead of letting buildozer clone:
+    buildozer invokes `git clone --branch <p4a.branch>`, which only accepts
+    branch/tag names — not commit hashes.  Our target (2ebea90d) is a
+    detached commit that no tag points at, so we have to clone first and
+    then `git checkout` the SHA.  We then tell PySide6 to use this local
+    clone via p4a.source_dir, bypassing buildozer's clone step entirely.
+    """
+    section('Step 3/8 — Pin python-for-android to ' + P4A_BRANCH)
+    p4a_dir = os.path.abspath(expanduser(DEFAULT_P4A_DIR))
+    repo_url = 'https://github.com/{}/python-for-android.git'.format(P4A_FORK)
+
+    if isdir(join(p4a_dir, '.git')):
+        # Existing clone — verify it's at the right commit, otherwise
+        # fetch+checkout to bring it up to date.
+        head = run(['git', '-C', p4a_dir, 'rev-parse', 'HEAD'],
+                   capture=True).stdout.strip()
+        if head.startswith(P4A_BRANCH):
+            log.info('Reusing existing clone at %s', p4a_dir)
+            log.info('  HEAD: %s ✓', head[:12])
+            return p4a_dir
+        log.info('Existing clone at %s is on %s; updating to %s',
+                 p4a_dir, head[:12], P4A_BRANCH)
+        run(['git', '-C', p4a_dir, 'fetch', '--all', '--quiet'])
+    else:
+        log.info('Cloning %s → %s', repo_url, p4a_dir)
+        os.makedirs(dirname(p4a_dir), exist_ok=True)
+        run(['git', 'clone', '--quiet', repo_url, p4a_dir])
+
+    run(['git', '-C', p4a_dir, 'checkout', '--quiet', P4A_BRANCH])
+    head = run(['git', '-C', p4a_dir, 'rev-parse', 'HEAD'],
+               capture=True).stdout.strip()
+    log.info('  HEAD: %s ✓', head[:12])
+
+    # Sanity-check: the python3 recipe in the clone should say 3.11.5.
+    recipe = join(p4a_dir, 'pythonforandroid', 'recipes', 'python3', '__init__.py')
+    if exists(recipe):
+        with open(recipe) as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith('version'):
+                    log.info('  python3 recipe: %s', stripped)
+                    if TARGET_PYTHON not in stripped:
+                        log.warning('  Recipe version does not contain %s — '
+                                    'p4a commit may have shifted.', TARGET_PYTHON)
+                    break
+    return p4a_dir
+
+
+# ─── Step 4 — patch PySide6's buildozer.py (the load-bearing fix) ─────────────
+
+def patch_pyside6_buildozer(venv_dir: str, p4a_source_dir: str) -> None:
     """
     Edit the venv copy of pyside6/scripts/deploy_lib/android/buildozer.py:
-      * line 27: requirements = python3,...        →  python3=={ver},...
-      * line 47: p4a.branch  = "develop"            →  p4a.branch = {commit}
-    The first edit pins the bundled Python version.  The second steers
-    buildozer toward a p4a commit that has both the qt bootstrap fix
-    PySide6 needs AND the Python 3.11.5 recipe.
+      * line 27: requirements = python3,...     →  python3=={ver},...
+      * line 47: p4a.branch  = "develop"         →  p4a.source_dir = {our_clone}
+
+    The first edit pins the bundled Python version inside the APK.  The
+    second redirects buildozer at our pre-cloned p4a (pinned to a commit
+    with both the qt bootstrap fix PySide6 needs AND the Python 3.11.5
+    recipe), bypassing buildozer's own `git clone --branch <hash>` which
+    git rejects for non-branch/non-tag refs.
     """
-    section('Step 3/7 — Patch PySide6 buildozer-spec generator')
-    # Find the file via importable location (handles arbitrary venv layouts).
+    section('Step 4/8 — Patch PySide6 buildozer-spec generator')
     py_exe = join(venv_dir, 'bin', 'python')
     out = run([py_exe, '-c',
                'import os, PySide6; '
@@ -256,11 +316,10 @@ def patch_pyside6_buildozer(venv_dir: str) -> None:
         r'\g<1>python3==' + TARGET_PYTHON + r'\g<2>',
         src, count=1,
     )
-    new_src, branch_n = re.subn(
-        r'(self\.set_value\(\s*"app"\s*,\s*"p4a\.branch"\s*,\s*")'
-        r'develop'
-        r'(\s*"\s*\))',
-        r'\g<1>' + P4A_BRANCH + r'\g<2>',
+    # Replace the p4a.branch = "develop" line with a p4a.source_dir line.
+    new_src, source_dir_n = re.subn(
+        r'self\.set_value\(\s*"app"\s*,\s*"p4a\.branch"\s*,\s*"develop"\s*\)',
+        'self.set_value("app", "p4a.source_dir", "' + p4a_source_dir + '")',
         new_src, count=1,
     )
 
@@ -270,17 +329,16 @@ def patch_pyside6_buildozer(venv_dir: str) -> None:
                     'may produce a broken APK.')
     else:
         log.info('  requirements line patched (python3==%s)', TARGET_PYTHON)
-    if branch_n == 0:
-        log.warning('Could not find the "p4a.branch" set_value() call to patch.')
-        log.warning('Build will use whatever branch PySide6 defaults to (likely '
-                    '"develop", which has Python 3.14).')
+    if source_dir_n == 0:
+        log.warning('Could not find the p4a.branch line to redirect to source_dir.')
+        log.warning('Build will use whatever p4a buildozer clones from develop, '
+                    'which currently has Python 3.14.')
     else:
-        log.info('  p4a.branch line patched (-> %s)', P4A_BRANCH)
+        log.info('  p4a.branch → p4a.source_dir = %s', p4a_source_dir)
 
     if new_src != src:
         with open(out, 'w', encoding='utf-8') as fh:
             fh.write(new_src)
-        # Drop any cached bytecode so the patched module is what gets imported.
         cache_dir = join(dirname(out), '__pycache__')
         if isdir(cache_dir):
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -290,7 +348,7 @@ def patch_pyside6_buildozer(venv_dir: str) -> None:
                     'has shifted.  Continuing.')
 
 
-# ─── Step 4 — Android SDK / NDK ──────────────────────────────────────────────
+# ─── Step 5 — Android SDK / NDK ──────────────────────────────────────────────
 
 def ensure_android_sdk_ndk(args):
     """
@@ -298,7 +356,7 @@ def ensure_android_sdk_ndk(args):
     cached them) — or trust ~/.buildozer to manage its own.  We do not
     download here; that's the CI workflow's job.
     """
-    section('Step 4/7 — Android SDK / NDK')
+    section('Step 5/8 — Android SDK / NDK')
     sdk = args.sdk_path or expanduser('~/.android/sdk')
     ndk = args.ndk_path or join(sdk, 'ndk', DEFAULT_NDK_VERSION)
     if not isdir(ndk):
@@ -312,7 +370,7 @@ def ensure_android_sdk_ndk(args):
     return sdk, ndk
 
 
-# ─── Step 5 — download cross-compiled PySide6 + shiboken6 wheels ─────────────
+# ─── Step 6 — download cross-compiled PySide6 + shiboken6 wheels ─────────────
 
 def download_android_wheels(args):
     """
@@ -328,7 +386,7 @@ def download_android_wheels(args):
     The arch component uses Linux-style names (aarch64, armv7a, x86_64,
     i686), not Android ABI names — so we map via ARCH_ABIS.
     """
-    section('Step 5/7 — PySide6 Android wheels')
+    section('Step 6/8 — PySide6 Android wheels')
     import urllib.request
 
     wheels_dir = expanduser(DEFAULT_WHEELS_DIR)
@@ -357,8 +415,6 @@ def download_android_wheels(args):
                 os.rename(tmp, dest)
                 log.info('  → %s (%.1f MB)', dest, getsize(dest) / 1024 ** 2)
             except Exception as e:
-                # Try to leave a useful trace; the most common cause is a
-                # 404 because the wheel name format changed in a new release.
                 raise SystemExit(
                     'Failed to download {}\n  url:  {}\n  err:  {}\n'
                     'If this is a 404, check the Qt download page at\n  {}/pyside6/\n'
@@ -369,11 +425,11 @@ def download_android_wheels(args):
     return paths['pyside'], paths['shiboken']
 
 
-# ─── Step 6 — run pyside6-android-deploy ──────────────────────────────────────
+# ─── Step 7 — run pyside6-android-deploy ──────────────────────────────────────
 
 def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     """Invoke pyside6-android-deploy in single-pass mode."""
-    section('Step 6/7 — pyside6-android-deploy')
+    section('Step 7/8 — pyside6-android-deploy')
     deploy = join(venv_dir, 'bin', 'pyside6-android-deploy')
     if not exists(deploy):
         raise RuntimeError('pyside6-android-deploy not found at ' + deploy)
@@ -382,7 +438,6 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     # venv's bin/ on PATH it can't see cython and fails partway through.
     env = os.environ.copy()
     env['PATH'] = join(venv_dir, 'bin') + os.pathsep + env.get('PATH', '')
-    # Force unbuffered output so we see progress in CI logs.
     env['PYTHONUNBUFFERED'] = '1'
 
     cmd = [
@@ -401,7 +456,6 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     log.info('  cwd=%s', args.project_dir)
     run(cmd, cwd=args.project_dir, env=env)
 
-    # Locate the produced APK/AAB.
     ext = '.apk' if args.mode == 'debug' else '.aab'
     candidates = []
     for root, _dirs, files in os.walk(args.project_dir):
@@ -415,7 +469,7 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     return artifact
 
 
-# ─── Step 7 — APK post-processing ─────────────────────────────────────────────
+# ─── Step 8 — APK post-processing ─────────────────────────────────────────────
 
 def post_process_apk(apk_path, sdk):
     """
@@ -423,7 +477,7 @@ def post_process_apk(apk_path, sdk):
     that p4a produces.  APKs do not preserve symlinks, so without this libshiboken6
     cannot resolve its DT_NEEDED entry at runtime.
     """
-    section('Step 7/7 — APK post-processing (libpython SONAME fix)')
+    section('Step 8/8 — APK post-processing (libpython SONAME fix)')
 
     with zipfile.ZipFile(apk_path, 'r') as z:
         names = z.namelist()
@@ -577,7 +631,8 @@ def main(argv=None):
 
     preflight(args)
     venv_dir, py_exe = setup_venv(args)
-    patch_pyside6_buildozer(venv_dir)
+    p4a_dir = prepare_p4a_pinned()
+    patch_pyside6_buildozer(venv_dir, p4a_dir)
     sdk, ndk = ensure_android_sdk_ndk(args)
     wheel_pyside, wheel_shiboken = download_android_wheels(args)
     apk = run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken)
