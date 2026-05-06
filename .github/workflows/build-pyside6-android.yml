@@ -13,9 +13,9 @@ on:
       arch:
         description: "Android ABI"
         required: true
-        default: "aarch64"
+        default: "arm64-v8a"
         type: choice
-        options: [aarch64, armv7a, x86_64, i686]
+        options: [arm64-v8a, armeabi-v7a, x86_64, x86]
       build_id:
         description: "Optional build ID for tracking (leave blank when running by hand)"
         required: false
@@ -28,7 +28,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 660
+    timeout-minutes: 96
 
     # Normalize inputs so manual runs and Django dispatches use the same names.
     env:
@@ -41,13 +41,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Free disk space (runners ship with ~14 GB; we need ~25)
+        # NDK alone is ~6 GB, the SDK adds ~3 GB, and Python source +
+        # cross-compiled artifacts add another ~5 GB. Without this step
+        # the build runs out of disk during the openssl recipe.
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          sudo rm -rf /usr/local/lib/android/sdk/ndk     # we'll download a fresh one
+          sudo rm -rf /usr/local/lib/android/sdk/ndk     # buildozer downloads its own
           docker system prune -af || true
           df -h
 
       - name: Set up Python 3.11
+        # The script enforces this hard at preflight — PySide6 6.10.x wheels are
+        # cp311-only on Linux, so the host Python must match.
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -74,11 +79,6 @@ jobs:
               libncurses-dev libsqlite3-dev libbz2-dev liblzma-dev \
               libreadline-dev ccache
 
-      - name: Install PySide6 + cmake on host
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "pyside6==6.10.2" cmake
-
       # The killer optimisation: the first build downloads ~10 GB of NDK/SDK/wheels
       # into ~/.pyside6_android_deploy. The cache makes every subsequent build ~5 min.
       - name: Cache Qt + Android toolchain
@@ -88,28 +88,35 @@ jobs:
           path: |
             ~/.pyside6_android_deploy
             ~/.cache/pip
-          key:          pyside6-toolchain-v1-${{ env.ARCH }}-${{ hashFiles('pyside6_android_builder.py') }}
-          restore-keys: pyside6-toolchain-v1-${{ env.ARCH }}-
+          key:          pyside6-toolchain-v2-${{ env.ARCH }}-${{ hashFiles('build_pyside6_android.py') }}
+          restore-keys: pyside6-toolchain-v2-${{ env.ARCH }}-
 
-      # Cache the build-tool venv (pyside6-android-deploy + deps, ~150 MB).
+      # Cache the build-tool venv (PySide6 + pyside6-android-deploy + p4a deps, ~250 MB).
       # Lives outside the project dir — required to avoid Qt bundling the venv into the APK.
+      # The hashFiles entry ties cache validity to the script: any change in the
+      # script (especially the patcher logic) invalidates the cached venv, so a
+      # fresh `setup_venv` runs and the patches re-apply to a fresh PySide6 install.
       - name: Cache build-tool venv
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pyqt-builder-venv
-          key:          venv-pyside6-${{ env.ARCH }}-${{ hashFiles('pyside6_android_builder.py') }}
-          restore-keys: venv-pyside6-${{ env.ARCH }}-
+          path: ~/.cache/pyside6-android-builder
+          key:          venv-newscript-v1-${{ env.ARCH }}-${{ hashFiles('build_pyside6_android.py') }}
+          restore-keys: venv-newscript-v1-${{ env.ARCH }}-
 
       # Buildozer downloads its OWN copy of Android SDK/NDK + cross-compiled Python
       # into ~/.buildozer (yes, redundant with ~/.pyside6_android_deploy — buildozer
       # owns its own toolchain). Caching this is the single biggest time saver after
       # the first successful run: subsequent builds drop from ~45 min to ~10 min.
+      # NB: we use a fresh cache prefix (newscript-v1) because the previous workflow
+      # cached state from p4a@develop builds (Python 3.14). The new script pins
+      # p4a to commit 2ebea90d (Python 3.11.5), and we don't want stale 3.14
+      # artifacts bleeding through.
       - name: Cache buildozer toolchain
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key:          buildozer-${{ env.ARCH }}-py311-v2
-          restore-keys: buildozer-${{ env.ARCH }}-py311-
+          key:          buildozer-newscript-v1-${{ env.ARCH }}
+          restore-keys: buildozer-newscript-v1-${{ env.ARCH }}-
 
       - name: Download user project
         run: |
@@ -122,13 +129,17 @@ jobs:
           echo "Detected project at: $PROJ_DIR"
           ls -la "$PROJ_DIR"
 
-      - name: Run pyside6_android_builder.py
+      - name: Build APK
+        # The new script takes project_dir as a positional argument and uses
+        # Android-style ABI names (arm64-v8a, armeabi-v7a, x86_64, x86) rather
+        # than the GNU triplet style of the old script (aarch64, armv7a, etc.).
+        # The workflow `arch` input above is already in the new format.
         run: |
-          mkdir -p "$HOME/.cache/pyqt-builder-venv"
-          python pyside6_android_builder.py \
-            --project-dir "$PROJ_DIR" \
-            --venv-dir "$HOME/.cache/pyqt-builder-venv/${ARCH}" \
+          mkdir -p "$HOME/.cache/pyside6-android-builder"
+          python build_pyside6_android.py "$PROJ_DIR" \
             --arch "$ARCH" \
+            --mode debug \
+            --venv-dir "$HOME/.cache/pyside6-android-builder/venv-${ARCH}" \
             --verbose
 
       - name: Locate APK
@@ -138,6 +149,21 @@ jobs:
           if [ -z "$APK" ]; then echo "::error::No APK produced"; exit 1; fi
           echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
           echo "Built: $APK ($(du -h "$APK" | cut -f1))"
+
+      - name: Sanity-check APK contents
+        # Belt-and-braces: the script's regex patches on PySide6 source could in
+        # principle silently fail to match (if PySide6 ships a slightly reformatted
+        # buildozer.py in some patch release). If that happens we'd build a Python
+        # 3.14 APK again. This step catches it before the artifact is published.
+        run: |
+          echo "libpython / libshiboken entries in APK:"
+          unzip -l "${{ steps.locate.outputs.apk_path }}" \
+            | grep -E 'libpython|libshiboken' || true
+          if ! unzip -l "${{ steps.locate.outputs.apk_path }}" | grep -q 'libpython3\.11'; then
+            echo "::error::APK does not contain libpython3.11.* — the PySide6 buildozer.py patch did not take effect."
+            exit 1
+          fi
+          echo "✓ APK contains libpython3.11"
 
       - name: Upload APK as workflow artifact (Day 1 — download from Actions tab)
         uses: actions/upload-artifact@v4
