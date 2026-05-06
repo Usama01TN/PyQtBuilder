@@ -1,11 +1,13 @@
-import sys
-from PySide6.QtWidgets import QApplication, QLabel
+# -*- coding: utf-8 -*-
+"""
+None
+"""
+from PySide6.QtWidgets import QApplication, QMainWindow, QLabel
+from sys import argv, exit
 
-def _run():                                  # pyside6-android-deploy convention
-    app = QApplication(sys.argv)
-    QLabel("Hello from Android!").show()
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    _run()
-  
+app = QApplication(argv)  # type: QApplication
+w = QMainWindow()  # type: QMainWindow
+lbl = QLabel('Hello World!')
+w.setCentralWidget(lbl)
+w.show()
+exit(app.exec_() if hasattr(app, 'exec_') else app.exec())
