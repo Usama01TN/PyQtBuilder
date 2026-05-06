@@ -111,7 +111,7 @@ DEFAULT_SDK_DIR = join(DEFAULT_CACHE_DIR, 'android-sdk')  # type: str
 # Minimum disk space required (bytes).
 MIN_DISK_GB = 15  # type: int
 # ------------------------------------------------------------------------------
-# Logging.
+# Logging
 # ------------------------------------------------------------------------------
 basicConfig(format='%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S', level=INFO)
 log = getLogger('pyside-android-builder')
@@ -375,6 +375,28 @@ def setup_virtualenv(cfg):
     log.info('Installing PySide6 %s (host)...', cfg.pyside_version)
     _run([cfg.pip_exe, 'install', 'pyside6=={}'.format(cfg.pyside_version), '--quiet', '--no-warn-script-location'],
          dry_run=cfg.dry_run)
+    # pyside6-android-deploy needs extra runtime deps (pkginfo, packaging, ...) that ship
+    # inside PySide6 itself as scripts/requirements-android.txt. The original script
+    # relied on setup_android_sdk_ndk() installing them as a side effect, which only
+    # happens when the Qt helper runs — i.e. NOT when the NDK/SDK cache is already warm.
+    # Install them explicitly so the deploy tool can always start.
+    log.info('Installing pyside6-android-deploy runtime requirements...')
+    locator = (
+        'import os, sys, PySide6; '
+        'p = os.path.join(os.path.dirname(PySide6.__file__), "scripts", "requirements-android.txt"); '
+        'sys.stdout.write(p if os.path.exists(p) else "")'
+    )
+    res = _run([cfg.python_exe, '-c', locator], capture=True, check=False, dry_run=cfg.dry_run)
+    req_path = (res.stdout or '').strip()
+    if req_path:
+        _run([cfg.pip_exe, 'install', '-r', req_path, '--quiet', '--no-warn-script-location'],
+             dry_run=cfg.dry_run)
+    else:
+        # Fall back: install the known-required packages directly so the deploy tool starts.
+        log.warning('requirements-android.txt not found inside installed PySide6; '
+                    'falling back to a hardcoded minimum set.')
+        _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location',
+              'pkginfo', 'packaging'], dry_run=cfg.dry_run)
     log.info('Virtual environment ready :)')
 
 
@@ -700,7 +722,7 @@ def build_arg_parser():
 
 
 # ------------------------------------------------------------------------------
-# Main entry point.
+# Main entry point
 # ------------------------------------------------------------------------------
 
 def main(argv=None):
