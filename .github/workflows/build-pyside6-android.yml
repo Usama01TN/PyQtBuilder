@@ -82,6 +82,15 @@ jobs:
           key:          pyside6-toolchain-v1-${{ env.ARCH }}-${{ hashFiles('pyside6_android_builder.py') }}
           restore-keys: pyside6-toolchain-v1-${{ env.ARCH }}-
 
+      # Cache the build-tool venv (pyside6-android-deploy + deps, ~150 MB).
+      # Lives outside the project dir — required to avoid Qt bundling the venv into the APK.
+      - name: Cache build-tool venv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pyqt-builder-venv
+          key:          venv-pyside6-${{ env.ARCH }}-${{ hashFiles('pyside6_android_builder.py') }}
+          restore-keys: venv-pyside6-${{ env.ARCH }}-
+
       - name: Download user project
         run: |
           mkdir -p workspace
@@ -95,8 +104,10 @@ jobs:
 
       - name: Run pyside6_android_builder.py
         run: |
+          mkdir -p "$HOME/.cache/pyqt-builder-venv"
           python pyside6_android_builder.py \
             --project-dir "$PROJ_DIR" \
+            --venv-dir "$HOME/.cache/pyqt-builder-venv/${ARCH}" \
             --arch "$ARCH" \
             --verbose
 
