@@ -88,7 +88,7 @@ jobs:
           path: |
             ~/.pyside6_android_deploy
             ~/.cache/pip
-          key:          pyside6-toolchain-v2-${{ env.ARCH }}-${{ hashFiles('build_pyside6_android.py') }}
+          key:          pyside6-toolchain-v2-${{ env.ARCH }}-${{ hashFiles('pyside6_android_builder.py') }}
           restore-keys: pyside6-toolchain-v2-${{ env.ARCH }}-
 
       # Cache the build-tool venv (PySide6 + pyside6-android-deploy + p4a deps, ~250 MB).
@@ -100,7 +100,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pyside6-android-builder
-          key:          venv-newscript-v1-${{ env.ARCH }}-${{ hashFiles('build_pyside6_android.py') }}
+          key:          venv-newscript-v1-${{ env.ARCH }}-${{ hashFiles('pyside6_android_builder.py') }}
           restore-keys: venv-newscript-v1-${{ env.ARCH }}-
 
       # Buildozer downloads its OWN copy of Android SDK/NDK + cross-compiled Python
@@ -136,7 +136,7 @@ jobs:
         # The workflow `arch` input above is already in the new format.
         run: |
           mkdir -p "$HOME/.cache/pyside6-android-builder"
-          python build_pyside6_android.py "$PROJ_DIR" \
+          python pyside6_android_builder.py "$PROJ_DIR" \
             --arch "$ARCH" \
             --mode debug \
             --venv-dir "$HOME/.cache/pyside6-android-builder/venv-${ARCH}" \
