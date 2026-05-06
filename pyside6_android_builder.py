@@ -622,7 +622,42 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
 
     log.info('Running: %s', ' '.join(cmd))
     log.info('  cwd=%s', args.project_dir)
-    run(cmd, cwd=args.project_dir, env=env)
+
+    # Capture buildozer's full output to a file alongside streaming it to
+    # the CI log.  When buildozer fails, its real error is buried hundreds
+    # of lines above its "I failed, please scroll up" wrapper message.  By
+    # tee-ing to a log file we can (a) replay the last 100 lines at the
+    # bottom of OUR output where the user can find them, and (b) upload
+    # the full log as a workflow artifact for offline inspection.
+    import shlex
+    log_path = expanduser('~/.cache/pyside6-android-builder/last-build.log')
+    os.makedirs(dirname(log_path), exist_ok=True)
+    tee_cmd = '{} 2>&1 | tee {}'.format(
+        ' '.join(shlex.quote(str(c)) for c in cmd),
+        shlex.quote(log_path),
+    )
+    # bash -c 'set -o pipefail; …' so the pipe to tee doesn't mask buildozer's
+    # exit code (default behaviour: tee succeeds, so the whole pipeline does).
+    result = subprocess.run(['bash', '-c', 'set -o pipefail; ' + tee_cmd],
+                            cwd=args.project_dir, env=env)
+
+    if result.returncode != 0:
+        log.error('')
+        log.error('=' * 70)
+        log.error('Buildozer failed (exit %d).  Last 100 lines of its output:',
+                 result.returncode)
+        log.error('=' * 70)
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
+                tail = fh.readlines()[-100:]
+            for line in tail:
+                sys.stderr.write(line)
+        except Exception as e:
+            log.error('  (could not read log file: %s)', e)
+        log.error('=' * 70)
+        log.error('Full log: %s', log_path)
+        log.error('In CI, this file is uploaded as the "build-log" workflow artifact.')
+        raise SystemExit(result.returncode)
 
     ext = '.apk' if args.mode == 'debug' else '.aab'
     candidates = []
