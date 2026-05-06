@@ -101,7 +101,11 @@ DEFAULT_VENV_DIR = '~/.cache/pyside6-android-builder/venv-{arch}'
 DEFAULT_WHEELS_DIR = '~/.cache/pyside6-android-builder/wheels'
 DEFAULT_P4A_DIR = '~/.cache/pyside6-android-builder/p4a-pinned'
 DEFAULT_NDK_VERSION = '27.2.12479018'   # Recommended by Qt for 6.10.x
-DEFAULT_API = '34'
+
+# Android SDK platform we compile against. Buildozer's default is 31, but
+# Google has retired API 31 from the GHA runner image (only 34/35/36 ship now).
+# We pin to 34 — fully compatible with p4a 2024.01 and PySide6 6.10.x.
+ANDROID_API = '34'
 
 # Qt's official wheel server. Hosts cross-compiled PySide6 + shiboken6 wheels
 # for Android, named e.g. PySide6-6.10.2-6.10.2-cp311-cp311-android_aarch64.whl.
@@ -322,6 +326,17 @@ def patch_pyside6_buildozer(venv_dir: str, p4a_source_dir: str) -> None:
         'self.set_value("app", "p4a.source_dir", "' + p4a_source_dir + '")',
         new_src, count=1,
     )
+    # Inject `android.api = 34` after the android.archs line.  Buildozer's
+    # default is API 31, but the GHA runner image no longer ships platforms
+    # for API 31 (only 34, 35, 36).  Letting buildozer try to install API 31
+    # via sdkmanager has historically failed in this setup — pinning to 34
+    # uses what's already on the runner.  API 34 is fully compatible with
+    # p4a 2024.01 and PySide6 6.10.x.
+    new_src, api_n = re.subn(
+        r'(self\.set_value\(\s*"app"\s*,\s*"android\.archs"\s*,\s*pysidedeploy_config\.arch\s*\))',
+        r'\g<1>\n        self.set_value("app", "android.api", "' + ANDROID_API + r'")',
+        new_src, count=1,
+    )
 
     if requirements_n == 0:
         log.warning('Could not find the "requirements" set_value() call to patch.')
@@ -335,6 +350,11 @@ def patch_pyside6_buildozer(venv_dir: str, p4a_source_dir: str) -> None:
                     'which currently has Python 3.14.')
     else:
         log.info('  p4a.branch → p4a.source_dir = %s', p4a_source_dir)
+    if api_n == 0:
+        log.warning('Could not inject android.api line; buildozer will use its '
+                    'default (31), which the GHA runner image no longer ships.')
+    else:
+        log.info('  android.api injected (= %s)', ANDROID_API)
 
     if new_src != src:
         with open(out, 'w', encoding='utf-8') as fh:
