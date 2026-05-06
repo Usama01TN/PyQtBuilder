@@ -425,6 +425,93 @@ def download_android_wheels(args):
     return paths['pyside'], paths['shiboken']
 
 
+def _accept_android_sdk_licenses() -> None:
+    """
+    Pre-create license files in buildozer's SDK directory so sdkmanager
+    treats licenses as accepted and proceeds non-interactively.  Without
+    this, sdkmanager prompts for "(y/N)", gets nothing on stdin, skips
+    the install of build-tools, and the build dies later when buildozer
+    looks for aidl.
+
+    Two sources, applied in order:
+      1. Copy any licenses already present in the system SDK
+         (/usr/local/lib/android/sdk on GHA runners) — these are the
+         most up-to-date set Google ships.
+      2. Append our hardcoded fallback hashes for licenses the system
+         SDK doesn't have yet (e.g. when build-tools introduces a new
+         license that the runner image hasn't been updated for).
+
+    The hashes are stable SHA-1s that have been in use across Android
+    SDK releases for years.  When sdkmanager sees them in the licenses
+    file, it considers the license accepted.
+    """
+    bz_sdk = expanduser('~/.buildozer/android/platform/android-sdk')
+    licenses_dir = join(bz_sdk, 'licenses')
+    os.makedirs(licenses_dir, exist_ok=True)
+
+    # 1. Copy whatever the runner's system SDK has accepted.
+    copied = 0
+    for env_var in ('ANDROID_SDK_ROOT', 'ANDROID_HOME'):
+        sys_sdk = os.environ.get(env_var)
+        if not sys_sdk:
+            continue
+        sys_licenses = join(sys_sdk, 'licenses')
+        if isdir(sys_licenses):
+            for name in os.listdir(sys_licenses):
+                src = join(sys_licenses, name)
+                dst = join(licenses_dir, name)
+                if not exists(dst):
+                    shutil.copy(src, dst)
+                    copied += 1
+            break
+    if copied:
+        log.info('  copied %d license file(s) from system SDK', copied)
+
+    # 2. Fallback hashes — covers anything the system SDK didn't have,
+    # and works even when no system SDK is available (local dev).
+    fallback = {
+        'android-sdk-license': [
+            '24333f8a63b6825ea9c5514f83c2829b004d1fee',
+            '8933bad161af4178b1185d1a37fbf41ea5269c55',
+            'd56f5187479451eabf01fb78af6dfcb131a6481e',
+        ],
+        'android-sdk-preview-license': [
+            '84831b9409646a918e30573bab4c9c91346d8abd',
+        ],
+        'android-sdk-arm-dbt-license': [
+            '859f317696f67ef3d7f30a50a5560e7834b43903',
+        ],
+        'intel-android-extra-license': [
+            'd975f751698a77b662f1254ddbeed3901e976f5a',
+        ],
+        'mips-android-sysimage-license': [
+            'e9acab5b5fbb560a72cfaecce8946896ff6aab9d',
+        ],
+        'google-gdk-license': [
+            '33b6a2b64607f11b759f320ef9dff4ae5c47d97a',
+        ],
+    }
+    appended = 0
+    for filename, hashes in fallback.items():
+        path = join(licenses_dir, filename)
+        existing = ''
+        if exists(path):
+            with open(path, 'r', encoding='utf-8') as fh:
+                existing = fh.read()
+        missing = [h for h in hashes if h not in existing]
+        if not missing:
+            continue
+        with open(path, 'a', encoding='utf-8') as fh:
+            if existing and not existing.endswith('\n'):
+                fh.write('\n')
+            for h in missing:
+                fh.write(h + '\n')
+                appended += 1
+    if appended:
+        log.info('  wrote %d fallback license hash(es)', appended)
+    log.info('  Android SDK licenses staged at %s', licenses_dir)
+
+
 # ─── Step 7 — run pyside6-android-deploy ──────────────────────────────────────
 
 def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
@@ -433,6 +520,9 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     deploy = join(venv_dir, 'bin', 'pyside6-android-deploy')
     if not exists(deploy):
         raise RuntimeError('pyside6-android-deploy not found at ' + deploy)
+
+    log.info('Pre-accepting Android SDK licenses for buildozer...')
+    _accept_android_sdk_licenses()
 
     # Buildozer invokes shell tools (cython, m4, autoconf...).  Without our
     # venv's bin/ on PATH it can't see cython and fails partway through.
