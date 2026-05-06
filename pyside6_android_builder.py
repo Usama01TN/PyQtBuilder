@@ -40,14 +40,14 @@ from os.path import isdir, sep, join, dirname, exists, basename, getsize, getmti
     relpath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from logging import basicConfig, getLogger, INFO, DEBUG
+from os import environ, pathsep, listdir, walk
 from zipfile import ZipFile, ZIP_DEFLATED
 from sys import exit, version_info, path
-from os import environ, pathsep, listdir
 from platform import release, system
 from subprocess import Popen, PIPE
+from re import match, compile
 from textwrap import dedent
 from shutil import move
-from re import compile
 
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
@@ -409,6 +409,19 @@ def setup_virtualenv(cfg):
                     'falling back to a hardcoded minimum set.')
         _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location',
               'pkginfo', 'packaging'], dry_run=cfg.dry_run)
+    # Pin python-for-android to a release that DEFAULTS TO PYTHON 3.11.
+    # PySide6 6.10's Android wheels are tagged cp311 (Python 3.11 ABI). Newer p4a
+    # (2025+) defaults to Python 3.13/3.14, which produces a libpython with the
+    # wrong SONAME and incompatible C ABI -> shiboken6 fails dlopen at app start.
+    # The 2024.1.21 release pins python3 recipe to 3.11.x, which matches the wheels.
+    log.info('Pinning python-for-android to a Python-3.11-default release...')
+    _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location',
+          '--force-reinstall', '--no-deps', 'python-for-android==2024.1.21'],
+         dry_run=cfg.dry_run)
+    res = _run([cfg.python_exe, '-c',
+                'import pythonforandroid; print(pythonforandroid.__version__)'],
+               capture=True, check=False, dry_run=cfg.dry_run)
+    log.info('  python-for-android version in venv: %s', (res.stdout or '?').strip())
     log.info('Virtual environment ready :)')
 
 
@@ -553,6 +566,17 @@ def build_apk(cfg):
     :return:    str
     """
     _step('Step 5/7 - Building APK/AAB')
+    # Buildozer keeps its own clone of python-for-android under ~/.buildozer.
+    # If a previous build cached a different p4a version (e.g., one defaulting
+    # to Python 3.13/3.14), we need to drop that clone so buildozer picks up the
+    # version we pinned in the venv. The python-installs cache (built Python
+    # binaries) is *not* deleted -- p4a will see the version mismatch and
+    # rebuild only the Python interpreter, which is what we want.
+    cached_p4a = join(expanduser('~'), '.buildozer', 'android', 'platform', 'python-for-android')
+    if isdir(cached_p4a):
+        log.info('Removing buildozer p4a clone at %s to force version refresh', cached_p4a)
+        from shutil import rmtree as _rmtree
+        _rmtree(cached_p4a, ignore_errors=True)
     cmd = [
         cfg.pyside6_android_deploy, '--name', cfg.app_name, '--wheel-pyside', cfg.wheel_pyside, '--wheel-shiboken',
         cfg.wheel_shiboken, '--ndk-path', cfg.ndk_path, '--sdk-path', cfg.sdk_path, '--force',  # non-interactive.
@@ -598,6 +622,147 @@ def build_apk(cfg):
 # APK post-processing — fix the libshiboken6 → libpython3.X.so SONAME mismatch
 # ------------------------------------------------------------------------------
 
+def _find_libpython_on_host(arch):
+    """
+    Search ~/.buildozer/android/platform/.../<arch>/ for libpython3.X.so* files
+    that python-for-android produced during the build. Returns the path to the
+    most recently modified candidate, preferring the unversioned name.
+    :param arch: str  -- e.g. 'arm64-v8a'
+    :return:     str | None
+    """
+    bz_root = join(expanduser('~'), '.buildozer', 'android', 'platform')
+    if not isdir(bz_root):
+        return None
+    pat = compile(r'^libpython\d+\.\d+\.so($|\..+$)')
+    candidates = []
+    for root, _dirs, files in walk(bz_root):
+        # Only files under a path that mentions our target arch
+        if arch not in root:
+            continue
+        for f in files:
+            if pat.match(f):
+                candidates.append(join(root, f))
+    if not candidates:
+        return None
+    # Prefer the unversioned file if available; otherwise newest versioned.
+    unversioned = [c for c in candidates if match(r'^libpython\d+\.\d+\.so$', basename(c))]
+    pool = unversioned or candidates
+    return sorted(pool, key=getmtime)[-1]
+
+
+def _patch_apk_python_aliases(apk_path, cfg):
+    """
+    Make sure the APK contains an unversioned libpython<X>.so in lib/<arch>/ so
+    that libshiboken6.abi3.so's DT_NEEDED lookup succeeds at runtime.
+    Strategy:
+      1. Inspect the APK; log every libpython* entry for diagnostics.
+      2. For each lib/<arch>/ already present:
+         a. If unversioned libpython is there  -> nothing to do for this arch.
+         b. Else if versioned (libpython.so.X) -> add an alias (zip duplicate).
+         c. Else  -> inject from ~/.buildozer build artifacts on disk.
+      3. Strip old signatures, zipalign, re-sign with the debug keystore.
+    :param apk_path: str
+    :param cfg:      BuildConfig
+    :return:         None
+    """
+    log.info('Post-processing APK to fix libpython.so SONAME mismatch...')
+    with ZipFile(apk_path, 'r') as z:
+        names = z.namelist()
+    name_set = set(names)
+    # 1. Diagnostic logging.
+    arch_dirs = sorted({n.split('/')[1] for n in names if n.startswith('lib/') and n.count('/') >= 2})
+    if not arch_dirs:
+        log.warning('  APK has no lib/<arch>/ directories at all; cannot patch.')
+        return
+    log.info('  Archs in APK: %s', arch_dirs)
+    all_pylib_entries = sorted(n for n in names if 'libpython' in n.lower())
+    log.info('  All libpython* entries in APK (%d total):', len(all_pylib_entries))
+    for p in all_pylib_entries:
+        log.info('    %s', p)
+    if not all_pylib_entries:
+        log.warning('  No libpython* found anywhere in APK. python-for-android may have '
+                    'bundled it via assets/private.tar instead of as a real .so. Will '
+                    'attempt to inject from disk.')
+    # 2. Build modification plan.
+    pat_versioned = compile(r'^(lib/[^/]+/libpython\d+\.\d+\.so)\.\d+(?:\.\d+)*$')
+    pat_unversioned = compile(r'^lib/[^/]+/libpython\d+\.\d+\.so$')
+    aliases = {}  # versioned arcname  -> unversioned arcname (intra-zip copy)
+    injections = {}  # target arcname     -> host filesystem path  (file from disk)
+    for arch in arch_dirs:
+        arch_prefix = 'lib/' + arch + '/'
+        if any(pat_unversioned.match(n) for n in names if n.startswith(arch_prefix)):
+            log.info('  lib/%s/: unversioned libpython already present -> OK', arch)
+            continue
+        # Look for versioned in this arch
+        versioned_here = [n for n in names if pat_versioned.match(n) and n.startswith(arch_prefix)]
+        if versioned_here:
+            for src in versioned_here:
+                aliases[src] = pat_versioned.match(src).group(1)
+            log.info('  lib/%s/: aliasing versioned libpython', arch)
+            continue
+        # Nothing here; try to inject from host
+        host_lib = _find_libpython_on_host(arch)
+        if host_lib:
+            base = basename(host_lib)
+            # Strip any version suffix in case we picked a libpython3.11.so.1.0 from disk
+            m = match(r'^(libpython\d+\.\d+\.so).*$', base)
+            target_name = m.group(1) if m else base
+            target_arc = arch_prefix + target_name
+            injections[target_arc] = host_lib
+            log.info('  lib/%s/: will inject from disk: %s -> %s', arch, host_lib, target_arc)
+        else:
+            log.error('  lib/%s/: no libpython in APK and none found on disk; the app '
+                      'will crash. Check that python-for-android actually built Python.', arch)
+    if not aliases and not injections:
+        log.info('  No APK modifications applied.')
+        return
+    # 3. Rewrite APK; strip old signature blocks so we can re-sign cleanly.
+    sig_pat = compile(r'^META-INF/.*\.(SF|RSA|DSA|EC)$')
+    tmp = apk_path + '.tmp'
+    with ZipFile(apk_path, 'r') as zin, ZipFile(tmp, 'w', ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if sig_pat.match(item.filename):
+                continue
+            zout.writestr(item, zin.read(item.filename))
+        for src, dst in aliases.items():
+            zout.writestr(dst, zin.read(src), ZIP_DEFLATED)
+        for dst, host_path in injections.items():
+            with open(host_path, 'rb') as fh:
+                zout.writestr(dst, fh.read(), ZIP_DEFLATED)
+    move(tmp, apk_path)
+    log.info('  APK rewritten: %d alias(es), %d injection(s).', len(aliases), len(injections))
+    # 4. Locate signing tools.
+    bt_dir = _find_android_buildtools(cfg)
+    if not bt_dir:
+        log.warning('  Android build-tools not found (apksigner + zipalign); APK is unsigned.')
+        return
+    log.info('  Using build-tools at: %s', bt_dir)
+    apksigner = join(bt_dir, 'apksigner')
+    zipalign = join(bt_dir, 'zipalign')
+    # 5. zipalign.
+    aligned = apk_path + '.aligned'
+    _run([zipalign, '-f', '-p', '4', apk_path, aligned])
+    move(aligned, apk_path)
+    # 6. Ensure debug keystore exists.
+    keystore = join(expanduser('~'), '.android', 'debug.keystore')
+    if not exists(keystore):
+        log.info('  Generating debug keystore at %s', keystore)
+        _makedirs(dirname(keystore))
+        _run(['keytool', '-genkeypair', '-v',
+              '-keystore', keystore,
+              '-storepass', 'android', '-keypass', 'android',
+              '-alias', 'androiddebugkey',
+              '-keyalg', 'RSA', '-keysize', '2048', '-validity', '10000',
+              '-dname', 'CN=Android Debug,O=Android,C=US'])
+    # 7. Re-sign.
+    _run([apksigner, 'sign',
+          '--ks', keystore,
+          '--ks-pass', 'pass:android',
+          '--key-pass', 'pass:android',
+          apk_path])
+    log.info('  APK re-signed successfully.')
+
+
 def _find_android_buildtools(cfg):
     """
     Locate the Android SDK build-tools directory (containing apksigner / zipalign).
@@ -610,83 +775,12 @@ def _find_android_buildtools(cfg):
         bt_root = join(sdk, 'build-tools')
         if not isdir(bt_root):
             continue
-        # Pick the highest-numbered version directory.
         versions = sorted([v for v in listdir(bt_root) if isdir(join(bt_root, v))])
         for v in reversed(versions):
             cand = join(bt_root, v)
             if exists(join(cand, 'apksigner')) and exists(join(cand, 'zipalign')):
                 return cand
     return None
-
-
-def _patch_apk_python_aliases(apk_path, cfg):
-    """
-    Add unversioned libpython<X>.so copies for every libpython<X>.so.<ver> entry,
-    then zipalign + re-sign with the debug keystore.
-    See build_apk() docstring for the underlying issue.
-    :param apk_path: str
-    :param cfg:      BuildConfig
-    :return:         None
-    """
-    log.info('Post-processing APK to fix libpython.so SONAME mismatch...')
-    # 1. Discover what aliases need to be added.
-    pat = compile(r'^(lib/[^/]+/libpython\d+\.\d+\.so)\.\d+(?:\.\d+)*$')
-    aliases = {}  # versioned arcname -> unversioned arcname
-    with ZipFile(apk_path, 'r') as z:
-        names = set(z.namelist())
-        for n in names:
-            m = pat.match(n)
-            if m and m.group(1) not in names:
-                aliases[n] = m.group(1)
-    if not aliases:
-        log.info('  APK already contains unversioned libpython entries; no patching needed.')
-        return
-    log.info('  Adding %d alias(es):', len(aliases))
-    for src, dst in aliases.items():
-        log.info('    %s  ->  %s', src, dst)
-    # 2. Rewrite APK with aliases added; strip old signature blocks.
-    sig_pat = compile(r'^META-INF/.*\.(SF|RSA|DSA|EC)$')
-    tmp = apk_path + '.tmp'
-    with ZipFile(apk_path, 'r') as zin, ZipFile(tmp, 'w', ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            if sig_pat.match(item.filename):
-                continue
-            zout.writestr(item, zin.read(item.filename))
-        for src, dst in aliases.items():
-            zout.writestr(dst, zin.read(src), ZIP_DEFLATED)
-    move(tmp, apk_path)
-    # 3. Locate signing tools.
-    bt_dir = _find_android_buildtools(cfg)
-    if not bt_dir:
-        log.warning('  Android build-tools not found (expected apksigner + zipalign). '
-                    'APK has aliases added but is unsigned. Re-sign manually before installing.')
-        return
-    log.info('  Using build-tools at: %s', bt_dir)
-    apksigner = join(bt_dir, 'apksigner')
-    zipalign = join(bt_dir, 'zipalign')
-    # 4. zipalign before signing (apksigner v2 requires aligned APK).
-    aligned = apk_path + '.aligned'
-    _run([zipalign, '-f', '-p', '4', apk_path, aligned])
-    move(aligned, apk_path)
-    # 5. Make sure a debug keystore exists. Buildozer normally creates one; if it
-    #    has been wiped, regenerate.
-    keystore = join(expanduser('~'), '.android', 'debug.keystore')
-    if not exists(keystore):
-        log.info('  Generating debug keystore at %s', keystore)
-        _makedirs(dirname(keystore))
-        _run(['keytool', '-genkeypair', '-v',
-              '-keystore', keystore,
-              '-storepass', 'android', '-keypass', 'android',
-              '-alias', 'androiddebugkey',
-              '-keyalg', 'RSA', '-keysize', '2048', '-validity', '10000',
-              '-dname', 'CN=Android Debug,O=Android,C=US'])
-    # 6. Re-sign with apksigner (v1 + v2 by default in modern build-tools).
-    _run([apksigner, 'sign',
-          '--ks', keystore,
-          '--ks-pass', 'pass:android',
-          '--key-pass', 'pass:android',
-          apk_path])
-    log.info('  APK re-signed successfully.')
 
 
 # ------------------------------------------------------------------------------
