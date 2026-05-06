@@ -382,10 +382,10 @@ def setup_virtualenv(cfg):
     _run([cfg.pip_exe, 'install', 'pyside6=={}'.format(cfg.pyside_version), '--quiet', '--no-warn-script-location'],
          dry_run=cfg.dry_run)
     # Cython is required by buildozer / python-for-android to compile native modules.
-    # It is NOT shipped in PySide6's requirements-android.txt — buildozer just assumes
-    # you have it on the dev machine. In CI we need to install it explicitly.
-    log.info('Installing Cython (required by buildozer)...')
-    _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location', 'cython'],
+    # `sh` is imported at the top of p4a's recipe modules; without it, importing
+    # any recipe (e.g. for our verification step) raises ModuleNotFoundError.
+    log.info('Installing Cython + sh (required by buildozer & p4a recipes)...')
+    _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location', 'cython', 'sh'],
          dry_run=cfg.dry_run)
     # pyside6-android-deploy needs extra runtime deps (pkginfo, packaging, ...) that ship
     # inside PySide6 itself as scripts/requirements-android.txt. The original script
@@ -826,36 +826,65 @@ def build_apk(cfg):
                 if line.lstrip().startswith(('requirements', 'python_version', 'p4a.', 'android.archs')):
                     log.info('  %s', line.rstrip())
         log.info('-----------------------------------------------')
-        # Brute-force enforcement: if the spec doesn't pin Python 3.11, rewrite
-        # the requirements line, drop any cached Python build, and re-run
-        # buildozer. This guarantees the final APK has libpython3.11.* regardless
-        # of what defaults p4a / PySide6 want to use.
+        # Brute-force enforcement: if the spec doesn't pin Python 3.11 *and*
+        # doesn't pin a p4a fork+branch, rewrite both, drop any cached state,
+        # and re-run buildozer. Two reasons buildozer might still produce
+        # Python 3.14 even after we pinned p4a in the venv:
+        #   1) buildozer ignores the pip-installed p4a and clones master
+        #      from kivy/python-for-android (which has the 3.14 recipe).
+        #   2) the requirements line in buildozer.spec is just `python3` with
+        #      no version pin, so even the pinned p4a's recipe defaults apply.
+        # Setting p4a.fork = kivy + p4a.branch = v2024.01.21 forces buildozer
+        # to clone the exact tag whose python3 recipe says version='3.11.5'.
         with open(spec_path, 'r', encoding='utf-8') as fh:
             spec_content = fh.read()
-        if 'python3==3.11' not in spec_content:
+        new_content = spec_content
+        needs_rebuild = False
+        # 1. Pin Python in requirements.
+        if 'python3==3.11' not in new_content:
             log.warning('buildozer.spec does NOT pin Python 3.11 -- forcing it now.')
             target = 'python3==3.11.5'
-            new_content = _re.sub(
+            patched = _re.sub(
                 r'^(requirements\s*=\s*)python3(==[\d.]+)?(?=[,\s]|$)',
                 r'\1' + target,
-                spec_content,
+                new_content,
                 count=1,
                 flags=_re.MULTILINE,
             )
-            if new_content == spec_content:
+            if patched == new_content:
                 log.error('Could not locate "requirements = python3" line in buildozer.spec.')
-                log.error('First 2000 chars of spec:\n%s', spec_content[:2000])
+                log.error('First 2000 chars of spec:\n%s', new_content[:2000])
                 raise RuntimeError('buildozer.spec missing expected requirements line')
+            new_content = patched
+            needs_rebuild = True
+        # 2. Pin p4a fork + branch so buildozer clones the right git tag.
+        if 'p4a.branch' not in new_content:
+            log.warning('buildozer.spec does NOT pin p4a.branch -- forcing v2024.01.21.')
+            new_content = _re.sub(
+                r'^(\[app\]\s*\n)',
+                r'\1p4a.fork = kivy\np4a.branch = v2024.01.21\n',
+                new_content,
+                count=1,
+                flags=_re.MULTILINE,
+            )
+            needs_rebuild = True
+        if needs_rebuild:
             with open(spec_path, 'w', encoding='utf-8') as fh:
                 fh.write(new_content)
+            log.info('--- patched buildozer.spec [key lines] ---')
             for line in new_content.split('\n'):
-                if line.lstrip().startswith('requirements'):
-                    log.info('  Updated: %s', line.rstrip())
-                    break
+                if line.lstrip().startswith(('requirements', 'p4a.fork', 'p4a.branch')):
+                    log.info('  %s', line.rstrip())
+            log.info('------------------------------------------')
             # Drop cached Python builds so p4a rebuilds against 3.11.5.
             from shutil import rmtree as _rmt2
             bz_platform = join(expanduser('~'), '.buildozer', 'android', 'platform')
             if isdir(bz_platform):
+                # Drop p4a clone -- buildozer will re-clone with our pinned branch.
+                p4a_clone = join(bz_platform, 'python-for-android')
+                if isdir(p4a_clone):
+                    log.info('  Dropping p4a clone (will re-clone v2024.01.21): %s', p4a_clone)
+                    _rmt2(p4a_clone, ignore_errors=True)
                 for sub in listdir(bz_platform):
                     sub_path = join(bz_platform, sub)
                     for victim in ('build', 'build/python-installs', 'build/other_builds'):
@@ -871,11 +900,12 @@ def build_apk(cfg):
                     _remove(f)
                 except OSError:
                     pass
-            log.info('Re-running buildozer android debug with Python 3.11 pinned...')
+            log.info('Re-running buildozer android debug with patched spec '
+                     '(p4a@v2024.01.21, python3==3.11.5)...')
             _run([cfg.python_exe, '-m', 'buildozer', 'android', 'debug'],
                  cwd=cfg.project_dir, env=deploy_env)
         else:
-            log.info('  Python 3.11 already pinned in buildozer.spec; no rebuild needed.')
+            log.info('  buildozer.spec already correctly configured; no rebuild needed.')
     # Locate the produced artifact.
     ext = '.apk' if cfg.mode == 'debug' else '.aab'
     matches = _rglob(cfg.project_dir, '*{}'.format(ext))
