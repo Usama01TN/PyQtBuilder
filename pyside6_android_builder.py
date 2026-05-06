@@ -98,8 +98,13 @@ EXTRA_VENV_PACKAGES = (
 )
 
 DEFAULT_VENV_DIR = '~/.cache/pyside6-android-builder/venv-{arch}'
+DEFAULT_WHEELS_DIR = '~/.cache/pyside6-android-builder/wheels'
 DEFAULT_NDK_VERSION = '27.2.12479018'   # Recommended by Qt for 6.10.x
 DEFAULT_API = '34'
+
+# Qt's official wheel server. Hosts cross-compiled PySide6 + shiboken6 wheels
+# for Android, named e.g. PySide6-6.10.2-6.10.2-cp311-cp311-android_aarch64.whl.
+WHEEL_BASE_URL = 'https://download.qt.io/official_releases/QtForPython'
 
 ARCH_ABIS = {
     'arm64-v8a':   'aarch64',
@@ -143,7 +148,7 @@ def section(title: str) -> None:
 
 def preflight(args) -> None:
     """Validate environment before doing any expensive work."""
-    section('Step 1/6 — Preflight')
+    section('Step 1/7 — Preflight')
 
     # Host Python must be 3.11.x.
     if sys.version_info[:2] != (3, 11):
@@ -182,7 +187,7 @@ def preflight(args) -> None:
 
 def setup_venv(args):
     """Create venv, install PySide6 and all build-time deps. Returns paths."""
-    section('Step 2/6 — Virtual environment')
+    section('Step 2/7 — Virtual environment')
     venv_dir = os.path.abspath(args.venv_dir)
     py_exe   = join(venv_dir, 'bin', 'python')
     pip_exe  = join(venv_dir, 'bin', 'pip')
@@ -229,7 +234,7 @@ def patch_pyside6_buildozer(venv_dir: str) -> None:
     buildozer toward a p4a commit that has both the qt bootstrap fix
     PySide6 needs AND the Python 3.11.5 recipe.
     """
-    section('Step 3/6 — Patch PySide6 buildozer-spec generator')
+    section('Step 3/7 — Patch PySide6 buildozer-spec generator')
     # Find the file via importable location (handles arbitrary venv layouts).
     py_exe = join(venv_dir, 'bin', 'python')
     out = run([py_exe, '-c',
@@ -293,7 +298,7 @@ def ensure_android_sdk_ndk(args):
     cached them) — or trust ~/.buildozer to manage its own.  We do not
     download here; that's the CI workflow's job.
     """
-    section('Step 4/6 — Android SDK / NDK')
+    section('Step 4/7 — Android SDK / NDK')
     sdk = args.sdk_path or expanduser('~/.android/sdk')
     ndk = args.ndk_path or join(sdk, 'ndk', DEFAULT_NDK_VERSION)
     if not isdir(ndk):
@@ -307,11 +312,68 @@ def ensure_android_sdk_ndk(args):
     return sdk, ndk
 
 
-# ─── Step 5 — run pyside6-android-deploy ──────────────────────────────────────
+# ─── Step 5 — download cross-compiled PySide6 + shiboken6 wheels ─────────────
 
-def run_deploy(args, venv_dir, py_exe, sdk, ndk):
+def download_android_wheels(args):
+    """
+    Fetch the cross-compiled Android wheels from Qt's server and return
+    (wheel_pyside_path, wheel_shiboken_path).  Wheels are cached at
+    ~/.cache/pyside6-android-builder/wheels/ — ~80 MB each, so we very
+    much do not want to re-download on every run.
+
+    Wheel filenames look like:
+        PySide6-6.10.2-6.10.2-cp311-cp311-android_aarch64.whl
+        shiboken6-6.10.2-6.10.2-cp311-cp311-android_aarch64.whl
+
+    The arch component uses Linux-style names (aarch64, armv7a, x86_64,
+    i686), not Android ABI names — so we map via ARCH_ABIS.
+    """
+    section('Step 5/7 — PySide6 Android wheels')
+    import urllib.request
+
+    wheels_dir = expanduser(DEFAULT_WHEELS_DIR)
+    os.makedirs(wheels_dir, exist_ok=True)
+
+    wheel_arch = ARCH_ABIS[args.arch]   # e.g. 'arm64-v8a' -> 'aarch64'
+    py_tag = 'cp311-cp311'              # PySide6 6.10.x is cp311-only on Android
+    base = '{ver}-{ver}-{tag}-android_{arch}.whl'.format(
+        ver=PYSIDE6_VERSION, tag=py_tag, arch=wheel_arch)
+
+    wheels = {
+        'pyside': ('PySide6-' + base,  WHEEL_BASE_URL + '/pyside6/PySide6-' + base),
+        'shiboken': ('shiboken6-' + base, WHEEL_BASE_URL + '/shiboken6/shiboken6-' + base),
+    }
+
+    paths = {}
+    for kind, (filename, url) in wheels.items():
+        dest = join(wheels_dir, filename)
+        if exists(dest) and getsize(dest) > 0:
+            log.info('cached: %s (%.1f MB)', filename, getsize(dest) / 1024 ** 2)
+        else:
+            log.info('downloading: %s', url)
+            try:
+                tmp = dest + '.partial'
+                urllib.request.urlretrieve(url, tmp)
+                os.rename(tmp, dest)
+                log.info('  → %s (%.1f MB)', dest, getsize(dest) / 1024 ** 2)
+            except Exception as e:
+                # Try to leave a useful trace; the most common cause is a
+                # 404 because the wheel name format changed in a new release.
+                raise SystemExit(
+                    'Failed to download {}\n  url:  {}\n  err:  {}\n'
+                    'If this is a 404, check the Qt download page at\n  {}/pyside6/\n'
+                    'and update PYSIDE6_VERSION or the wheel-naming code.'
+                    .format(filename, url, e, WHEEL_BASE_URL))
+        paths[kind] = dest
+
+    return paths['pyside'], paths['shiboken']
+
+
+# ─── Step 6 — run pyside6-android-deploy ──────────────────────────────────────
+
+def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     """Invoke pyside6-android-deploy in single-pass mode."""
-    section('Step 5/6 — pyside6-android-deploy')
+    section('Step 6/7 — pyside6-android-deploy')
     deploy = join(venv_dir, 'bin', 'pyside6-android-deploy')
     if not exists(deploy):
         raise RuntimeError('pyside6-android-deploy not found at ' + deploy)
@@ -326,6 +388,8 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk):
     cmd = [
         deploy,
         '--name', args.app_name,
+        '--wheel-pyside', wheel_pyside,
+        '--wheel-shiboken', wheel_shiboken,
         '--force',
     ]
     if sdk:
@@ -351,7 +415,7 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk):
     return artifact
 
 
-# ─── Step 6 — APK post-processing ─────────────────────────────────────────────
+# ─── Step 7 — APK post-processing ─────────────────────────────────────────────
 
 def post_process_apk(apk_path, sdk):
     """
@@ -359,7 +423,7 @@ def post_process_apk(apk_path, sdk):
     that p4a produces.  APKs do not preserve symlinks, so without this libshiboken6
     cannot resolve its DT_NEEDED entry at runtime.
     """
-    section('Step 6/6 — APK post-processing (libpython SONAME fix)')
+    section('Step 7/7 — APK post-processing (libpython SONAME fix)')
 
     with zipfile.ZipFile(apk_path, 'r') as z:
         names = z.namelist()
@@ -515,7 +579,8 @@ def main(argv=None):
     venv_dir, py_exe = setup_venv(args)
     patch_pyside6_buildozer(venv_dir)
     sdk, ndk = ensure_android_sdk_ndk(args)
-    apk = run_deploy(args, venv_dir, py_exe, sdk, ndk)
+    wheel_pyside, wheel_shiboken = download_android_wheels(args)
+    apk = run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken)
     post_process_apk(apk, sdk)
 
     log.info('')
