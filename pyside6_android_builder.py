@@ -438,6 +438,14 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     # venv's bin/ on PATH it can't see cython and fails partway through.
     env = os.environ.copy()
     env['PATH'] = join(venv_dir, 'bin') + os.pathsep + env.get('PATH', '')
+    # Buildozer 1.5.x checks `if "VIRTUAL_ENV" in os.environ` before deciding
+    # whether to pass --user to pip when installing p4a's runtime deps.  When
+    # we invoke buildozer with the venv's python directly, that env var isn't
+    # set automatically (it's normally set by `source bin/activate`).  Without
+    # this line, buildozer runs `pip install --user appdirs colorama ...`,
+    # pip refuses (--user is forbidden in venvs), and the build dies during
+    # "install_platform" before any compilation starts.
+    env['VIRTUAL_ENV'] = venv_dir
     env['PYTHONUNBUFFERED'] = '1'
 
     cmd = [
