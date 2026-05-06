@@ -43,6 +43,7 @@ from logging import basicConfig, getLogger, INFO, DEBUG
 from sys import exit, version_info, path
 from platform import release, system
 from subprocess import Popen, PIPE
+from os import environ, pathsep
 from textwrap import dedent
 
 if dirname(__file__) not in path:
@@ -222,7 +223,7 @@ class BuildConfig(object):
 # Helpers
 # ------------------------------------------------------------------------------
 
-def _run(cmd, cwd=None, check=True, dry_run=False, capture=False):
+def _run(cmd, cwd=None, check=True, dry_run=False, capture=False, env=None):
     """
     Run a subprocess with unified error handling.
     Replaces subprocess.run() + CompletedProcess for Python 2/3 compatibility.
@@ -231,6 +232,7 @@ def _run(cmd, cwd=None, check=True, dry_run=False, capture=False):
     :param check:    bool
     :param dry_run:  bool
     :param capture:  bool
+    :param env:      dict[str, str] | None  -- subprocess environment; inherits parent if None.
     :return:         SimpleProcess
     """
     cmd_strs = [c for c in cmd]
@@ -241,9 +243,10 @@ def _run(cmd, cwd=None, check=True, dry_run=False, capture=False):
         return SimpleProcess(cmd, 0, '', '')
     try:
         if capture:
-            proc = Popen(cmd_strs, cwd=cwd if cwd else None, stdout=PIPE, stderr=PIPE, universal_newlines=True)
+            proc = Popen(cmd_strs, cwd=cwd if cwd else None, env=env, stdout=PIPE, stderr=PIPE,
+                         universal_newlines=True)
         else:
-            proc = Popen(cmd_strs, cwd=cwd if cwd else None, universal_newlines=True)
+            proc = Popen(cmd_strs, cwd=cwd if cwd else None, env=env, universal_newlines=True)
         stdout, stderr = proc.communicate()
     except OSError as exc:
         raise RuntimeError('Failed to start subprocess: {}\n{}'.format(display, exc))
@@ -558,7 +561,16 @@ def build_apk(cfg):
     if cfg.dry_run:
         cmd.append('--dry-run')
     log.info('Running: %s', ' '.join(c for c in cmd))
-    _run(cmd, cwd=cfg.project_dir)  # Must run even in dry_run mode.
+    # CRITICAL: pyside6-android-deploy spawns buildozer, which does PATH-based lookups
+    # for tools like `cython`, `git`, `autoconf`. Cython is installed inside the venv
+    # at <venv>/bin/cython, but the venv isn't activated — we just invoke its python
+    # by absolute path. Without the next two lines, buildozer's `which('cython')`
+    # check fails and the deploy aborts with "Cython not found".
+    venv_bin = dirname(cfg.python_exe)
+    deploy_env = environ.copy()
+    deploy_env['PATH'] = venv_bin + pathsep + deploy_env.get('PATH', '')
+    deploy_env['VIRTUAL_ENV'] = cfg.venv_dir   # buildozer / p4a sometimes inspect this
+    _run(cmd, cwd=cfg.project_dir, env=deploy_env)  # Must run even in dry_run mode.
     # Locate the produced artifact.
     ext = '.apk' if cfg.mode == 'debug' else '.aab'
     matches = _rglob(cfg.project_dir, '*{}'.format(ext))
