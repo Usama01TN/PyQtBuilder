@@ -375,6 +375,12 @@ def setup_virtualenv(cfg):
     log.info('Installing PySide6 %s (host)...', cfg.pyside_version)
     _run([cfg.pip_exe, 'install', 'pyside6=={}'.format(cfg.pyside_version), '--quiet', '--no-warn-script-location'],
          dry_run=cfg.dry_run)
+    # Cython is required by buildozer / python-for-android to compile native modules.
+    # It is NOT shipped in PySide6's requirements-android.txt — buildozer just assumes
+    # you have it on the dev machine. In CI we need to install it explicitly.
+    log.info('Installing Cython (required by buildozer)...')
+    _run([cfg.pip_exe, 'install', '--quiet', '--no-warn-script-location', 'cython'],
+         dry_run=cfg.dry_run)
     # pyside6-android-deploy needs extra runtime deps (pkginfo, packaging, ...) that ship
     # inside PySide6 itself as scripts/requirements-android.txt. The original script
     # relied on setup_android_sdk_ndk() installing them as a side effect, which only
