@@ -698,6 +698,56 @@ def build_apk(cfg):
                 if line.lstrip().startswith(('requirements', 'python_version', 'p4a.', 'android.archs')):
                     log.info('  %s', line.rstrip())
         log.info('-----------------------------------------------')
+        # Brute-force enforcement: if the spec doesn't pin Python 3.11, rewrite
+        # the requirements line, drop any cached Python build, and re-run
+        # buildozer. This guarantees the final APK has libpython3.11.* regardless
+        # of what defaults p4a / PySide6 want to use.
+        with open(spec_path, 'r', encoding='utf-8') as fh:
+            spec_content = fh.read()
+        if 'python3==3.11' not in spec_content:
+            log.warning('buildozer.spec does NOT pin Python 3.11 -- forcing it now.')
+            target = 'python3==3.11.5'
+            new_content = _re.sub(
+                r'^(requirements\s*=\s*)python3(==[\d.]+)?(?=[,\s]|$)',
+                r'\1' + target,
+                spec_content,
+                count=1,
+                flags=_re.MULTILINE,
+            )
+            if new_content == spec_content:
+                log.error('Could not locate "requirements = python3" line in buildozer.spec.')
+                log.error('First 2000 chars of spec:\n%s', spec_content[:2000])
+                raise RuntimeError('buildozer.spec missing expected requirements line')
+            with open(spec_path, 'w', encoding='utf-8') as fh:
+                fh.write(new_content)
+            for line in new_content.split('\n'):
+                if line.lstrip().startswith('requirements'):
+                    log.info('  Updated: %s', line.rstrip())
+                    break
+            # Drop cached Python builds so p4a rebuilds against 3.11.5.
+            from shutil import rmtree as _rmt2
+            bz_platform = join(expanduser('~'), '.buildozer', 'android', 'platform')
+            if isdir(bz_platform):
+                for sub in listdir(bz_platform):
+                    sub_path = join(bz_platform, sub)
+                    for victim in ('build', 'build/python-installs', 'build/other_builds'):
+                        v = join(sub_path, *victim.split('/'))
+                        if isdir(v):
+                            log.info('  Dropping %s', v)
+                            _rmt2(v, ignore_errors=True)
+            # Drop the broken APK from the first pass so _rglob picks the new one.
+            from os import remove as _remove
+            for f in _rglob(cfg.project_dir, '*.apk') + _rglob(cfg.project_dir, '*.aab'):
+                log.info('  Removing first-pass artifact: %s', f)
+                try:
+                    _remove(f)
+                except OSError:
+                    pass
+            log.info('Re-running buildozer android debug with Python 3.11 pinned...')
+            _run([cfg.python_exe, '-m', 'buildozer', 'android', 'debug'],
+                 cwd=cfg.project_dir, env=deploy_env)
+        else:
+            log.info('  Python 3.11 already pinned in buildozer.spec; no rebuild needed.')
     # Locate the produced artifact.
     ext = '.apk' if cfg.mode == 'debug' else '.aab'
     matches = _rglob(cfg.project_dir, '*{}'.format(ext))
@@ -713,6 +763,23 @@ def build_apk(cfg):
     # so dlopen fails at app launch. Patch the APK to add the unversioned aliases.
     if ext == '.apk' and not cfg.dry_run:
         _patch_apk_python_aliases(artifact, cfg)
+    # Hard assertion: refuse to ship an APK that doesn't carry libpython3.11.*.
+    # Anything else means we wasted ~45 minutes; better to fail the workflow
+    # loudly than to install a broken APK.
+    if ext == '.apk' and not cfg.dry_run:
+        with ZipFile(artifact, 'r') as z:
+            py_libs = [n for n in z.namelist() if 'libpython' in n.lower()]
+        log.info('APK libpython entries: %s', py_libs or '(none)')
+        wrong = [p for p in py_libs if not _re.search(r'libpython3\.11(\.|$|\.so)', p)]
+        right = [p for p in py_libs if _re.search(r'libpython3\.11(\.|$|\.so)', p)]
+        if wrong and not right:
+            raise RuntimeError(
+                'APK contains the WRONG Python version: {}.\n'
+                'PySide6 wheels are cp311 -- bundled Python must be 3.11.x.\n'
+                'Check the build log for "buildozer.spec" requirements line and '
+                '"python3 recipe version" -- they should both say 3.11.'.format(py_libs))
+        if not py_libs:
+            log.warning('No libpython* in APK at all. Patcher should have handled this.')
     size_mb = getsize(artifact) / 1024.0 ** 2  # Float division.
     log.info('Build artifact: %s (%.1f MB)', artifact, size_mb)
     log.info('Build complete :)')
