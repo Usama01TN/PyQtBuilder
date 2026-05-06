@@ -466,20 +466,18 @@ def _log_p4a_diagnostics(cfg):
 def _patch_p4a_recipe_version(cfg, recipe_name, target_version):
     """
     Force a python-for-android recipe to use a specific Python version by
-    editing its source file. Works for both `python3` (target) and
-    `hostpython3` (host) recipes -- their `version` class attributes are the
-    only way to override what version p4a builds.
-    Steps:
-      1. Locate <venv>/.../pythonforandroid/recipes/<recipe_name>/__init__.py
-      2. If the file has its own `version = '3.X.Y'` line, replace it
-      3. If the file inherits from another recipe (no own version), do nothing
-         (the parent's version controls; patch the parent instead)
-      4. Comment out md5sum / sha256sum so a new tarball isn't rejected
+    editing its source file. Dumps the recipe file to the log on entry so we
+    can see exactly what we're working with, tries multiple regex patterns
+    (recent p4a versions sometimes use type-annotated class attributes), and
+    raises if the patch did not actually take effect.
     :param cfg:            BuildConfig
     :param recipe_name:    str -- 'python3' or 'hostpython3'
     :param target_version: str -- e.g. '3.11.5'
+    :raises RuntimeError: if patch did not take effect
     """
-    log.info('Patching p4a recipe %s -> Python %s...', recipe_name, target_version)
+    log.info('=' * 60)
+    log.info('Patching p4a recipe: %s -> Python %s', recipe_name, target_version)
+    log.info('=' * 60)
     res = _run([cfg.python_exe, '-c',
                 'import importlib.util; '
                 's = importlib.util.find_spec("pythonforandroid.recipes.{}"); '
@@ -487,37 +485,49 @@ def _patch_p4a_recipe_version(cfg, recipe_name, target_version):
                capture=True, check=False, dry_run=cfg.dry_run)
     recipe_path = (res.stdout or '').strip()
     if not recipe_path or not exists(recipe_path):
-        log.warning('  %s recipe not found; skipping', recipe_name)
+        log.warning('  %s recipe file not found; skipping', recipe_name)
         return
-    log.info('  Recipe at: %s', recipe_path)
+    log.info('Recipe file: %s', recipe_path)
     with open(recipe_path, 'r', encoding='utf-8') as fh:
         original = fh.read()
-    # Show current state for diagnostics
-    log.info('  --- BEFORE ---')
-    for line in original.split('\n'):
-        s = line.strip()
-        if s and not s.startswith('#') and (
-                s.startswith(('version =', 'version=', 'url =', 'url=',
-                              'md5sum', 'sha256sum', 'patches =', 'class '))
-                or 'from pythonforandroid.recipes' in s):
-            log.info('    %s', s)
-    log.info('  --------------')
-    # Replace `version = '3.X.Y'` if the recipe has one of its own
-    modified, n_ver = _re.subn(
-        r"(\bversion\s*=\s*['\"])3\.\d+\.\d+(['\"])",
-        r"\g<1>" + target_version + r"\g<2>",
-        original, count=1
-    )
-    if n_ver == 0:
+    # Dump the entire recipe (small, ~50-150 lines). Critical for diagnosing
+    # the case where our regex doesn't match the recipe's actual layout.
+    log.info('--- FULL RECIPE BEFORE PATCH ---')
+    for i, line in enumerate(original.split('\n'), 1):
+        log.info('  %3d| %s', i, line)
+    log.info('--- END OF BEFORE ---')
+    # Try several patterns -- different p4a versions have used different layouts.
+    patterns = [
+        # 1. Plain class attribute: `version = '3.X.Y'` or `version = "3.X.Y"`
+        (r"(\bversion\s*=\s*['\"])3\.\d+(?:\.\d+)?(['\"])",
+         r"\g<1>" + target_version + r"\g<2>"),
+        # 2. Type-annotated:        `version: str = '3.X.Y'`
+        (r"(\bversion\s*:\s*str\s*=\s*['\"])3\.\d+(?:\.\d+)?(['\"])",
+         r"\g<1>" + target_version + r"\g<2>"),
+    ]
+    modified = original
+    total_replacements = 0
+    for pat, repl in patterns:
+        modified, n = _re.subn(pat, repl, modified)
+        total_replacements += n
+    if total_replacements == 0:
+        # The recipe might inherit version from another recipe (e.g. hostpython3
+        # inheriting from Python3Recipe). That's a legitimate case -- log it and
+        # don't fail.
         if 'from pythonforandroid.recipes.python3' in original \
                 or 'class HostPython3Recipe(Python3Recipe' in original:
-            log.info('  %s inherits version from python3 recipe; nothing to patch here.',
+            log.info('%s appears to inherit version from python3; nothing to patch in this file.',
                      recipe_name)
-        else:
-            log.warning('  %s: no `version = "3.X.Y"` line found and no inheritance '
-                        'detected. Recipe layout may have changed.', recipe_name)
-        return
-    # Comment out hash checks (new tarball won't match old hash)
+            return
+        log.error('NO version line in %s matched any pattern.', recipe_name)
+        log.error('The recipe layout has likely changed. Inspect the dump above '
+                  'to find the line that defines the Python version, and add a '
+                  'pattern for it to _patch_p4a_recipe_version().')
+        raise RuntimeError(
+            'p4a {} recipe patch failed: no version line matched any pattern. '
+            'See the FULL RECIPE BEFORE PATCH dump in the build log above.'
+            .format(recipe_name))
+    # Comment out hash checks -- the new tarball won't match any old hash.
     modified = _re.sub(
         r"^(\s*)(md5sum|sha256sum)(\s*=)",
         r"\1# \2\3",
@@ -525,7 +535,30 @@ def _patch_p4a_recipe_version(cfg, recipe_name, target_version):
     )
     with open(recipe_path, 'w', encoding='utf-8') as fh:
         fh.write(modified)
-    log.info('  Wrote patched recipe (%d version replacement)', n_ver)
+    log.info('Made %d replacement(s) in %s', total_replacements, recipe_path)
+    # Verify by importing in a fresh subprocess and reading the class attr.
+    verify_code = (
+        'import importlib, pythonforandroid.recipes.{0} as m; '
+        'importlib.reload(m); '
+        'cls = next((c for n, c in vars(m).items() '
+        '            if isinstance(c, type) and "Recipe" in n and n != "Recipe"), None); '
+        'print("VERIFY", cls.__name__ if cls else "no class", '
+        '      getattr(cls, "version", "?") if cls else "?")'
+    ).format(recipe_name)
+    res = _run([cfg.python_exe, '-c', verify_code],
+               capture=True, check=False, dry_run=cfg.dry_run)
+    output = (res.stdout or '').strip()
+    log.info('Verification output: %s', output)
+    if target_version not in output:
+        raise RuntimeError(
+            'p4a {} recipe patch did NOT take effect.\n'
+            'Reported version: {}\n'
+            'Expected version: {}\n'
+            'Inspect the FULL RECIPE BEFORE PATCH dump above to see what '
+            'version-defining construct the recipe actually uses (it may be a '
+            'property, a method, or imported from elsewhere).'
+            .format(recipe_name, output, target_version))
+    log.info('%s recipe successfully patched and verified.', recipe_name)
 
 
 def _patch_pyside6_for_python_311(cfg):
