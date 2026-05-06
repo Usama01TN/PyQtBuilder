@@ -641,15 +641,42 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
     result = subprocess.run(['bash', '-c', 'set -o pipefail; ' + tee_cmd],
                             cwd=args.project_dir, env=env)
 
-    if result.returncode != 0:
+    # pyside6-android-deploy's main() wraps everything in `except Exception:
+    # print(traceback)` then proceeds to the `finally:` block and exits 0.
+    # That means buildozer can fail catastrophically and we still see exit
+    # code 0 at the shell level.  So we have to detect failure from the
+    # CAPTURED OUTPUT, not the exit code.
+    build_failed = result.returncode != 0
+    failure_reason = 'subprocess exited %d' % result.returncode
+    log_content = ''
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
+            log_content = fh.read()
+    except OSError:
+        pass
+
+    failure_markers = [
+        # Buildozer's "I died, please scroll up" wrapper message:
+        '# Buildozer failed to execute the last command',
+        # pyside6-android-deploy's swallowed-exception print:
+        'Exception occurred: Traceback',
+        # Direct subprocess failure inside deploy:
+        'subprocess.CalledProcessError',
+    ]
+    for marker in failure_markers:
+        if marker in log_content:
+            build_failed = True
+            failure_reason = 'detected marker in log: ' + marker
+            break
+
+    if build_failed:
         log.error('')
         log.error('=' * 70)
-        log.error('Buildozer failed (exit %d).  Last 100 lines of its output:',
-                 result.returncode)
+        log.error('Buildozer failed (%s).  Last 120 lines of its output:',
+                 failure_reason)
         log.error('=' * 70)
         try:
-            with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
-                tail = fh.readlines()[-100:]
+            tail = log_content.splitlines(keepends=True)[-120:]
             for line in tail:
                 sys.stderr.write(line)
         except Exception as e:
@@ -657,7 +684,7 @@ def run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken):
         log.error('=' * 70)
         log.error('Full log: %s', log_path)
         log.error('In CI, this file is uploaded as the "build-log" workflow artifact.')
-        raise SystemExit(result.returncode)
+        raise SystemExit(1)
 
     ext = '.apk' if args.mode == 'debug' else '.aab'
     candidates = []
