@@ -28,7 +28,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    timeout-minutes: 660
 
     # Normalize inputs so manual runs and Django dispatches use the same names.
     env:
