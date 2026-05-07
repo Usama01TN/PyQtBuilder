@@ -392,6 +392,135 @@ def ensure_android_sdk_ndk(args):
 
 # ─── Step 6 — download cross-compiled PySide6 + shiboken6 wheels ─────────────
 
+# Qt modules that must always be kept in the wheel — without them, even a
+# trivial PySide6 app fails to import or render.  These never get stripped
+# regardless of what the project imports.
+PYSIDE6_ESSENTIAL_MODULES = {'QtCore', 'QtGui', 'QtWidgets'}
+
+
+def _scan_project_for_pyside6_imports(project_dir):
+    """
+    Walk the project tree and parse every .py file's AST to find PySide6
+    module imports.  Returns a set like {'QtCore', 'QtNetwork', ...}.
+
+    Detects all three import forms:
+        from PySide6.QtCore import QObject
+        from PySide6 import QtCore
+        import PySide6.QtCore
+    """
+    import ast
+    skip_dirs = {'__pycache__', '.git', '.venv', 'venv', 'env',
+                 'node_modules', '.buildozer', 'deployment'}
+    found = set()
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+        for fn in files:
+            if not fn.endswith('.py'):
+                continue
+            path = join(root, fn)
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    tree = ast.parse(fh.read(), filename=path)
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module == 'PySide6':
+                        # `from PySide6 import QtCore, QtGui`
+                        for alias in node.names:
+                            if alias.name.startswith('Qt'):
+                                found.add(alias.name)
+                    elif node.module.startswith('PySide6.'):
+                        # `from PySide6.QtCore import ...`
+                        parts = node.module.split('.')
+                        if len(parts) >= 2 and parts[1].startswith('Qt'):
+                            found.add(parts[1])
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        # `import PySide6.QtCore`
+                        if alias.name.startswith('PySide6.'):
+                            parts = alias.name.split('.')
+                            if len(parts) >= 2 and parts[1].startswith('Qt'):
+                                found.add(parts[1])
+    return found
+
+
+def _list_qt_modules_in_wheel(wheel_path):
+    """Return the set of Qt<X> module names present in the wheel."""
+    modules = set()
+    pat = re.compile(r'^PySide6/(Qt[A-Z][A-Za-z0-9]*)\.')
+    with zipfile.ZipFile(wheel_path, 'r') as z:
+        for name in z.namelist():
+            m = pat.match(name)
+            if m:
+                modules.add(m.group(1))
+    return modules
+
+
+def _strip_pyside6_wheel(wheel_path, drop_modules):
+    """
+    Create a stripped copy of the PySide6 wheel with the given modules
+    removed.  Returns the path to the new wheel (or the original path if
+    nothing was dropped).
+
+    Removes for each dropped module Qt<X>:
+      * PySide6/Qt<X>.{pyi,so,abi3.so,...}             (Python bindings)
+      * PySide6/Qt/lib/libQt6<X>.so*                   (Qt framework lib)
+      * PySide6/Qt/qml/Qt<X>/...                       (QML imports)
+
+    Plugins are NOT touched — they're shared across modules and pruning
+    them safely requires module-specific knowledge.
+    """
+    if not drop_modules:
+        return wheel_path
+
+    log.info('Stripping %d Qt module(s) from PySide6 wheel:', len(drop_modules))
+    for m in sorted(drop_modules):
+        log.info('  - %s', m)
+
+    # Build match patterns.  For Qt<X>, the framework lib is libQt6<X>.so —
+    # we strip the leading "Qt" for the lib name (QtCharts → libQt6Charts.so).
+    # Qt3D* modules don't follow that pattern (libQt63DCore.so) — handle both.
+    patterns = []
+    for module in drop_modules:
+        bind_pat = r'^PySide6/' + re.escape(module) + r'(\.|$)'
+        # Library naming: Qt-prefixed modules drop "Qt", Qt3D modules don't.
+        if module.startswith('Qt3D'):
+            lib_token = module[2:]   # 3DCore → libQt63DCore? Actually Qt63DCore
+        else:
+            lib_token = module[2:] if module.startswith('Qt') else module
+        lib_pat = (r'^PySide6/Qt/lib/libQt6' + re.escape(lib_token)
+                   + r'(\.so|\.so\.|$)')
+        qml_pat = r'^PySide6/Qt/qml/' + re.escape(module) + r'/'
+        patterns += [re.compile(bind_pat), re.compile(lib_pat), re.compile(qml_pat)]
+
+    stripped = wheel_path[:-4] + '-stripped.whl'
+    if exists(stripped):
+        os.unlink(stripped)
+
+    bytes_in = bytes_out = n_in = n_out = 0
+    dropped_files = []
+    with zipfile.ZipFile(wheel_path, 'r') as zin, \
+         zipfile.ZipFile(stripped, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            n_in += 1
+            bytes_in += info.file_size
+            if any(p.match(info.filename) for p in patterns):
+                dropped_files.append(info.filename)
+                continue
+            zout.writestr(info, zin.read(info.filename))
+            n_out += 1
+            bytes_out += info.file_size
+
+    log.info('  before: %d entries, %.1f MB',  n_in, bytes_in / 1024 ** 2)
+    log.info('  after:  %d entries, %.1f MB',  n_out, bytes_out / 1024 ** 2)
+    log.info('  saved:  %d entries, %.1f MB (-%.0f%%)',
+             n_in - n_out,
+             (bytes_in - bytes_out) / 1024 ** 2,
+             100 * (bytes_in - bytes_out) / max(bytes_in, 1))
+    return stripped
+
+
 def download_android_wheels(args):
     """
     Fetch the cross-compiled Android wheels from Qt's server and return
@@ -442,7 +571,29 @@ def download_android_wheels(args):
                     .format(filename, url, e, WHEEL_BASE_URL))
         paths[kind] = dest
 
-    return paths['pyside'], paths['shiboken']
+    # Optionally strip unused Qt modules from the PySide6 wheel.  shiboken6
+    # is left alone — it has no per-Qt-module structure to strip.
+    pyside_path = paths['pyside']
+    drop = set(args.exclude_modules or [])
+    if args.auto_strip:
+        used = _scan_project_for_pyside6_imports(args.project_dir)
+        log.info('Auto-strip: detected PySide6 modules used in project:')
+        for m in sorted(used):
+            log.info('  • %s', m)
+        all_in_wheel = _list_qt_modules_in_wheel(pyside_path)
+        keep = used | PYSIDE6_ESSENTIAL_MODULES | set(args.keep_modules or [])
+        drop |= (all_in_wheel - keep)
+    elif args.exclude_modules:
+        # Manual mode: refuse to drop essentials even if explicitly listed.
+        bad = drop & PYSIDE6_ESSENTIAL_MODULES
+        if bad:
+            log.warning('Refusing to drop essential modules: %s', sorted(bad))
+            drop -= PYSIDE6_ESSENTIAL_MODULES
+
+    if drop:
+        pyside_path = _strip_pyside6_wheel(pyside_path, drop)
+
+    return pyside_path, paths['shiboken']
 
 
 def _setup_buildozer_sdk_layout() -> None:
@@ -854,6 +1005,20 @@ def parse_args(argv=None):
                    help='Android SDK path (optional; buildozer manages its own)')
     p.add_argument('--ndk-path',  default='',
                    help='Android NDK path (optional; buildozer manages its own)')
+    p.add_argument('--auto-strip', action='store_true',
+                   help='Scan project for PySide6 imports and strip every Qt '
+                        'module the project does not use from the bundled '
+                        'wheel.  Typical savings: 30-50 MB.  Essentials '
+                        '(QtCore, QtGui, QtWidgets) are always kept.')
+    p.add_argument('--exclude-modules', default='',
+                   help='Comma-separated list of Qt modules to remove from '
+                        'the bundled wheel, e.g. "QtCharts,QtPdf,QtSerialPort". '
+                        'Combined with --auto-strip if both are given.')
+    p.add_argument('--keep-modules', default='',
+                   help='Comma-separated list of Qt modules to preserve in '
+                        'addition to those auto-detected (only meaningful '
+                        'with --auto-strip).  Useful when the project uses '
+                        'dynamic imports the AST scanner cannot see.')
     p.add_argument('-v', '--verbose', action='store_true',
                    help='Verbose subprocess logging')
     args = p.parse_args(argv)
@@ -862,6 +1027,14 @@ def parse_args(argv=None):
         args.venv_dir = expanduser(DEFAULT_VENV_DIR.format(arch=args.arch))
 
     args.project_dir = os.path.abspath(args.project_dir)
+
+    # Parse comma-separated module lists into list[str] (strip whitespace,
+    # drop empty entries from things like "Qt , ,Foo").
+    def _parse_csv(s):
+        return [x.strip() for x in (s or '').split(',') if x.strip()]
+    args.exclude_modules = _parse_csv(args.exclude_modules)
+    args.keep_modules    = _parse_csv(args.keep_modules)
+
     return args
 
 
