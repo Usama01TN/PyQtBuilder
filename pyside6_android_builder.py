@@ -457,67 +457,127 @@ def _list_qt_modules_in_wheel(wheel_path):
     return modules
 
 
-def _strip_pyside6_wheel(wheel_path, drop_modules):
+def _strip_pyside6_wheel(wheel_path, drop_modules, keep_modules=None):
     """
     Create a stripped copy of the PySide6 wheel with the given modules
     removed.  Returns the path to the new wheel (or the original path if
     nothing was dropped).
 
-    Removes for each dropped module Qt<X>:
-      * PySide6/Qt<X>.{pyi,so,abi3.so,...}             (Python bindings)
-      * PySide6/Qt/lib/libQt6<X>.so*                   (Qt framework lib)
-      * PySide6/Qt/qml/Qt<X>/...                       (QML imports)
+    For each dropped module Qt<X> we remove:
 
-    Plugins are NOT touched — they're shared across modules and pruning
-    them safely requires module-specific knowledge.
+      * PySide6/Qt<X>.{pyi,abi3.so,so,py}  — the Python binding
+      * PySide6/Qt/lib/libQt6<X>.so*       — the main framework lib
+      * PySide6/Qt/lib/libQt6<X><Suffix>.so* for sub-libs at CamelCase
+        boundaries (e.g. dropping QtPdf removes libQt6Pdf, libQt6PdfQuick,
+        libQt6PdfWidgets; dropping QtQml removes libQt6Qml, libQt6QmlCore,
+        libQt6QmlMeta, libQt6QmlNetwork, libQt6QmlModels, libQt6QmlCompiler,
+        libQt6QmlLocalStorage, libQt6QmlWorkerScript, libQt6QmlXmlListModel)
+      * PySide6/Qt/qml/Qt<X>/...          — QML imports
+
+    When a sub-lib's prefix matches BOTH a kept and a dropped module, the
+    longest match wins.  That makes `--exclude-modules QtQuick` while keeping
+    `QtQuick3D` work correctly: libQt6Quick3DAssetUtils matches both "Quick"
+    (drop) and "Quick3D" (keep), and "Quick3D" is longer so the lib is kept.
+
+    Special case: libQt6Labs<*> are Qt's experimental QML modules with no
+    direct PySide6 binding — they're QtQml internals.  We drop them iff
+    QtQml itself is being dropped.
+
+    Plugins (under PySide6/Qt/plugins/) are NOT touched — their relationship
+    to modules is many-to-many and pruning safely needs more knowledge than
+    the script has.
     """
     if not drop_modules:
         return wheel_path
+
+    drop_modules = set(drop_modules)
+    keep_modules = set(keep_modules or [])
 
     log.info('Stripping %d Qt module(s) from PySide6 wheel:', len(drop_modules))
     for m in sorted(drop_modules):
         log.info('  - %s', m)
 
-    # Build match patterns.  For Qt<X>, the framework lib is libQt6<X>.so —
-    # we strip the leading "Qt" for the lib name (QtCharts → libQt6Charts.so).
-    # Qt3D* modules don't follow that pattern (libQt63DCore.so) — handle both.
-    patterns = []
-    for module in drop_modules:
-        bind_pat = r'^PySide6/' + re.escape(module) + r'(\.|$)'
-        # Library naming: Qt-prefixed modules drop "Qt", Qt3D modules don't.
-        if module.startswith('Qt3D'):
-            lib_token = module[2:]   # 3DCore → libQt63DCore? Actually Qt63DCore
-        else:
-            lib_token = module[2:] if module.startswith('Qt') else module
-        lib_pat = (r'^PySide6/Qt/lib/libQt6' + re.escape(lib_token)
-                   + r'(\.so|\.so\.|$)')
-        qml_pat = r'^PySide6/Qt/qml/' + re.escape(module) + r'/'
-        patterns += [re.compile(bind_pat), re.compile(lib_pat), re.compile(qml_pat)]
+    def _base(module):
+        # Module Qt<X> → lib token <X>.  Qt3D modules retain the "3D" prefix
+        # because libs are libQt63DCore etc.
+        return module[2:] if module.startswith('Qt') else module
+
+    keep_bases = {_base(m) for m in keep_modules}
+    drop_bases = {_base(m) for m in drop_modules}
+
+    def _boundary_match(name, base):
+        """Does `base` match the start of `name` at a CamelCase boundary?"""
+        if name == base:
+            return True
+        if name.startswith(base) and len(name) > len(base):
+            next_ch = name[len(base)]
+            return next_ch.isupper() or next_ch.isdigit()
+        return False
+
+    LIBPAT = re.compile(r'^PySide6/Qt/lib/libQt6([A-Za-z0-9]+)')
+
+    def _should_drop_lib(filename):
+        m = LIBPAT.match(filename)
+        if not m:
+            return False
+        name = m.group(1)
+
+        # Labs* are QtQml internals with no own PySide6 module.
+        if name.startswith('Labs') and (len(name) == 4 or name[4].isupper()):
+            return 'Qml' in drop_bases
+
+        keep_hits = [b for b in keep_bases if _boundary_match(name, b)]
+        drop_hits = [b for b in drop_bases if _boundary_match(name, b)]
+
+        if keep_hits and drop_hits:
+            # Longest match wins (more specific).  Tied → keep.
+            return max(map(len, drop_hits)) > max(map(len, keep_hits))
+        return bool(drop_hits)
+
+    # Precompiled patterns for binding files and QML imports.
+    binding_patterns = [
+        re.compile(r'^PySide6/' + re.escape(m) + r'(\.|$)')
+        for m in drop_modules
+    ]
+    qml_patterns = [
+        re.compile(r'^PySide6/Qt/qml/' + re.escape(m) + r'/')
+        for m in drop_modules
+    ]
+    if 'QtQml' in drop_modules:
+        # Qt's experimental QML modules live under qml/Qt/labs/.
+        qml_patterns.append(re.compile(r'^PySide6/Qt/qml/Qt/labs/'))
 
     stripped = wheel_path[:-4] + '-stripped.whl'
     if exists(stripped):
         os.unlink(stripped)
 
-    bytes_in = bytes_out = n_in = n_out = 0
-    dropped_files = []
+    n_in = n_out = bytes_in = bytes_out = 0
+    libs_dropped = 0
     with zipfile.ZipFile(wheel_path, 'r') as zin, \
          zipfile.ZipFile(stripped, 'w', zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
             n_in += 1
             bytes_in += info.file_size
-            if any(p.match(info.filename) for p in patterns):
-                dropped_files.append(info.filename)
+            drop = (
+                any(p.match(info.filename) for p in binding_patterns) or
+                any(p.match(info.filename) for p in qml_patterns) or
+                _should_drop_lib(info.filename)
+            )
+            if drop:
+                if info.filename.startswith('PySide6/Qt/lib/'):
+                    libs_dropped += 1
                 continue
             zout.writestr(info, zin.read(info.filename))
             n_out += 1
             bytes_out += info.file_size
 
-    log.info('  before: %d entries, %.1f MB',  n_in, bytes_in / 1024 ** 2)
+    log.info('  before: %d entries, %.1f MB',  n_in,  bytes_in  / 1024 ** 2)
     log.info('  after:  %d entries, %.1f MB',  n_out, bytes_out / 1024 ** 2)
-    log.info('  saved:  %d entries, %.1f MB (-%.0f%%)',
+    log.info('  saved:  %d entries, %.1f MB (-%.0f%%) — %d native libs',
              n_in - n_out,
              (bytes_in - bytes_out) / 1024 ** 2,
-             100 * (bytes_in - bytes_out) / max(bytes_in, 1))
+             100 * (bytes_in - bytes_out) / max(bytes_in, 1),
+             libs_dropped)
     return stripped
 
 
@@ -575,6 +635,7 @@ def download_android_wheels(args):
     # is left alone — it has no per-Qt-module structure to strip.
     pyside_path = paths['pyside']
     drop = set(args.exclude_modules or [])
+    keep = set()
     if args.auto_strip:
         used = _scan_project_for_pyside6_imports(args.project_dir)
         log.info('Auto-strip: detected PySide6 modules used in project:')
@@ -584,14 +645,19 @@ def download_android_wheels(args):
         keep = used | PYSIDE6_ESSENTIAL_MODULES | set(args.keep_modules or [])
         drop |= (all_in_wheel - keep)
     elif args.exclude_modules:
-        # Manual mode: refuse to drop essentials even if explicitly listed.
+        # Manual mode: refuse to drop essentials even if explicitly listed,
+        # and treat everything else in the wheel as kept.
         bad = drop & PYSIDE6_ESSENTIAL_MODULES
         if bad:
             log.warning('Refusing to drop essential modules: %s', sorted(bad))
             drop -= PYSIDE6_ESSENTIAL_MODULES
+        all_in_wheel = _list_qt_modules_in_wheel(pyside_path)
+        keep = all_in_wheel - drop
 
     if drop:
-        pyside_path = _strip_pyside6_wheel(pyside_path, drop)
+        # Pass the keep set so the stripper can resolve longest-match
+        # ambiguities (dropping QtQuick while keeping QtQuick3D, etc.).
+        pyside_path = _strip_pyside6_wheel(pyside_path, drop, keep_modules=keep)
 
     return pyside_path, paths['shiboken']
 
