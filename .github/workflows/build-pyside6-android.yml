@@ -131,7 +131,7 @@ jobs:
 
       - name: Build APK
         run: |
-          python build_pyside6_android.py "$PROJ_DIR" \
+          python pyside6_android_builder.py "$PROJ_DIR" \
             --arch "$ARCH" \
             --mode debug \
             --venv-dir "$HOME/.cache/pyside6-android-builder/venv-${ARCH}" \
