@@ -130,17 +130,14 @@ jobs:
           ls -la "$PROJ_DIR"
 
       - name: Build APK
-        # The new script takes project_dir as a positional argument and uses
-        # Android-style ABI names (arm64-v8a, armeabi-v7a, x86_64, x86) rather
-        # than the GNU triplet style of the old script (aarch64, armv7a, etc.).
-        # The workflow `arch` input above is already in the new format.
         run: |
-          mkdir -p "$HOME/.cache/pyside6-android-builder"
-          python pyside6_android_builder.py "$PROJ_DIR" \
+          python build_pyside6_android.py "$PROJ_DIR" \
             --arch "$ARCH" \
             --mode debug \
             --venv-dir "$HOME/.cache/pyside6-android-builder/venv-${ARCH}" \
-            --verbose
+            --auto-strip \
+            --verbose \
+            --exclude-modules QtCharts,QtSerialPort,QtPdf,QtMultimedia,QtNetworkAuth,Qt3DCore,Qt3DRender,QtWebEngineCore,QtWebEngineQuick,QtWebEngineWidgets
 
       - name: Locate APK
         id: locate
