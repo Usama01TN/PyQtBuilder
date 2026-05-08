@@ -287,7 +287,68 @@ def prepare_p4a_pinned() -> str:
 
 # ─── Step 4 — patch PySide6's buildozer.py (the load-bearing fix) ─────────────
 
-def patch_pyside6_buildozer(venv_dir: str, p4a_source_dir: str) -> None:
+# ─── Step 4 — patch PySide6's buildozer.py (the load-bearing fix) ─────────────
+
+# Names p4a 2024.01.21 ships dedicated recipes for.  Anything not in this list
+# is still permitted (p4a falls back to pip install via its PythonRecipe), but
+# packages with C extensions outside this set will fail to build because pip
+# can't cross-compile arbitrary native code for Android.  We only use this list
+# for log warnings — the build still attempts whatever the user requests.
+P4A_KNOWN_RECIPES = frozenset({
+    'numpy', 'scipy', 'pillow', 'lxml', 'cryptography', 'cffi', 'pycparser',
+    'bcrypt', 'pynacl', 'six', 'setuptools', 'wheel', 'requests', 'urllib3',
+    'certifi', 'charset-normalizer', 'idna', 'chardet', 'pytz',
+    'python-dateutil', 'pyjnius', 'plyer', 'kivy', 'sdl2', 'sqlite3',
+    'openssl', 'libffi', 'sympy', 'matplotlib', 'pyzmq', 'msgpack',
+    'cython', 'flask', 'jinja2', 'markupsafe', 'click', 'itsdangerous',
+    'werkzeug', 'genericpath', 'libxml2', 'libxslt', 'pyyaml', 'protobuf',
+    'pandas', 'pycryptodome', 'pycryptodomex', 'pyrsistent', 'attrs',
+    'jsonschema', 'pyparsing', 'packaging', 'rsa', 'pyasn1',
+})
+
+
+def _parse_requirements_file(path):
+    """
+    Read a requirements.txt-style file and return a list of `name[==version]`
+    strings suitable for passing to p4a / buildozer.
+
+    Skips comments, blank lines, pip flags (-r, --index-url, etc.), and
+    git/url installs (those don't work with p4a).  Strips environment
+    markers (`; sys_platform == "linux"`) since they wouldn't apply on
+    Android anyway.
+    """
+    if not exists(path):
+        return []
+    out = []
+    seen = set()
+    with open(path, 'r', encoding='utf-8') as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith('#') or line.startswith('-'):
+                continue
+            # `package; sys_platform == "linux"` → drop the marker
+            if ';' in line:
+                line = line.split(';', 1)[0].strip()
+            # `package @ git+https://...` or `git+https://...` — not supported
+            if line.startswith('git+') or '@' in line:
+                log.warning('  skipping VCS/URL requirement (unsupported on '
+                            'Android): %s', line)
+                continue
+            # Strip trailing comment
+            if '#' in line:
+                line = line.split('#', 1)[0].strip()
+            # Strip extras: `package[extra1,extra2]==1.0` → `package==1.0`
+            line = re.sub(r'\[[^\]]*\]', '', line)
+            # Get the bare package name for de-dup and recipe-check
+            name = re.split(r'[<>=!~\s]', line, 1)[0].strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append(line)
+    return out
+
+
+def patch_pyside6_buildozer(venv_dir, p4a_source_dir, user_requirements=None):
     """
     Edit the venv copy of pyside6/scripts/deploy_lib/android/buildozer.py:
       * line 27: requirements = python3,...     →  python3=={ver},...
@@ -313,11 +374,17 @@ def patch_pyside6_buildozer(venv_dir: str, p4a_source_dir: str) -> None:
     with open(out, 'r', encoding='utf-8') as fh:
         src = fh.read()
 
+    # Build the full requirements list: PySide6 essentials + user's deps.
+    base_reqs = ['python3==' + TARGET_PYTHON, 'shiboken6', 'PySide6']
+    user_reqs = list(user_requirements or [])
+    full_value = ','.join(base_reqs + user_reqs)
+    # Replace the WHOLE requirements value (any string between the quotes),
+    # so we can inject however many user packages we need.  The original
+    # value is `python3,shiboken6,PySide6` — `[^"]+` handles that and any
+    # variant a future PySide6 release might ship.
     new_src, requirements_n = re.subn(
-        r'(self\.set_value\(\s*"app"\s*,\s*"requirements"\s*,\s*")'
-        r'python3'
-        r'(\s*,\s*shiboken6\s*,\s*PySide6\s*"\s*\))',
-        r'\g<1>python3==' + TARGET_PYTHON + r'\g<2>',
+        r'(self\.set_value\(\s*"app"\s*,\s*"requirements"\s*,\s*")[^"]+(\s*"\s*\))',
+        lambda m: m.group(1) + full_value + m.group(2),
         src, count=1,
     )
     # Replace the p4a.branch = "develop" line with a p4a.source_dir line.
@@ -343,7 +410,23 @@ def patch_pyside6_buildozer(venv_dir: str, p4a_source_dir: str) -> None:
         log.warning('PySide6 layout may have changed.  Build will proceed but '
                     'may produce a broken APK.')
     else:
-        log.info('  requirements line patched (python3==%s)', TARGET_PYTHON)
+        if user_reqs:
+            log.info('  requirements line patched (python3==%s + %d user dep(s))',
+                     TARGET_PYTHON, len(user_reqs))
+            for req in user_reqs:
+                name = re.split(r'[<>=!~\s]', req, 1)[0].strip().lower()
+                tag = '✓' if name in P4A_KNOWN_RECIPES else '?'
+                log.info('    %s %s', tag, req)
+            unknown = [r for r in user_reqs
+                       if re.split(r'[<>=!~\s]', r, 1)[0].strip().lower()
+                       not in P4A_KNOWN_RECIPES]
+            if unknown:
+                log.info('  (? = no dedicated p4a recipe; will be installed '
+                         'via pip — works for pure-Python packages, fails '
+                         'for ones with C extensions)')
+        else:
+            log.info('  requirements line patched (python3==%s, no user deps)',
+                     TARGET_PYTHON)
     if source_dir_n == 0:
         log.warning('Could not find the p4a.branch line to redirect to source_dir.')
         log.warning('Build will use whatever p4a buildozer clones from develop, '
@@ -1071,6 +1154,17 @@ def parse_args(argv=None):
                    help='Android SDK path (optional; buildozer manages its own)')
     p.add_argument('--ndk-path',  default='',
                    help='Android NDK path (optional; buildozer manages its own)')
+    p.add_argument('--requirements-file', default=None,
+                   help='Path to a pip-style requirements file with extra '
+                        'Python deps to bundle into the APK.  Defaults to '
+                        '<project_dir>/requirements.txt if it exists.')
+    p.add_argument('--no-requirements', action='store_true',
+                   help='Ignore <project>/requirements.txt entirely (only '
+                        'PySide6/shiboken6/python3 will be bundled).')
+    p.add_argument('--extra-requirements', default='',
+                   help='Comma-separated extra Python packages to bundle, '
+                        'in addition to anything in --requirements-file.  '
+                        'Useful for one-off overrides.')
     p.add_argument('--auto-strip', action='store_true',
                    help='Scan project for PySide6 imports and strip every Qt '
                         'module the project does not use from the bundled '
@@ -1101,6 +1195,27 @@ def parse_args(argv=None):
     args.exclude_modules = _parse_csv(args.exclude_modules)
     args.keep_modules    = _parse_csv(args.keep_modules)
 
+    # Resolve the user's requirements list (deps to bundle into the APK).
+    # Order: file contents first, then --extra-requirements appended (de-duped).
+    args.user_requirements = []
+    if not args.no_requirements:
+        req_path = args.requirements_file
+        if req_path is None:
+            default_path = join(args.project_dir, 'requirements.txt')
+            if exists(default_path):
+                req_path = default_path
+        if req_path:
+            args.user_requirements.extend(_parse_requirements_file(req_path))
+            args.requirements_file = req_path
+    extra = _parse_csv(args.extra_requirements)
+    seen = {re.split(r'[<>=!~\s]', r, 1)[0].strip().lower()
+            for r in args.user_requirements}
+    for r in extra:
+        name = re.split(r'[<>=!~\s]', r, 1)[0].strip().lower()
+        if name and name not in seen:
+            seen.add(name)
+            args.user_requirements.append(r)
+
     return args
 
 
@@ -1116,12 +1231,17 @@ def main(argv=None):
     log.info('   mode       : %s', args.mode)
     log.info('   target Py  : %s', TARGET_PYTHON)
     log.info('   p4a branch : %s @ %s', P4A_FORK, P4A_BRANCH)
+    if args.user_requirements:
+        rf = getattr(args, 'requirements_file', None)
+        log.info('   user deps  : %d package(s)%s',
+                 len(args.user_requirements),
+                 ' from ' + rf if rf else '')
     log.info('')
 
     preflight(args)
     venv_dir, py_exe = setup_venv(args)
     p4a_dir = prepare_p4a_pinned()
-    patch_pyside6_buildozer(venv_dir, p4a_dir)
+    patch_pyside6_buildozer(venv_dir, p4a_dir, args.user_requirements)
     sdk, ndk = ensure_android_sdk_ndk(args)
     wheel_pyside, wheel_shiboken = download_android_wheels(args)
     apk = run_deploy(args, venv_dir, py_exe, sdk, ndk, wheel_pyside, wheel_shiboken)
