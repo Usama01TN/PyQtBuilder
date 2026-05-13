@@ -14,8 +14,8 @@ name: build-pyqt5-android
 # Build is heavy:
 #   - First run: ~60-90 minutes
 #   - Cached run: ~15-20 minutes
-#   - Disk usage: ~30 GB peak (free runners have ~14 GB free out of the box;
-#     the "free disk space" step below recovers the rest)
+#   - Disk usage: ~30 GB peak (free runners ship with ~14 GB free; the
+#     disk-cleanup step below recovers the rest)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ on:
       project_url:
         description: "Public URL to project zip (must contain a .pdt file)"
         required: true
-        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip"
+        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp.zip"
       arch:
         description: "Target ABI"
         required: true
@@ -65,7 +65,8 @@ jobs:
       ANDROID_API:       "28"
       NDK_VERSION:       "21.4.7075529"
       BUILD_TOOLS_VER:   "28.0.3"
-      # Where aqtinstall lays Qt down; matches builder's --qt-dir expectation.
+      # Where Qt lands.  install-qt-action will install into this dir if we
+      # pass it explicitly via the `dir` input.
       QT_INSTALL_DIR: ${{ github.workspace }}/Qt
 
     steps:
@@ -73,9 +74,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Free disk space (need ~30 GB; runners ship with ~14 GB free)
-        # PyQt5 builder warns MIN_DISK_GB = 40. Even after this cleanup we
-        # don't quite hit 40, but we get close enough since the sysroot build
-        # is the only thing that approaches that ceiling.
+        # PyQt5 build is disk-hungry: Qt for Android ~3 GB, NDK r21e ~1 GB,
+        # sysroot (cross-compiled Python+SIP+PyQt) ~5 GB, plus source trees
+        # and build artifacts.  Strip everything else.
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
                       /usr/local/lib/android/sdk/ndk \
@@ -97,15 +98,15 @@ jobs:
 
       - name: Set up JDK 11
         # Qt 5.15.2's androiddeployqt is happiest with JDK 11.  Don't use 17
-        # or newer — gradle plugin in older Qt versions breaks on them.
+        # or newer — Gradle plugin in older Qt versions breaks on them.
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "11"
 
       - name: Install host build dependencies
-        # The cross-compile pipeline runs autotools / configure / make on the
-        # HOST (to build host-side moc, rcc, sip, etc.), so we need a working
+        # The cross-compile pipeline runs autotools/configure/make on the
+        # HOST (to build host-side moc, rcc, sip, etc.), so we need a full
         # C/C++ build chain plus the dev headers Python and Qt link against.
         run: |
           sudo apt-get update
@@ -119,20 +120,14 @@ jobs:
               libreadline-dev libgdbm-dev libnss3-dev libgdbm-compat-dev \
               tk-dev uuid-dev libpng-dev libjpeg-dev
 
-      # ───────────── Qt for Android via aqtinstall ─────────────────
-      # The builder script's default Qt installer is the interactive online
-      # installer (qt-unified-linux-x64-...-online.run) — useless in CI.
-      # We use aqtinstall instead, which is non-interactive and fast.
-      #
-      # We need BOTH:
-      #   - host Qt (linux x86_64)  → for cross-compile tools (host moc, qmake)
-      #   - android Qt for the target arch  → for the device libraries
-      #
-      # aqt naming for android_arch matches the builder's ARCH_MAP:
-      #   android-64   → android_arm64_v8a
-      #   android-32   → android_armv7
-      #   android-x86  → android_x86
-      #   android-x86_64 → android_x86_64
+      # ──────────────── Qt 5.15.2 install via install-qt-action ────────────
+      # We switched away from invoking `aqt install-qt` directly because of
+      # repeated regressions in aqtinstall's Qt 5 vs Qt 6 detection (the
+      # `qt_base packages not found while parsing XML` error among others).
+      # jurplel/install-qt-action wraps aqtinstall but is actively maintained
+      # to track upstream API changes and apply workarounds for Qt 5 Android
+      # specifically.  It also handles its own caching.
+
       - name: Map ARCH to Qt's android arch name
         id: archmap
         run: |
@@ -144,38 +139,54 @@ jobs:
             *) echo "::error::Unknown arch: $ARCH"; exit 1 ;;
           esac
 
-      - name: Cache Qt 5.15.2 (host + android, ~4 GB total)
-        id: qt-cache
-        uses: actions/cache@v4
+      - name: Install Qt 5.15.2 (host/desktop tools)
+        # Host Qt: provides moc, rcc, qmake compiled for x86_64 Linux.  These
+        # are the cross-compile drivers; the Android Qt below provides the
+        # ARM target libraries.  install-qt-action handles install + cache.
+        uses: jurplel/install-qt-action@v4
         with:
-          path: ${{ env.QT_INSTALL_DIR }}
-          # Bumped to v2: v1 caches may contain a partial install from the
-          # aqtinstall 3.3.0 Qt 5 Android regression (desktop OK, android
-          # missing).  Forcing a fresh install ensures a complete tree.
-          key: qt-${{ env.QT_VERSION }}-${{ steps.archmap.outputs.qt_arch }}-v2
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: gcc_64
+          dir: ${{ env.QT_INSTALL_DIR }}
+          aqtversion: ">=3.1,<3.2"   # last series that handles Qt 5 cleanly
+          cache: true
+          cache-key-prefix: install-qt-action-desktop
+          setup-python: false        # we already set up our own Python
 
-      - name: Install Qt 5.15.2 (host + android target)
-        if: steps.qt-cache.outputs.cache-hit != 'true'
+      - name: Install Qt 5.15.2 (Android target)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: android
+          arch: ${{ steps.archmap.outputs.qt_arch }}
+          dir: ${{ env.QT_INSTALL_DIR }}
+          aqtversion: ">=3.1,<3.2"
+          cache: true
+          cache-key-prefix: install-qt-action-android
+          setup-python: false
+
+      - name: Verify Qt installations are complete
+        # install-qt-action might silently produce a partial install if its
+        # mirror times out mid-download.  Verify both qmakes exist before
+        # spending an hour on the rest of the build.
         run: |
-          python -m pip install --upgrade pip
-          # aqtinstall 3.3.0 has a regression for Qt 5.15.2 Android installs:
-          # it tries to resolve a Qt 6-style "qt_base" package against the
-          # Qt 5 repository metadata and fails with "The packages ['qt_base']
-          # were not found while parsing XML of package information".  3.1.x
-          # is the last series where Qt 5 Android still works reliably.
-          python -m pip install "aqtinstall>=3.1,<3.2"
-          mkdir -p "$QT_INSTALL_DIR"
-          # Host Qt — needed for moc, rcc, qmake (we're cross-compiling)
-          aqt install-qt linux desktop "$QT_VERSION" \
-            --outputdir "$QT_INSTALL_DIR"
-          # Android target Qt for our arch
-          aqt install-qt linux android "$QT_VERSION" \
-            "${{ steps.archmap.outputs.qt_arch }}" \
-            --outputdir "$QT_INSTALL_DIR"
+          HOST_QMAKE="$QT_INSTALL_DIR/$QT_VERSION/gcc_64/bin/qmake"
+          ANDROID_QMAKE="$QT_INSTALL_DIR/$QT_VERSION/${{ steps.archmap.outputs.qt_arch }}/bin/qmake"
+          echo "Looking for host qmake:    $HOST_QMAKE"
+          echo "Looking for android qmake: $ANDROID_QMAKE"
+          ls -la "$QT_INSTALL_DIR/$QT_VERSION/" || true
+          test -x "$HOST_QMAKE"    || { echo "::error::Host Qt incomplete";    exit 1; }
+          test -x "$ANDROID_QMAKE" || { echo "::error::Android Qt incomplete"; exit 1; }
+          echo "✓ Both Qt installs verified"
+          "$HOST_QMAKE" --version
+          "$ANDROID_QMAKE" --version
 
       # ───────────── Android SDK + NDK r21e via sdkmanager ─────────
       # The runner image ships newer NDKs (r25+, r27) but the PyQt5 builder
-      # pins NDK r21e. android-ndk-r21e is the last NDK with full GCC-style
+      # pins NDK r21e.  android-ndk-r21e is the last NDK with full GCC-style
       # ABI compatibility that pyqtdeploy/SIP know how to drive.
       - name: Cache Android NDK r21e + SDK platforms/build-tools
         id: sdk-cache
@@ -186,7 +197,7 @@ jobs:
             ~/Android/Sdk/platforms/android-${{ env.ANDROID_API }}
             ~/Android/Sdk/build-tools/${{ env.BUILD_TOOLS_VER }}
             ~/Android/Sdk/platform-tools
-          key: android-sdk-ndk-${{ env.NDK_VERSION }}-api${{ env.ANDROID_API }}-bt${{ env.BUILD_TOOLS_VER }}-v1
+          key: android-sdk-ndk-${{ env.NDK_VERSION }}-api${{ env.ANDROID_API }}-bt${{ env.BUILD_TOOLS_VER }}-v2
 
       - name: Install pinned NDK + SDK platform/build-tools via sdkmanager
         if: steps.sdk-cache.outputs.cache-hit != 'true'
@@ -196,17 +207,27 @@ jobs:
           export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
           mkdir -p "$ANDROID_SDK_ROOT/licenses"
           # Mirror the runner's pre-accepted licenses into our SDK
-          cp /usr/local/lib/android/sdk/licenses/* "$ANDROID_SDK_ROOT/licenses/" || true
-          # Yes-pipe handles any new license the runner image hasn't seen
+          cp /usr/local/lib/android/sdk/licenses/* "$ANDROID_SDK_ROOT/licenses/" 2>/dev/null || true
+          # `yes |` handles any new license the runner image hasn't seen
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" \
               "platform-tools" \
               "platforms;android-$ANDROID_API" \
               "build-tools;$BUILD_TOOLS_VER" \
               "ndk;$NDK_VERSION"
 
+      - name: Verify SDK + NDK paths
+        run: |
+          NDK_DIR="$HOME/Android/Sdk/ndk/$NDK_VERSION"
+          PLATFORM_DIR="$HOME/Android/Sdk/platforms/android-$ANDROID_API"
+          BT_DIR="$HOME/Android/Sdk/build-tools/$BUILD_TOOLS_VER"
+          test -d "$NDK_DIR"      || { echo "::error::NDK $NDK_VERSION missing";      exit 1; }
+          test -d "$PLATFORM_DIR" || { echo "::error::Android $ANDROID_API platform missing"; exit 1; }
+          test -d "$BT_DIR"       || { echo "::error::Build-tools $BUILD_TOOLS_VER missing"; exit 1; }
+          echo "✓ NDK + SDK paths verified"
+
       # ───────────── Sysroot cache (the BIG one) ───────────────────
       # The sysroot is the cross-compiled Python + SIP + PyQt5 build output.
-      # ~5 GB and takes 30-45 minutes to produce from scratch. Caching it
+      # ~5 GB and takes 30-45 minutes to produce from scratch.  Caching it
       # makes subsequent builds drop to ~15 minutes (just app packaging).
       # The key intentionally excludes the project — the sysroot is
       # project-agnostic, so multiple projects can share one cache.
@@ -244,7 +265,7 @@ jobs:
         run: |
           QT_DIR="$QT_INSTALL_DIR/$QT_VERSION/${{ steps.archmap.outputs.qt_arch }}"
           if [ ! -d "$QT_DIR" ]; then
-            echo "::error::Qt for Android not found at $QT_DIR"
+            echo "::error::Qt for Android not found at $QT_DIR — verification step missed it?"
             exit 1
           fi
 
@@ -253,6 +274,11 @@ jobs:
             APP_NAME_ARG="--app-name $APP_NAME"
           fi
 
+          # Run with `set -o pipefail` and `tee` so the build log is captured
+          # regardless of which side of the pipe fails.  Same approach as the
+          # PySide6 workflow: the upstream tool sometimes swallows errors and
+          # returns 0, so we scan the log for failure markers afterward.
+          set -o pipefail
           python pyqt5_android_builder.py \
             --project-dir "$PROJ_DIR" \
             $APP_NAME_ARG \
@@ -266,10 +292,9 @@ jobs:
             --verbose \
             2>&1 | tee build.log
 
-          # Mirror the PySide6 workflow's belt-and-braces failure detection:
-          # if the builder swallowed the error somehow, surface it here.
-          if grep -q "Buildozer failed\|Exception occurred: Traceback\|CalledProcessError" build.log; then
-            echo "::warning::Builder produced a failure marker — check the log"
+          # Belt-and-braces failure detection (mirrors the PySide6 builder).
+          if grep -qE "Buildozer failed|Exception occurred: Traceback|CalledProcessError|EnvironmentError" build.log; then
+            echo "::warning::Builder produced a failure marker — see build.log artifact"
           fi
 
       - name: Locate APK
@@ -285,8 +310,8 @@ jobs:
           echo "Built: $APK ($(du -h "$APK" | cut -f1))"
 
       - name: Sanity-check APK contents
-        # PyQt5 APKs contain libpython3.10.so, libQt5*, and the pyqtdeploy
-        # frozen-module bundle (typically a .pyo or pyc archive under assets/).
+        # PyQt5 APKs contain libpython3.10.so, libQt5*, libsip, and a frozen
+        # Python module bundle (typically pyc/pyo under assets/).
         run: |
           APK="${{ steps.locate.outputs.apk_path }}"
           unzip -l "$APK" | grep -E 'libpython|libQt5|libsip|pyqt' | head -20
