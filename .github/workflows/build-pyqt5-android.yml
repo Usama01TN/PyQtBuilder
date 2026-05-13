@@ -149,13 +149,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.QT_INSTALL_DIR }}
-          key: qt-${{ env.QT_VERSION }}-${{ steps.archmap.outputs.qt_arch }}-v1
+          # Bumped to v2: v1 caches may contain a partial install from the
+          # aqtinstall 3.3.0 Qt 5 Android regression (desktop OK, android
+          # missing).  Forcing a fresh install ensures a complete tree.
+          key: qt-${{ env.QT_VERSION }}-${{ steps.archmap.outputs.qt_arch }}-v2
 
       - name: Install Qt 5.15.2 (host + android target)
         if: steps.qt-cache.outputs.cache-hit != 'true'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "aqtinstall>=3.1"
+          # aqtinstall 3.3.0 has a regression for Qt 5.15.2 Android installs:
+          # it tries to resolve a Qt 6-style "qt_base" package against the
+          # Qt 5 repository metadata and fails with "The packages ['qt_base']
+          # were not found while parsing XML of package information".  3.1.x
+          # is the last series where Qt 5 Android still works reliably.
+          python -m pip install "aqtinstall>=3.1,<3.2"
           mkdir -p "$QT_INSTALL_DIR"
           # Host Qt — needed for moc, rcc, qmake (we're cross-compiling)
           aqt install-qt linux desktop "$QT_VERSION" \
