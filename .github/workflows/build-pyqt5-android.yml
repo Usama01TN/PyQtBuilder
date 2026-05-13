@@ -23,7 +23,7 @@ on:
       project_url:
         description: "Public URL to project zip (must contain a .pdt file)"
         required: true
-        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp.zip"
+        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip"
       arch:
         description: "Target ABI"
         required: true
