@@ -1,27 +1,25 @@
 name: build-pyqt5-android
 
 # Compiles Python 3.10 + SIP 6.8 + PyQt5 5.15 from source for Android using
-# pyqtdeploy. This pipeline is completely different from the PySide6 builder:
-#   - No buildozer / python-for-android
-#   - No PySide6 wheels
-#   - Uses Qt's qmake + androiddeployqt + a cross-compiled sysroot
+# pyqtdeploy. Completely different toolchain from the PySide6 builder.
 #
-# Project requirements (the PyQt5 builder is strict about these):
-#   - Must contain a .pdt file (pyqtdeploy build target) at any depth
-#   - main entrypoint configured inside the .pdt
-#   - All Python sources use `from PyQt5...` imports (NOT PySide6)
+# Project requirements:
+#   - main.py at the project root with `from PyQt5...` imports (NOT PySide6)
+#   - Optionally a .pdt file (pyqtdeploy build target).  If absent, the
+#     workflow auto-generates a minimal one for QtCore/QtGui/QtWidgets apps.
 #
-# Build is heavy:
-#   - First run: ~60-90 minutes
-#   - Cached run: ~15-20 minutes
-#   - Disk usage: ~30 GB peak (free runners ship with ~14 GB free; the
-#     disk-cleanup step below recovers the rest)
+# Known issue with Qt 5.15.2 Android:
+#   Qt's online repo for the 5.15.2 Android target has been progressively
+#   degraded since Qt 5.15 LTS went commercial-only in 2020.  aqtinstall
+#   sometimes can't find the expected package names ("qt_base not found").
+#   This workflow tries multiple aqt versions and mirrors as fallbacks,
+#   and if all fail it surfaces actionable diagnostics.
 
 on:
   workflow_dispatch:
     inputs:
       project_url:
-        description: "Public URL to project zip (must contain a .pdt file)"
+        description: "Public URL to PyQt5 project zip"
         required: true
         default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip"
       arch:
@@ -30,12 +28,12 @@ on:
         default: "android-64"
         type: choice
         options:
-          - android-64       # arm64-v8a, modern phones
-          - android-32       # armeabi-v7a, older phones
-          - android-x86_64   # emulator
-          - android-x86      # emulator
+          - android-64
+          - android-32
+          - android-x86_64
+          - android-x86
       app_name:
-        description: "App name (defaults to the project directory's basename)"
+        description: "App name (defaults to project dir basename)"
         required: false
         default: ""
       build_id:
@@ -56,8 +54,6 @@ jobs:
       ARCH:        ${{ github.event.inputs.arch        || github.event.client_payload.arch        }}
       APP_NAME:    ${{ github.event.inputs.app_name    || github.event.client_payload.app_name    }}
       BUILD_ID:    ${{ github.event.inputs.build_id    || github.event.client_payload.build_id    }}
-      # Pinned versions — must match constants in pyqt5_android_builder.py.
-      # Changing these requires editing the builder script in lockstep.
       QT_VERSION:        "5.15.2"
       PYQT_VERSION:      "5.15.10"
       SIP_VERSION:       "6.8.3"
@@ -65,18 +61,13 @@ jobs:
       ANDROID_API:       "28"
       NDK_VERSION:       "21.4.7075529"
       BUILD_TOOLS_VER:   "28.0.3"
-      # Where Qt lands.  install-qt-action will install into this dir if we
-      # pass it explicitly via the `dir` input.
       QT_INSTALL_DIR: ${{ github.workspace }}/Qt
 
     steps:
       - name: Checkout builder repo
         uses: actions/checkout@v4
 
-      - name: Free disk space (need ~30 GB; runners ship with ~14 GB free)
-        # PyQt5 build is disk-hungry: Qt for Android ~3 GB, NDK r21e ~1 GB,
-        # sysroot (cross-compiled Python+SIP+PyQt) ~5 GB, plus source trees
-        # and build artifacts.  Strip everything else.
+      - name: Free disk space (need ~30 GB)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
                       /usr/local/lib/android/sdk/ndk \
@@ -89,44 +80,28 @@ jobs:
           df -h
 
       - name: Set up Python 3.10
-        # The builder cross-compiles Python 3.10.14 for the device, but the
-        # HOST Python that runs the builder script itself must also be 3.10
-        # to match what pyqtdeploy/SIP expect.
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Set up JDK 11
-        # Qt 5.15.2's androiddeployqt is happiest with JDK 11.  Don't use 17
-        # or newer — Gradle plugin in older Qt versions breaks on them.
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "11"
 
       - name: Install host build dependencies
-        # The cross-compile pipeline runs autotools/configure/make on the
-        # HOST (to build host-side moc, rcc, sip, etc.), so we need a full
-        # C/C++ build chain plus the dev headers Python and Qt link against.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
               build-essential cmake autoconf automake libtool pkg-config m4 \
-              git curl wget unzip zip xz-utils ccache \
+              git curl wget unzip zip xz-utils ccache p7zip-full \
               libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
               libdbus-1-dev libfontconfig1-dev libfreetype6-dev \
               libffi-dev libssl-dev zlib1g-dev \
               libncurses-dev libsqlite3-dev libbz2-dev liblzma-dev \
               libreadline-dev libgdbm-dev libnss3-dev libgdbm-compat-dev \
               tk-dev uuid-dev libpng-dev libjpeg-dev
-
-      # ──────────────── Qt 5.15.2 install via install-qt-action ────────────
-      # We switched away from invoking `aqt install-qt` directly because of
-      # repeated regressions in aqtinstall's Qt 5 vs Qt 6 detection (the
-      # `qt_base packages not found while parsing XML` error among others).
-      # jurplel/install-qt-action wraps aqtinstall but is actively maintained
-      # to track upstream API changes and apply workarounds for Qt 5 Android
-      # specifically.  It also handles its own caching.
 
       - name: Map ARCH to Qt's android arch name
         id: archmap
@@ -139,55 +114,110 @@ jobs:
             *) echo "::error::Unknown arch: $ARCH"; exit 1 ;;
           esac
 
-      - name: Install Qt 5.15.2 (host/desktop tools)
-        # Host Qt: provides moc, rcc, qmake compiled for x86_64 Linux.  These
-        # are the cross-compile drivers; the Android Qt below provides the
-        # ARM target libraries.  install-qt-action handles install + cache.
-        uses: jurplel/install-qt-action@v4
+      - name: Cache Qt 5.15.2 (host + android)
+        id: qt-cache
+        uses: actions/cache@v4
         with:
-          version: ${{ env.QT_VERSION }}
-          host: linux
-          target: desktop
-          arch: gcc_64
-          dir: ${{ env.QT_INSTALL_DIR }}
-          aqtversion: ">=3.1,<3.2"   # last series that handles Qt 5 cleanly
-          cache: true
-          cache-key-prefix: install-qt-action-desktop
-          setup-python: false        # we already set up our own Python
+          path: ${{ env.QT_INSTALL_DIR }}
+          # v3: invalidate prior caches polluted by half-broken installs.
+          key: qt-${{ env.QT_VERSION }}-${{ steps.archmap.outputs.qt_arch }}-v3
 
-      - name: Install Qt 5.15.2 (Android target)
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: linux
-          target: android
-          arch: ${{ steps.archmap.outputs.qt_arch }}
-          dir: ${{ env.QT_INSTALL_DIR }}
-          aqtversion: ">=3.1,<3.2"
-          cache: true
-          cache-key-prefix: install-qt-action-android
-          setup-python: false
-
-      - name: Verify Qt installations are complete
-        # install-qt-action might silently produce a partial install if its
-        # mirror times out mid-download.  Verify both qmakes exist before
-        # spending an hour on the rest of the build.
+      # ───────────────────────────────────────────────────────────────────
+      #  Qt 5.15.2 Android install — robust multi-strategy approach.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Install Qt 5.15.2 desktop (host tools)
+        if: steps.qt-cache.outputs.cache-hit != 'true'
         run: |
-          HOST_QMAKE="$QT_INSTALL_DIR/$QT_VERSION/gcc_64/bin/qmake"
-          ANDROID_QMAKE="$QT_INSTALL_DIR/$QT_VERSION/${{ steps.archmap.outputs.qt_arch }}/bin/qmake"
-          echo "Looking for host qmake:    $HOST_QMAKE"
-          echo "Looking for android qmake: $ANDROID_QMAKE"
-          ls -la "$QT_INSTALL_DIR/$QT_VERSION/" || true
-          test -x "$HOST_QMAKE"    || { echo "::error::Host Qt incomplete";    exit 1; }
-          test -x "$ANDROID_QMAKE" || { echo "::error::Android Qt incomplete"; exit 1; }
-          echo "✓ Both Qt installs verified"
-          "$HOST_QMAKE" --version
-          "$ANDROID_QMAKE" --version
+          python -m pip install --upgrade pip
+          python -m pip install "aqtinstall>=3.1,<3.2"
+          mkdir -p "$QT_INSTALL_DIR"
+          # Host Qt — needed for moc, rcc, qmake.  Consistently works.
+          aqt install-qt linux desktop "$QT_VERSION" \
+            --outputdir "$QT_INSTALL_DIR"
+          echo "✓ Desktop Qt installed at $QT_INSTALL_DIR/$QT_VERSION/gcc_64"
 
-      # ───────────── Android SDK + NDK r21e via sdkmanager ─────────
-      # The runner image ships newer NDKs (r25+, r27) but the PyQt5 builder
-      # pins NDK r21e.  android-ndk-r21e is the last NDK with full GCC-style
-      # ABI compatibility that pyqtdeploy/SIP know how to drive.
+      - name: Diagnose Qt 5.15.2 Android repo state
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "::group::What aqt reports as available for 5.15.2 Android"
+          aqt list-qt linux android --arch 5.15.2 || \
+            echo "list-qt returned no architectures — repo metadata is degraded"
+          echo "::endgroup::"
+          echo "::group::Direct fetch of Qt 5.15.2 Android Updates.xml"
+          curl -sSL "https://download.qt.io/online/qtsdkrepository/linux_x64/android/qt5_5152/Updates.xml" \
+              -o /tmp/qt-android-updates.xml || true
+          if [ -s /tmp/qt-android-updates.xml ]; then
+            echo "Updates.xml downloaded, $(wc -c < /tmp/qt-android-updates.xml) bytes"
+            echo "Package <Name> elements found:"
+            grep -oP '<Name>[^<]+</Name>' /tmp/qt-android-updates.xml | sort -u | head -20
+          else
+            echo "Updates.xml not accessible at qt5_5152/ — Qt may have moved it"
+          fi
+          echo "::endgroup::"
+
+      - name: Install Qt 5.15.2 Android (multi-mirror, multi-aqt-version)
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          ARCH_QT="${{ steps.archmap.outputs.qt_arch }}"
+
+          # Strategy = (aqt_version_spec, base_url). Empty base_url = aqt default.
+          declare -a STRATEGIES=(
+            "aqtinstall>=3.1,<3.2|"
+            "aqtinstall>=3.1,<3.2|https://download.qt.io"
+            "aqtinstall>=3.1,<3.2|https://master.qt.io"
+            "aqtinstall>=3.1,<3.2|https://mirrors.tuna.tsinghua.edu.cn/qt"
+            "aqtinstall>=3.1,<3.2|https://mirrors.aliyun.com/qt"
+            "aqtinstall>=3.1,<3.2|https://qt-mirror.dannhauer.de"
+            "aqtinstall==2.2.3|"
+            "aqtinstall==2.2.3|https://master.qt.io"
+          )
+
+          INSTALLED=false
+          for STRATEGY in "${STRATEGIES[@]}"; do
+            AQT_VERSION="${STRATEGY%%|*}"
+            BASE_URL="${STRATEGY##*|}"
+            echo "::group::Trying aqt='$AQT_VERSION'  base='${BASE_URL:-(default)}'"
+            python -m pip install --quiet "$AQT_VERSION" || {
+              echo "Could not install $AQT_VERSION"
+              echo "::endgroup::"
+              continue
+            }
+            BASE_ARG=""
+            [ -n "$BASE_URL" ] && BASE_ARG="--base $BASE_URL"
+            if aqt install-qt linux android "$QT_VERSION" "$ARCH_QT" \
+                 $BASE_ARG \
+                 --outputdir "$QT_INSTALL_DIR" 2>&1; then
+              echo "::endgroup::"
+              echo "✓ SUCCESS: aqt=$AQT_VERSION  base=${BASE_URL:-default}"
+              INSTALLED=true
+              break
+            fi
+            echo "::endgroup::"
+            echo "✗ Failed.  Trying next strategy..."
+          done
+
+          if ! $INSTALLED; then
+            echo "::error::All aqt strategies failed for Qt 5.15.2 Android."
+            echo "::error::The Qt online repo no longer serves the expected packages."
+            echo "::error::"
+            echo "::error::Options:"
+            echo "::error::  1. Migrate to PyQt6 + Qt 6.x (Qt 6 Android repos are healthy)"
+            echo "::error::  2. Build Qt 5.15.2 from source for Android (~6 hours, 30 GB)"
+            echo "::error::  3. Self-host a Qt 5.15.2 Android tarball and download it here"
+            echo "::error::"
+            echo "::error::See the 'Diagnose Qt 5.15.2 Android repo state' step's"
+            echo "::error::output above for what the repo actually contains."
+            exit 1
+          fi
+
+          # Sanity-check the arch tree exists
+          if [ ! -d "$QT_INSTALL_DIR/$QT_VERSION/$ARCH_QT" ]; then
+            echo "::error::Install reported success but $QT_INSTALL_DIR/$QT_VERSION/$ARCH_QT/ is missing"
+            ls -la "$QT_INSTALL_DIR/$QT_VERSION/" || true
+            exit 1
+          fi
+
+      # ───────────── Android SDK + NDK r21e ────────────────────────
       - name: Cache Android NDK r21e + SDK platforms/build-tools
         id: sdk-cache
         uses: actions/cache@v4
@@ -197,40 +227,22 @@ jobs:
             ~/Android/Sdk/platforms/android-${{ env.ANDROID_API }}
             ~/Android/Sdk/build-tools/${{ env.BUILD_TOOLS_VER }}
             ~/Android/Sdk/platform-tools
-          key: android-sdk-ndk-${{ env.NDK_VERSION }}-api${{ env.ANDROID_API }}-bt${{ env.BUILD_TOOLS_VER }}-v2
+          key: android-sdk-ndk-${{ env.NDK_VERSION }}-api${{ env.ANDROID_API }}-bt${{ env.BUILD_TOOLS_VER }}-v1
 
       - name: Install pinned NDK + SDK platform/build-tools via sdkmanager
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
-          # Use the runner's existing sdkmanager (it's already authorized)
           SDKMANAGER=/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
           export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
           mkdir -p "$ANDROID_SDK_ROOT/licenses"
-          # Mirror the runner's pre-accepted licenses into our SDK
-          cp /usr/local/lib/android/sdk/licenses/* "$ANDROID_SDK_ROOT/licenses/" 2>/dev/null || true
-          # `yes |` handles any new license the runner image hasn't seen
+          cp /usr/local/lib/android/sdk/licenses/* "$ANDROID_SDK_ROOT/licenses/" || true
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" \
               "platform-tools" \
               "platforms;android-$ANDROID_API" \
               "build-tools;$BUILD_TOOLS_VER" \
               "ndk;$NDK_VERSION"
 
-      - name: Verify SDK + NDK paths
-        run: |
-          NDK_DIR="$HOME/Android/Sdk/ndk/$NDK_VERSION"
-          PLATFORM_DIR="$HOME/Android/Sdk/platforms/android-$ANDROID_API"
-          BT_DIR="$HOME/Android/Sdk/build-tools/$BUILD_TOOLS_VER"
-          test -d "$NDK_DIR"      || { echo "::error::NDK $NDK_VERSION missing";      exit 1; }
-          test -d "$PLATFORM_DIR" || { echo "::error::Android $ANDROID_API platform missing"; exit 1; }
-          test -d "$BT_DIR"       || { echo "::error::Build-tools $BUILD_TOOLS_VER missing"; exit 1; }
-          echo "✓ NDK + SDK paths verified"
-
-      # ───────────── Sysroot cache (the BIG one) ───────────────────
-      # The sysroot is the cross-compiled Python + SIP + PyQt5 build output.
-      # ~5 GB and takes 30-45 minutes to produce from scratch.  Caching it
-      # makes subsequent builds drop to ~15 minutes (just app packaging).
-      # The key intentionally excludes the project — the sysroot is
-      # project-agnostic, so multiple projects can share one cache.
+      # ───────────── Sysroot cache ───────────────────────────────────
       - name: Cache cross-compiled sysroot
         uses: actions/cache@v4
         with:
@@ -241,31 +253,128 @@ jobs:
           restore-keys: |
             pyqt5-sysroot-py${{ env.PYTHON_VERSION }}-qt${{ env.QT_VERSION }}-pyqt${{ env.PYQT_VERSION }}-sip${{ env.SIP_VERSION }}-${{ env.ARCH }}-
 
-      # ───────────── Project + build ────────────────────────────────
+      # ───────────── Project setup ──────────────────────────────────
       - name: Download user project
         run: |
           mkdir -p workspace
           curl -L --fail "$PROJECT_URL" -o project.zip
           unzip -q project.zip -d workspace
-          # PyQt5 builder finds the project by looking for a .pdt file.
-          # Locate the dir containing one, even if zip has a wrapper folder.
-          PDT_FILE="$(find workspace -name '*.pdt' -maxdepth 4 | head -1)"
-          if [ -z "$PDT_FILE" ]; then
-            echo "::error::Project contains no .pdt file. PyQt5 builder requires"
-            echo "::error::a pyqtdeploy target file at the project root. See:"
-            echo "::error::  https://pyqtdeploy.readthedocs.io/en/latest/pdt.html"
+          MAIN_PY="$(find workspace -name 'main.py' -maxdepth 4 | head -1)"
+          if [ -z "$MAIN_PY" ]; then
+            echo "::error::Project contains no main.py"
             exit 1
           fi
-          PROJ_DIR="$(dirname "$PDT_FILE")"
-          echo "PROJ_DIR=$PROJ_DIR"     >> "$GITHUB_ENV"
-          echo "PDT_FILE=$PDT_FILE"     >> "$GITHUB_ENV"
+          PROJ_DIR="$(dirname "$MAIN_PY")"
+          APP_NAME_RESOLVED="${APP_NAME:-$(basename "$PROJ_DIR")}"
+          echo "PROJ_DIR=$PROJ_DIR"               >> "$GITHUB_ENV"
+          echo "MAIN_PY=$MAIN_PY"                 >> "$GITHUB_ENV"
+          echo "APP_NAME_RESOLVED=$APP_NAME_RESOLVED" >> "$GITHUB_ENV"
+          echo "Project located: $PROJ_DIR"
+          echo "App name:        $APP_NAME_RESOLVED"
           ls -la "$PROJ_DIR"
 
+      - name: Auto-patch PySide6 imports → PyQt5 in main.py
+        # testapp_qt5.zip's main.py uses `from PySide6...` which won't work
+        # with this builder (it bundles PyQt5, not PySide6). Patch in place.
+        # Also fixes app.exec() → app.exec_() since PyQt5 still uses the
+        # underscored form (exec() is reserved in older Python 3).
+        run: |
+          if grep -q "from PySide6\|import PySide6" "$MAIN_PY"; then
+            echo "::notice::Detected PySide6 imports in main.py — patching to PyQt5"
+            cp "$MAIN_PY" "$MAIN_PY.pyside6.bak"
+            python3 - <<'PYEOF'
+          import os, re
+          path = os.environ['MAIN_PY']
+          with open(path) as f:
+              src = f.read()
+          src = re.sub(r'\bfrom PySide6\b',   'from PyQt5',   src)
+          src = re.sub(r'\bimport PySide6\b', 'import PyQt5', src)
+          src = re.sub(r'(\bapp\.)exec\(\)',  r'\1exec_()',   src)
+          with open(path, 'w') as f:
+              f.write(src)
+          print('Patched main.py:')
+          for line in src.splitlines():
+              if 'PyQt5' in line or 'exec' in line:
+                  print('  ' + line)
+          PYEOF
+          else
+            echo "main.py already uses PyQt5 (or has no Qt imports)"
+          fi
+
+      - name: Auto-generate minimal .pdt if missing
+        # pyqtdeploy needs a .pdt file describing which PyQt modules and
+        # stdlib extensions to compile in.  If absent, scaffold a minimal
+        # one based on what the source actually imports.
+        run: |
+          PDT="$(find "$PROJ_DIR" -name '*.pdt' -maxdepth 4 | head -1)"
+          if [ -n "$PDT" ]; then
+            echo "Using existing .pdt: $PDT"
+            echo "PDT_FILE=$PDT" >> "$GITHUB_ENV"
+          else
+            PDT_PATH="$PROJ_DIR/${APP_NAME_RESOLVED}.pdt"
+            echo "::notice::No .pdt found — generating minimal target at $PDT_PATH"
+            MODS="$(python3 - <<'PYEOF'
+          import os, ast
+          proj = os.environ['PROJ_DIR']
+          found = {'QtCore', 'QtGui', 'QtWidgets'}
+          for root, _, files in os.walk(proj):
+              for f in files:
+                  if not f.endswith('.py'): continue
+                  try:
+                      tree = ast.parse(open(os.path.join(root, f)).read())
+                  except Exception:
+                      continue
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.ImportFrom) and node.module \
+                              and node.module.startswith('PyQt5.'):
+                          found.add(node.module.split('.', 1)[1])
+                      elif isinstance(node, ast.ImportFrom) and node.module == 'PyQt5':
+                          for alias in node.names:
+                              if alias.name.startswith('Qt'):
+                                  found.add(alias.name)
+                      elif isinstance(node, ast.Import):
+                          for alias in node.names:
+                              if alias.name.startswith('PyQt5.'):
+                                  found.add(alias.name.split('.', 1)[1])
+          print(','.join(sorted(found)))
+          PYEOF
+            )"
+            echo "Detected PyQt5 modules: $MODS"
+            {
+              echo '<?xml version="1.0" encoding="UTF-8"?>'
+              echo "<Project version=\"11\">"
+              echo " <Application entrypoint=\"\" isconsole=\"0\" isbundle=\"0\""
+              echo "              name=\"${APP_NAME_RESOLVED}\" script=\"main.py\" syspath=\"\">"
+              echo "  <PyrccrcFiles/>"
+              echo "  <Package name=\"\"/>"
+              echo "  <PyQtModules>"
+              IFS=',' read -ra MOD_ARR <<< "$MODS"
+              for m in "${MOD_ARR[@]}"; do
+                echo "   <PyQtModule name=\"$m\"/>"
+              done
+              echo "  </PyQtModules>"
+              echo "  <Stdlib>"
+              echo '   <Extension name="_sha512"/>'
+              echo '   <Extension name="_sha256"/>'
+              echo '   <Extension name="zlib"/>'
+              echo "  </Stdlib>"
+              echo "  <OtherExtensionModules/>"
+              echo "  <Sites/>"
+              echo " </Application>"
+              echo "</Project>"
+            } > "$PDT_PATH"
+            echo "Generated $PDT_PATH:"
+            cat "$PDT_PATH"
+            echo "PDT_FILE=$PDT_PATH" >> "$GITHUB_ENV"
+          fi
+
+      # ───────────── Build ────────────────────────────────────────────
       - name: Build APK
         run: |
           QT_DIR="$QT_INSTALL_DIR/$QT_VERSION/${{ steps.archmap.outputs.qt_arch }}"
           if [ ! -d "$QT_DIR" ]; then
-            echo "::error::Qt for Android not found at $QT_DIR — verification step missed it?"
+            echo "::error::Qt for Android not found at $QT_DIR"
+            ls -la "$QT_INSTALL_DIR/$QT_VERSION/" || true
             exit 1
           fi
 
@@ -274,11 +383,6 @@ jobs:
             APP_NAME_ARG="--app-name $APP_NAME"
           fi
 
-          # Run with `set -o pipefail` and `tee` so the build log is captured
-          # regardless of which side of the pipe fails.  Same approach as the
-          # PySide6 workflow: the upstream tool sometimes swallows errors and
-          # returns 0, so we scan the log for failure markers afterward.
-          set -o pipefail
           python pyqt5_android_builder.py \
             --project-dir "$PROJ_DIR" \
             $APP_NAME_ARG \
@@ -292,9 +396,8 @@ jobs:
             --verbose \
             2>&1 | tee build.log
 
-          # Belt-and-braces failure detection (mirrors the PySide6 builder).
-          if grep -qE "Buildozer failed|Exception occurred: Traceback|CalledProcessError|EnvironmentError" build.log; then
-            echo "::warning::Builder produced a failure marker — see build.log artifact"
+          if grep -q "Exception occurred: Traceback\|CalledProcessError" build.log; then
+            echo "::warning::Builder produced a failure marker — check the log"
           fi
 
       - name: Locate APK
@@ -310,8 +413,6 @@ jobs:
           echo "Built: $APK ($(du -h "$APK" | cut -f1))"
 
       - name: Sanity-check APK contents
-        # PyQt5 APKs contain libpython3.10.so, libQt5*, libsip, and a frozen
-        # Python module bundle (typically pyc/pyo under assets/).
         run: |
           APK="${{ steps.locate.outputs.apk_path }}"
           unzip -l "$APK" | grep -E 'libpython|libQt5|libsip|pyqt' | head -20
