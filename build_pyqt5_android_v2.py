@@ -57,6 +57,12 @@ import urllib.request
 from os.path import abspath, basename, dirname, exists, join
 from pathlib import Path
 
+# ─── Script version marker ─────────────────────────────────────────────────
+# Bumped on each significant fix so we can verify from build logs whether
+# CI is running the latest pushed script.  If the build log doesn't show
+# this version, the user's GitHub repo has a stale build_pyqt5_android.py.
+BUILDER_SCRIPT_VERSION = 7  # 2026-05: added [Qt] section to sysroot.toml
+
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
 PYQT_VERSION     = '5.15.10'
@@ -374,6 +380,8 @@ def _auto_generate_pdt(project_dir, app_name):
 def preflight(args):
     """Verify the project has the files we need."""
     log.info('Step 1/7 — Preflight')
+    log.info('  BUILDER_SCRIPT_VERSION = %d  (Qt=%s, PyQt=%s, Python=%s)',
+             BUILDER_SCRIPT_VERSION, QT_VERSION, PYQT_VERSION, PYTHON_VERSION)
 
     if not os.path.isdir(args.project_dir):
         raise SystemExit(f'  ✗ Project dir not found: {args.project_dir}')
@@ -911,7 +919,25 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
     sources_dir.mkdir(exist_ok=True)
 
     spec_file = sysroots_parent / 'sysroot.toml'
-    spec_file.write_text(_sysroot_spec(args.pyqt5_modules))
+    spec_content = _sysroot_spec(args.pyqt5_modules)
+    spec_file.write_text(spec_content)
+
+    # Belt-and-braces self-check: pyqtdeploy 3.3 fails if [Qt] is missing
+    # from the sysroot spec (the Python component's verify() depends on it).
+    # If the TOML we just generated doesn't have it, we're running stale
+    # code and would hit "Python: 'Qt' must be specified" later.  Fail
+    # fast with a clear message instead of letting pyqtdeploy do it.
+    if '[Qt]' not in spec_content:
+        raise SystemExit(
+            f'  ✗ Generated sysroot.toml is missing the [Qt] section.\n'
+            f'    This means build_pyqt5_android.py is an OLD version.\n'
+            f'    BUILDER_SCRIPT_VERSION={BUILDER_SCRIPT_VERSION}, but the\n'
+            f'    _sysroot_spec function appears stale.  Re-download the\n'
+            f'    script from the latest Anthropic chat output.')
+
+    log.info('  generated sysroot.toml at %s:', spec_file)
+    for line in spec_content.splitlines():
+        log.info('    │ %s', line)
 
     qmake = Path(qt_dir) / 'bin' / 'qmake'
     if not qmake.exists():
@@ -924,6 +950,13 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
     # actual work begins.
     env['ANDROID_NDK_PLATFORM'] = f'android-{ANDROID_API}'
     env['ANDROID_SDK_ROOT'] = _ensure_sdk()
+    # Prepend the venv's bin/ to PATH so pyqtdeploy can locate the helper
+    # binaries installed by its dependencies — `sip-module`, `sip-install`,
+    # `sip-build`, and `pyqt-bundle` (from PyQt-builder).  pyqtdeploy looks
+    # these up via PATH (e.g. SIP.py: self.run('sip-module', '--version'))
+    # and the venv is not active when we invoke the binary directly.
+    venv_bin = str(Path(venv_dir) / 'bin')
+    env['PATH'] = f'{venv_bin}:' + env.get('PATH', '')
 
     sysroot_bin = Path(venv_dir) / 'bin' / 'pyqtdeploy-sysroot'
     if not sysroot_bin.exists():
@@ -1038,6 +1071,10 @@ def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
     # pyqtdeploy-build looks up the sysroot via the qmake's Qt install,
     # but the SYSROOT env var helps in some configurations.
     env['SYSROOT'] = sysroot_dir
+    # Same PATH fix as build_sysroot: pyqtdeploy-build also shells out to
+    # sip-install / sip-build / pyqt-bundle during APK staging.
+    venv_bin = str(Path(venv_dir) / 'bin')
+    env['PATH'] = f'{venv_bin}:' + env.get('PATH', '')
 
     run([str(build_bin),
          '--build-dir', str(build_dir),
