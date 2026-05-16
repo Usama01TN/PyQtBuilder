@@ -622,6 +622,19 @@ def _build_qt_from_source(args, qt_dir, arch_qt):
     env['ANDROID_NDK_ROOT'] = ndk_path
     env['ANDROID_SDK_ROOT'] = sdk_path
     env['JAVA_HOME']        = env.get('JAVA_HOME', '/usr/lib/jvm/default-java')
+    # Qt 5.15.2's host-side qmake build fails with GCC 11+ because the
+    # source uses std::numeric_limits without #include <limits>.  Patches
+    # above fix the headers, but pinning to GCC 10 (if installed) is
+    # belt-and-braces: it accepts the unpatched code AND any other GCC 11+
+    # strictness issues we might not have caught.  NDK clang is used for
+    # the Android target build regardless.
+    if shutil.which('gcc-10') and shutil.which('g++-10'):
+        env['CC']  = 'gcc-10'
+        env['CXX'] = 'g++-10'
+        log.info('    host compiler: gcc-10/g++-10 (Qt 5.15.2 incompatible w/ gcc-11+)')
+    else:
+        log.warning('    gcc-10 not found; relying solely on source patches')
+        log.warning('    install gcc-10/g++-10 (`apt install gcc-10 g++-10`) for safer build')
     run(configure_args, cwd=str(build_dir), env=env)
 
     # 5. Build  (THIS IS THE LONG PART)
@@ -642,23 +655,68 @@ def _build_qt_from_source(args, qt_dir, arch_qt):
 
 def _apply_qt_source_patches(src_dir):
     """
-    Apply patches that Qt 5.15.2 needs to build with modern toolchains.
-    The Qt 5.15.2 source predates several GCC/clang strictness changes.
+    Apply patches Qt 5.15.2 needs to build with modern toolchains.
+
+    Qt 5.15.2's source predates GCC 11's stricter handling of transitive
+    includes.  Several headers specialize std::numeric_limits or call
+    std::numeric_limits<T>::max() without including <limits>; pre-GCC 11
+    pulled it in transitively, GCC 11+ doesn't.  Without the patches the
+    build fails with:
+        error: 'numeric_limits' is not a class template
+        error: 'std::numeric_limits' is not a template
+
+    These are the same patches KDE's qt5-patch-collection and several
+    Linux distros (Arch, Fedora) ship.
     """
-    # Patch qtbase for newer clang's stricter narrowing checks
-    patches = [
-        # qfloat16.h: some toolchains have an ambiguous overload
-        (src_dir / 'qtbase' / 'src' / 'corelib' / 'global' / 'qfloat16.h',
-         'inline qfloat16::qfloat16(float f) Q_DECL_NOTHROW',
-         'inline qfloat16::qfloat16(float f) Q_DECL_NOTHROW // patched'),
+    # Headers that need <limits> added.  List is conservative — we just
+    # patch all the ones known to be affected in the qtbase/qtdeclarative
+    # subset we build.  No-op for files that don't exist (e.g., if a
+    # skipped module wasn't extracted).
+    needs_limits = [
+        'qtbase/src/corelib/global/qfloat16.h',
+        'qtbase/src/corelib/global/qendian.h',
+        'qtbase/src/corelib/global/qrandom.h',
+        'qtbase/src/corelib/tools/qbytearraymatcher.h',
+        'qtbase/src/corelib/tools/qsharedpointer_impl.h',
+        'qtbase/src/corelib/tools/qhash.h',
+        'qtbase/src/corelib/tools/qstring.h',
+        'qtbase/src/corelib/io/qiodevice.h',
+        'qtbase/src/corelib/io/qprocess.h',
+        'qtbase/src/corelib/text/qstringliteral.h',
+        'qtbase/src/corelib/text/qstringview.h',
+        'qtbase/src/corelib/itemmodels/qabstractitemmodel.h',
+        'qtdeclarative/src/qml/jsruntime/qv4engine_p.h',
+        'qtdeclarative/src/qml/jsruntime/qv4global_p.h',
+        'qttools/src/linguist/shared/translator.h',
     ]
-    for path, find, replace in patches:
+
+    patched_count = 0
+    skipped_count = 0
+    for rel in needs_limits:
+        path = src_dir / rel
         if not path.exists():
             continue
-        text = path.read_text(errors='ignore')
-        if find in text and replace not in text:
-            path.write_text(text.replace(find, replace))
-            log.info('    patched %s', path.relative_to(src_dir))
+        try:
+            text = path.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            continue
+        if '#include <limits>' in text:
+            skipped_count += 1
+            continue
+        # Insert "#include <limits>" before the first #include directive.
+        # This works regardless of license header / include guard layout
+        # because every Qt header has a regular #include somewhere after
+        # the include guard #define.
+        m = re.search(r'^#include\s', text, re.MULTILINE)
+        if not m:
+            continue
+        new_text = text[:m.start()] + '#include <limits>\n' + text[m.start():]
+        path.write_text(new_text, encoding='utf-8')
+        patched_count += 1
+        log.debug('    + #include <limits> → %s', rel)
+
+    log.info('    applied <limits> patches: %d added, %d already present',
+             patched_count, skipped_count)
 
 
 # ─── Step 4 — NDK + SDK ─────────────────────────────────────────────────────
