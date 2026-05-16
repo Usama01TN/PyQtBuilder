@@ -386,6 +386,8 @@ def preflight(args):
     if pdts:
         args.pdt_file = str(pdts[0])
         log.info('  ✓ .pdt file  : %s (using existing)', args.pdt_file)
+        # Even if .pdt exists, re-scan modules — we need them for sysroot too.
+        args.pyqt5_modules = sorted(_scan_pyqt5_modules(args.project_dir))
     elif args.no_auto_pdt:
         raise SystemExit(
             f'  ✗ No .pdt file found in {args.project_dir}.\n'
@@ -396,6 +398,7 @@ def preflight(args):
         app_name = args.pdt_app_name or basename(args.project_dir.rstrip('/'))
         log.info('  no .pdt found — auto-generating from project imports')
         args.pdt_file = _auto_generate_pdt(args.project_dir, app_name)
+        args.pyqt5_modules = sorted(_scan_pyqt5_modules(args.project_dir))
         log.info('  ✓ .pdt file  : %s (auto-generated)', args.pdt_file)
 
     # Verify the project uses PyQt5, not PySide6
@@ -845,86 +848,170 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
     """
     Use pyqtdeploy-sysroot to build the cross-compiled sysroot:
       Python 3.10.14 + SIP 6.8.3 + PyQt5 5.15.10
+
+    pyqtdeploy 3.3.0 ships three binaries, NOT module entry points:
+      pyqtdeploy           (GUI editor)
+      pyqtdeploy-sysroot   (this step — build the sysroot)
+      pyqtdeploy-build     (next step — build the project)
+
+    Notable args (verified by running `pyqtdeploy-sysroot --help` locally):
+      --sysroots-dir   (plural "sysroots") — parent of per-target sysroots
+      --qmake          — point at our pre-built Qt's qmake so pyqtdeploy
+                         doesn't try to download+build Qt 5.15.2 itself
+                         (we already did that in step 3, 90 min ago)
+      --python         — host Python to use for building
+      --target         — pyqtdeploy's target name (matches our args.arch)
+      --jobs           — parallelism for source builds (Python, SIP, PyQt)
     """
     log.info('Step 5/7 — Build cross-compiled sysroot')
 
     arch_qt, _ = ARCH_MAP[args.arch]
-    sysroot_dir = CACHE_DIR / 'sysroot' / arch_qt
+    sysroots_parent = CACHE_DIR / 'sysroot'
+    sysroot_dir = sysroots_parent / args.arch
     marker = sysroot_dir / '.sysroot-complete'
     if marker.exists():
         log.info('  ✓ sysroot already built: %s', sysroot_dir)
         return str(sysroot_dir)
 
-    sysroot_dir.mkdir(parents=True, exist_ok=True)
+    sysroots_parent.mkdir(parents=True, exist_ok=True)
     sources_dir = CACHE_DIR / 'sysroot-sources'
     sources_dir.mkdir(exist_ok=True)
 
-    spec_file = sysroot_dir / 'sysroot.toml'
-    spec_file.write_text(_sysroot_spec(arch_qt))
+    spec_file = sysroots_parent / 'sysroot.toml'
+    spec_file.write_text(_sysroot_spec(args.pyqt5_modules))
 
-    py = str(Path(venv_dir) / 'bin' / 'python')
+    qmake = Path(qt_dir) / 'bin' / 'qmake'
+    if not qmake.exists():
+        raise SystemExit(f'  ✗ qmake not found at {qmake}')
+
     env = os.environ.copy()
     env['ANDROID_NDK_ROOT'] = ndk_path
-    env['QT_DIR']           = qt_dir
-    env['PATH']             = f'{qt_dir}/bin:' + env['PATH']
+    # pyqtdeploy-sysroot ALSO requires ANDROID_NDK_PLATFORM ("android-28")
+    # and ANDROID_SDK_ROOT.  Without these its preflight fails before any
+    # actual work begins.
+    env['ANDROID_NDK_PLATFORM'] = f'android-{ANDROID_API}'
+    env['ANDROID_SDK_ROOT'] = _ensure_sdk()
 
-    run([py, '-m', 'pyqtdeploy.sysroot.main',
-         'build',
-         '--source-dir',  str(sources_dir),
-         '--sysroot-dir', str(sysroot_dir),
-         '--target',      f'android-{ARCH_MAP[args.arch][1].split("-")[0]}',
-         str(spec_file)],
-        env=env)
+    sysroot_bin = Path(venv_dir) / 'bin' / 'pyqtdeploy-sysroot'
+    if not sysroot_bin.exists():
+        raise SystemExit(
+            f'  ✗ pyqtdeploy-sysroot binary not found at {sysroot_bin}.\n'
+            f'    Did the venv setup complete? Check Step 2.')
 
-    marker.touch()
+    nproc = max(1, multiprocessing.cpu_count())
+    cmd = [str(sysroot_bin),
+           '--source-dir',   str(sources_dir),
+           '--sysroots-dir', str(sysroots_parent),
+           '--qmake',        str(qmake),
+           '--target',       args.arch,
+           '--jobs',         str(nproc),
+           '--verbose',
+           str(spec_file)]
+    run(cmd, env=env)
+
+    if not sysroot_dir.exists():
+        # pyqtdeploy may have used a different sub-directory name.  Find it.
+        candidates = [d for d in sysroots_parent.iterdir() if d.is_dir()
+                      and (d.name == args.arch or d.name == arch_qt
+                           or 'sysroot' in d.name.lower())]
+        if candidates:
+            sysroot_dir = candidates[0]
+            log.info('  ! sysroot landed at %s (renaming/symlinking)', sysroot_dir)
+        else:
+            raise SystemExit(
+                f'  ✗ pyqtdeploy-sysroot reported success but no sysroot dir at\n'
+                f'    {sysroot_dir}\n    Contents of {sysroots_parent}:\n'
+                + '\n'.join(f'      {p.name}' for p in sysroots_parent.iterdir()))
+
+    (sysroot_dir / '.sysroot-complete').touch()
     log.info('  ✓ sysroot built at %s', sysroot_dir)
     return str(sysroot_dir)
 
 
-def _sysroot_spec(arch_qt):
-    """Generate pyqtdeploy sysroot TOML spec."""
-    return f'''
-[Python]
-build_host_from_source = true
-build_target_from_source = true
-version = "{PYTHON_VERSION}"
+def _sysroot_spec(pyqt5_modules):
+    """
+    Generate pyqtdeploy 3.3.0 sysroot TOML.
 
-[Qt]
-qt_dir = "$QT_DIR"
+    Schema verified against pyqtdeploy 3.3.0 source — each plugin's
+    ComponentOption('xxx') declarations dictate which keys are accepted:
+
+      [Python]
+        version                       (from base AbstractComponent)
+        install_host_from_source      (bool, build host Python from source?)
+        dynamic_loading               (bool, allow C ext modules at runtime?)
+
+      [SIP]
+        version
+        abi_major_version             REQUIRED — 12 for PyQt5, 13 for PyQt6
+        module_name                   REQUIRED — "PyQt5.sip" for PyQt5
+
+      [PyQt]
+        version
+        installed_modules             REQUIRED — list of PyQt5.QtX modules
+        disabled_features             optional — list of Qt features to disable
+
+    No [Qt] section: we pass --qmake to pyqtdeploy-sysroot to use the Qt
+    we built ourselves in step 3.
+    """
+    # Ensure essentials are always present even if scan missed something
+    modules = sorted(set(pyqt5_modules) | {'QtCore', 'QtGui', 'QtWidgets'})
+    modules_toml_list = ', '.join(f'"{m}"' for m in modules)
+
+    return f'''[Python]
+version = "{PYTHON_VERSION}"
+install_host_from_source = false
 
 [SIP]
 version = "{SIP_VERSION}"
+abi_major_version = 12
+module_name = "PyQt5.sip"
 
-[PyQt5]
+[PyQt]
 version = "{PYQT_VERSION}"
-android_disabled_features = [
-    "PyQt_OpenGL",
-]
+installed_modules = [{modules_toml_list}]
 '''
 
 
 # ─── Step 6 — pyqtdeploy on .pdt ────────────────────────────────────────────
 
-def run_pyqtdeploy(args, sysroot_dir, venv_dir):
-    """Run pyqtdeploy to translate the .pdt → Qt .pro project."""
-    log.info('Step 6/7 — pyqtdeploy on %s', basename(args.pdt_file))
+def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
+    """
+    Run pyqtdeploy-build to translate the .pdt into a Qt .pro project.
+
+    pyqtdeploy-build's CLI doesn't have a --sysroot-dir flag.  It locates
+    the sysroot via the qmake we pass with --qmake (which lives inside the
+    Qt that the sysroot is configured against).
+
+    The output is a build directory containing a .pro file and generated
+    C++ that wraps the Python interpreter + frozen .py modules.  We then
+    run qmake + make + androiddeployqt in Step 7.
+    """
+    log.info('Step 6/7 — pyqtdeploy-build on %s', basename(args.pdt_file))
 
     build_dir = Path(args.project_dir) / f'build-{args.arch}'
     if build_dir.exists():
         shutil.rmtree(build_dir)
-    build_dir.mkdir()
 
-    py = str(Path(venv_dir) / 'bin' / 'python')
+    build_bin = Path(venv_dir) / 'bin' / 'pyqtdeploy-build'
+    if not build_bin.exists():
+        raise SystemExit(
+            f'  ✗ pyqtdeploy-build binary not found at {build_bin}.\n'
+            f'    Did Step 2 (venv setup) complete?')
+
+    qmake = Path(qt_dir) / 'bin' / 'qmake'
     env = os.environ.copy()
+    # pyqtdeploy-build looks up the sysroot via the qmake's Qt install,
+    # but the SYSROOT env var helps in some configurations.
     env['SYSROOT'] = sysroot_dir
-    run([py, '-m', 'pyqtdeploy.pyqtdeploycli',
-         '--project',     args.pdt_file,
-         '--build-dir',   str(build_dir),
-         '--sysroot',     sysroot_dir,
-         '--target',      f'android-{ARCH_MAP[args.arch][1].split("-")[0]}',
-         'build'],
+
+    run([str(build_bin),
+         '--build-dir', str(build_dir),
+         '--qmake',     str(qmake),
+         '--target',    args.arch,
+         '--verbose',
+         args.pdt_file],
         env=env)
-    log.info('  ✓ pyqtdeploy build dir: %s', build_dir)
+    log.info('  ✓ pyqtdeploy-build dir: %s', build_dir)
     return str(build_dir)
 
 
@@ -1040,7 +1127,7 @@ def main():
     qt_dir      = acquire_qt_android(args)
     ndk_path, sdk_path = install_ndk_sdk()
     sysroot     = build_sysroot(args, qt_dir, ndk_path, venv_dir)
-    build_dir   = run_pyqtdeploy(args, sysroot, venv_dir)
+    build_dir   = run_pyqtdeploy(args, sysroot, venv_dir, qt_dir)
     apk         = build_apk(args, build_dir, qt_dir, ndk_path, sdk_path)
 
     log.info('')
