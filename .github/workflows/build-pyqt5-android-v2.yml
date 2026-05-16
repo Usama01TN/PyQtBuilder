@@ -81,7 +81,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              build-essential gcc-10 g++-10 \
+              build-essential gcc-10 g++-10 libstdc++-10-dev \
               cmake autoconf automake libtool pkg-config m4 \
               git curl wget unzip zip xz-utils ccache p7zip-full \
               libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
@@ -98,7 +98,10 @@ jobs:
               libxcb-shape0-dev libxcb-sync-dev libxcb-xfixes0-dev \
               libxcb-xkb-dev libxcb-cursor-dev \
               python3-dev
+          # Sanity-check: gcc-10 should be installed AND its own libstdc++ headers
           gcc-10 --version | head -1
+          g++-10 --version | head -1
+          ls /usr/include/c++/ | grep -E '^10' || echo "WARNING: libstdc++-10 headers missing"
 
       # ════════ Caches ════════
       # The big one: Qt 5.15.2 Android sysroot (~5 GB).  Saves the 5-hour
@@ -108,9 +111,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.PYQT5_BUILDER_CACHE }}/qt
-          # v2: previous cache had partial Qt build that failed configure
-          # before any patches/gcc-10 fix were in place. Force fresh build.
-          key: pyqt5-qt-${{ env.ARCH }}-v2
+          # v3: previous attempts left partial Qt builds in the cache before
+          # gcc-10 PATH shims + comprehensive auto-patching were in place.
+          key: pyqt5-qt-${{ env.ARCH }}-v3
 
       - name: Cache Python+SIP+PyQt5 sysroot
         uses: actions/cache@v4
