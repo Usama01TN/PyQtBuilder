@@ -565,19 +565,38 @@ def _build_qt_from_source(args, qt_dir, arch_qt):
     src_root.mkdir(parents=True, exist_ok=True)
     tarball   = src_root / 'qt-everywhere-src-5.15.2.tar.xz'
     extracted = src_root / 'qt-everywhere-src-5.15.2'
+    # Marker indicating which patches version was applied to extracted/.
+    # If patches logic changes (PATCHES_VERSION bumped), we MUST re-extract
+    # because previously-patched files may have stale or broken edits.
+    patches_marker = src_root / f'.patches-v{PATCHES_VERSION}-applied'
 
     # 1. Download
     log.info('  [1/6] downloading Qt source tarball (~600 MB)')
     download_file(QT_SRC_URL, tarball, expected_sha256=QT_SRC_SHA)
 
-    # 2. Extract (skip if already done)
+    # 2. Extract — force re-extract if our patches version doesn't match
+    # what was applied previously (which would have been a different,
+    # potentially buggy version of _apply_qt_source_patches).
+    if extracted.exists() and not patches_marker.exists():
+        log.info('  [2/6] previous patches incompatible with current logic — re-extracting')
+        shutil.rmtree(extracted)
+        # Clean up stale markers from previous patch versions
+        for old in src_root.glob('.patches-v*-applied'):
+            old.unlink()
     if not extracted.exists():
         log.info('  [2/6] extracting (~7 GB of source)')
         run(['tar', 'xf', str(tarball), '-C', str(src_root)])
 
     # 3. Patches for modern compilers
-    log.info('  [3/6] applying compatibility patches')
+    log.info('  [3/6] applying compatibility patches (patches v%d)', PATCHES_VERSION)
     _apply_qt_source_patches(extracted)
+    patches_marker.touch()
+
+    # Also clean any partial Qt install from a previous failed run — installing
+    # on top of incomplete files would mix old and new artifacts.
+    if qt_dir.exists():
+        log.info('    cleaning incomplete previous Qt install at %s', qt_dir)
+        shutil.rmtree(qt_dir)
 
     # 4. Configure
     ndk_path = _ensure_ndk()
@@ -645,30 +664,51 @@ def _build_qt_from_source(args, qt_dir, arch_qt):
     log.info('  ✓ Qt %s for Android %s built and installed', QT_VERSION, abi)
 
 
+PATCHES_VERSION = 2  # Bump when _apply_qt_source_patches logic changes.
+                     # Forces re-extraction of Qt source on next build so
+                     # previously-bad patches get wiped.
+
+
 def _apply_qt_source_patches(src_dir):
     """
     Comprehensively patch Qt 5.15.2 source for GCC 11+ compatibility.
 
-    Walks the entire Qt source tree and adds #include <limits> to every
-    header that uses std::numeric_limits but doesn't include the header.
+    Walks the Qt source tree.  For every C++ file that actually uses
+    std::numeric_limits<T> as a template (NOT just mentions it in a
+    comment), adds `#include <limits>` if missing.
 
-    Qt 5.15.2's source predates GCC 11's stricter transitive-include
-    behavior — many headers specialize std::numeric_limits or call
-    numeric_limits<T>::max() without including <limits>; older libstdc++
-    pulled it in via <algorithm>, GCC 11's doesn't.
+    Three precautions against the past two failures:
 
-    Hand-listing affected files is fragile (we just discovered
-    qbytearraymatcher.h was at qtbase/src/corelib/text/, not tools/, and
-    silently missed our list).  Tree-walking catches all of them.
+    1. Strict regex `\\bnumeric_limits\\s*<` — must be followed by `<`,
+       meaning real template instantiation.  Substring matches in
+       comments like `// see std::numeric_limits docs` no longer trigger
+       patching.  This prevents the qcompilerdetection.h case where a
+       comment-only mention caused the file to get a stray `<limits>`
+       include even though it doesn't actually need one.
+
+    2. `#ifdef __cplusplus` guard around the added include.  Several Qt
+       headers (qcompilerdetection.h, qglobal.h, qsystemdetection.h) are
+       deliberately C-compatible and included by .c files in Qt's build.
+       Bare `#include <limits>` breaks C compilation because <limits>
+       is C++-only (C uses <limits.h>).  The guard makes the include a
+       no-op when the file is compiled as C.
+
+    3. Skip `.c` files entirely.  C-only files never use std::numeric_limits
+       (it's C++); if the substring appears it's a false positive.
     """
     patched, already_have = 0, 0
     skip_dirs = {'tests', 'examples', '3rdparty', '.git', 'doc', 'config.tests'}
-    limits_include_re   = re.compile(r'#\s*include\s*[<"]limits[>"]')
-    first_include_re    = re.compile(r'^#\s*include\s', re.MULTILINE)
 
-    # Scan both .h headers and .cpp files (some .cpp's use numeric_limits
-    # directly without a preceding header that gets fixed).
-    for ext in ('.h', '.hpp', '.cpp', '.cc'):
+    # Strict: matches ACTUAL template instantiation, not bare word in comments.
+    nl_usage_re   = re.compile(r'\bnumeric_limits\s*<')
+    limits_inc_re = re.compile(r'#\s*include\s*[<"]limits[>"]')
+    first_inc_re  = re.compile(r'^#\s*include\s', re.MULTILINE)
+
+    # ONLY C++ extensions.  Pure C (.c) files don't use std::numeric_limits
+    # and shouldn't get C++ headers added.
+    extensions = ('.h', '.hpp', '.hxx', '.cpp', '.cc', '.cxx')
+
+    for ext in extensions:
         for path in src_dir.rglob(f'*{ext}'):
             if any(part in skip_dirs for part in path.parts):
                 continue
@@ -676,15 +716,25 @@ def _apply_qt_source_patches(src_dir):
                 text = path.read_text(encoding='utf-8', errors='ignore')
             except (OSError, UnicodeDecodeError):
                 continue
-            if 'numeric_limits' not in text:
+
+            # Must be real template usage, not just a substring in comment.
+            if not nl_usage_re.search(text):
                 continue
-            if limits_include_re.search(text):
+            if limits_inc_re.search(text):
                 already_have += 1
                 continue
-            m = first_include_re.search(text)
+            m = first_inc_re.search(text)
             if not m:
                 continue
-            new_text = text[:m.start()] + '#include <limits>\n' + text[m.start():]
+
+            # Wrap the added include in __cplusplus guard so the patch is
+            # safe even if the header is included from C code (e.g.
+            # qcompilerdetection.h being pulled in by qgrayraster.c).
+            new_text = (
+                text[:m.start()]
+                + '#ifdef __cplusplus\n#include <limits>\n#endif\n'
+                + text[m.start():]
+            )
             try:
                 path.write_text(new_text, encoding='utf-8')
                 patched += 1
@@ -692,8 +742,8 @@ def _apply_qt_source_patches(src_dir):
             except OSError:
                 pass
 
-    log.info('    auto-patched %d files (added <limits>); %d already had it',
-             patched, already_have)
+    log.info('    auto-patched %d C++ files (added guarded <limits>); '
+             '%d already had it', patched, already_have)
 
 
 def _setup_gcc10_path_shims(env):
