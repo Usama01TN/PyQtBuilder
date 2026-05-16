@@ -622,19 +622,11 @@ def _build_qt_from_source(args, qt_dir, arch_qt):
     env['ANDROID_NDK_ROOT'] = ndk_path
     env['ANDROID_SDK_ROOT'] = sdk_path
     env['JAVA_HOME']        = env.get('JAVA_HOME', '/usr/lib/jvm/default-java')
-    # Qt 5.15.2's host-side qmake build fails with GCC 11+ because the
-    # source uses std::numeric_limits without #include <limits>.  Patches
-    # above fix the headers, but pinning to GCC 10 (if installed) is
-    # belt-and-braces: it accepts the unpatched code AND any other GCC 11+
-    # strictness issues we might not have caught.  NDK clang is used for
-    # the Android target build regardless.
-    if shutil.which('gcc-10') and shutil.which('g++-10'):
-        env['CC']  = 'gcc-10'
-        env['CXX'] = 'g++-10'
-        log.info('    host compiler: gcc-10/g++-10 (Qt 5.15.2 incompatible w/ gcc-11+)')
-    else:
-        log.warning('    gcc-10 not found; relying solely on source patches')
-        log.warning('    install gcc-10/g++-10 (`apt install gcc-10 g++-10`) for safer build')
+    # Qt 5.15.2's bootstrap-qmake invokes `g++` directly via its Makefiles,
+    # NOT via $CXX.  Setting CC/CXX env vars alone is ignored.  We need to
+    # make `g++` itself resolve to `g++-10` by prepending a shim dir to PATH.
+    # This is belt-and-braces with the source patches above.
+    env = _setup_gcc10_path_shims(env)
     run(configure_args, cwd=str(build_dir), env=env)
 
     # 5. Build  (THIS IS THE LONG PART)
@@ -655,68 +647,94 @@ def _build_qt_from_source(args, qt_dir, arch_qt):
 
 def _apply_qt_source_patches(src_dir):
     """
-    Apply patches Qt 5.15.2 needs to build with modern toolchains.
+    Comprehensively patch Qt 5.15.2 source for GCC 11+ compatibility.
 
-    Qt 5.15.2's source predates GCC 11's stricter handling of transitive
-    includes.  Several headers specialize std::numeric_limits or call
-    std::numeric_limits<T>::max() without including <limits>; pre-GCC 11
-    pulled it in transitively, GCC 11+ doesn't.  Without the patches the
-    build fails with:
-        error: 'numeric_limits' is not a class template
-        error: 'std::numeric_limits' is not a template
+    Walks the entire Qt source tree and adds #include <limits> to every
+    header that uses std::numeric_limits but doesn't include the header.
 
-    These are the same patches KDE's qt5-patch-collection and several
-    Linux distros (Arch, Fedora) ship.
+    Qt 5.15.2's source predates GCC 11's stricter transitive-include
+    behavior — many headers specialize std::numeric_limits or call
+    numeric_limits<T>::max() without including <limits>; older libstdc++
+    pulled it in via <algorithm>, GCC 11's doesn't.
+
+    Hand-listing affected files is fragile (we just discovered
+    qbytearraymatcher.h was at qtbase/src/corelib/text/, not tools/, and
+    silently missed our list).  Tree-walking catches all of them.
     """
-    # Headers that need <limits> added.  List is conservative — we just
-    # patch all the ones known to be affected in the qtbase/qtdeclarative
-    # subset we build.  No-op for files that don't exist (e.g., if a
-    # skipped module wasn't extracted).
-    needs_limits = [
-        'qtbase/src/corelib/global/qfloat16.h',
-        'qtbase/src/corelib/global/qendian.h',
-        'qtbase/src/corelib/global/qrandom.h',
-        'qtbase/src/corelib/tools/qbytearraymatcher.h',
-        'qtbase/src/corelib/tools/qsharedpointer_impl.h',
-        'qtbase/src/corelib/tools/qhash.h',
-        'qtbase/src/corelib/tools/qstring.h',
-        'qtbase/src/corelib/io/qiodevice.h',
-        'qtbase/src/corelib/io/qprocess.h',
-        'qtbase/src/corelib/text/qstringliteral.h',
-        'qtbase/src/corelib/text/qstringview.h',
-        'qtbase/src/corelib/itemmodels/qabstractitemmodel.h',
-        'qtdeclarative/src/qml/jsruntime/qv4engine_p.h',
-        'qtdeclarative/src/qml/jsruntime/qv4global_p.h',
-        'qttools/src/linguist/shared/translator.h',
-    ]
+    patched, already_have = 0, 0
+    skip_dirs = {'tests', 'examples', '3rdparty', '.git', 'doc', 'config.tests'}
+    limits_include_re   = re.compile(r'#\s*include\s*[<"]limits[>"]')
+    first_include_re    = re.compile(r'^#\s*include\s', re.MULTILINE)
 
-    patched_count = 0
-    skipped_count = 0
-    for rel in needs_limits:
-        path = src_dir / rel
-        if not path.exists():
-            continue
-        try:
-            text = path.read_text(encoding='utf-8', errors='ignore')
-        except OSError:
-            continue
-        if '#include <limits>' in text:
-            skipped_count += 1
-            continue
-        # Insert "#include <limits>" before the first #include directive.
-        # This works regardless of license header / include guard layout
-        # because every Qt header has a regular #include somewhere after
-        # the include guard #define.
-        m = re.search(r'^#include\s', text, re.MULTILINE)
-        if not m:
-            continue
-        new_text = text[:m.start()] + '#include <limits>\n' + text[m.start():]
-        path.write_text(new_text, encoding='utf-8')
-        patched_count += 1
-        log.debug('    + #include <limits> → %s', rel)
+    # Scan both .h headers and .cpp files (some .cpp's use numeric_limits
+    # directly without a preceding header that gets fixed).
+    for ext in ('.h', '.hpp', '.cpp', '.cc'):
+        for path in src_dir.rglob(f'*{ext}'):
+            if any(part in skip_dirs for part in path.parts):
+                continue
+            try:
+                text = path.read_text(encoding='utf-8', errors='ignore')
+            except (OSError, UnicodeDecodeError):
+                continue
+            if 'numeric_limits' not in text:
+                continue
+            if limits_include_re.search(text):
+                already_have += 1
+                continue
+            m = first_include_re.search(text)
+            if not m:
+                continue
+            new_text = text[:m.start()] + '#include <limits>\n' + text[m.start():]
+            try:
+                path.write_text(new_text, encoding='utf-8')
+                patched += 1
+                log.debug('    + #include <limits> → %s', path.relative_to(src_dir))
+            except OSError:
+                pass
 
-    log.info('    applied <limits> patches: %d added, %d already present',
-             patched_count, skipped_count)
+    log.info('    auto-patched %d files (added <limits>); %d already had it',
+             patched, already_have)
+
+
+def _setup_gcc10_path_shims(env):
+    """
+    Set up PATH shims so 'g++' itself resolves to 'g++-10'.
+
+    Setting CC/CXX env vars isn't enough — Qt 5.15.2's bootstrap-qmake
+    Makefiles invoke `g++` directly.  We create a small shim directory
+    with `g++ → g++-10`, `gcc → gcc-10` symlinks and prepend it to PATH.
+    """
+    gcc10 = shutil.which('gcc-10')
+    gpp10 = shutil.which('g++-10')
+    if not (gcc10 and gpp10):
+        log.warning('    gcc-10/g++-10 not installed — patches alone must carry')
+        log.warning('    install via: sudo apt install gcc-10 g++-10 libstdc++-10-dev')
+        return env
+
+    shim_dir = CACHE_DIR / 'gcc10-shims'
+    if shim_dir.exists():
+        shutil.rmtree(shim_dir)
+    shim_dir.mkdir(parents=True)
+    for name, target in (('gcc', gcc10), ('g++', gpp10),
+                         ('cc',  gcc10), ('c++', gpp10)):
+        (shim_dir / name).symlink_to(target)
+
+    env['PATH'] = f'{shim_dir}{os.pathsep}' + env.get('PATH', '')
+    env['CC']   = str(shim_dir / 'gcc')
+    env['CXX']  = str(shim_dir / 'g++')
+
+    # Verify the shim works — log what `g++` actually resolves to now
+    try:
+        out = subprocess.run(['g++', '--version'], env=env,
+                             capture_output=True, text=True, check=True)
+        first_line = out.stdout.splitlines()[0] if out.stdout else '?'
+        log.info('    host compiler shims at %s', shim_dir)
+        log.info('    g++ resolves to: %s', first_line)
+        if 'g++-10' not in first_line and '10.' not in first_line:
+            log.warning('    g++ does NOT appear to be gcc-10!  Shim may not work.')
+    except (subprocess.CalledProcessError, OSError) as e:
+        log.warning('    couldn\'t verify g++ shim: %s', e)
+    return env
 
 
 # ─── Step 4 — NDK + SDK ─────────────────────────────────────────────────────
