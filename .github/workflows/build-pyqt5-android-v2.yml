@@ -1,0 +1,277 @@
+name: build-pyqt5-android-v2
+
+# PyQt5 → Android using build_pyqt5_android_v2.py (the source-build-capable script).
+#
+# Strategy:
+#   First run (cold cache):  ~5 hours
+#     - aqtinstall attempts fail (Qt 5.15.2 Android repo is dead)
+#     - Script falls back to building Qt 5.15.2 from source
+#     - Builds Python+SIP+PyQt5 sysroot
+#     - Builds the APK
+#   Subsequent runs:         ~15-20 minutes
+#     - Qt cache hit, sysroot cache hit
+#     - Only the app's pyqtdeploy step + qmake/make/androiddeployqt runs
+#
+# Critical: GitHub Actions free-tier runners have a 6-hour timeout per job.
+#           The first run cuts it close.  If it times out, the cache is
+#           preserved and the second run picks up where it left off.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: "Public URL to PyQt5 project zip (main.py + .pdt)"
+        required: true
+        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip"
+      arch:
+        description: "Target ABI"
+        required: true
+        default: "android-64"
+        type: choice
+        options: [android-64, android-32, android-x86_64, android-x86]
+      qt_tarball_url:
+        description: "OPTIONAL: URL to pre-built Qt 5.15.2 Android tarball (skips source build)"
+        required: false
+        default: ""
+      build_id:
+        description: "Optional build ID"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350     # max GHA free-tier job time
+
+    env:
+      PROJECT_URL:     ${{ github.event.inputs.project_url }}
+      ARCH:            ${{ github.event.inputs.arch }}
+      QT_TARBALL_URL:  ${{ github.event.inputs.qt_tarball_url }}
+      BUILD_ID:        ${{ github.event.inputs.build_id }}
+      PYQT5_BUILDER_CACHE: /home/runner/pyqt5-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (need ~30 GB for source build)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      /usr/local/lib/android/sdk/ndk \
+                      /opt/hostedtoolcache/CodeQL \
+                      "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get -y purge --auto-remove \
+              azure-cli google-cloud-cli microsoft-edge-stable \
+              google-chrome-stable firefox powershell || true
+          docker system prune -af || true
+          df -h
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Install host build dependencies (Qt source build needs these)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake autoconf automake libtool pkg-config m4 \
+              git curl wget unzip zip xz-utils ccache p7zip-full \
+              libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
+              libdbus-1-dev libfontconfig1-dev libfreetype6-dev \
+              libffi-dev libssl-dev zlib1g-dev \
+              libncurses-dev libsqlite3-dev libbz2-dev liblzma-dev \
+              libreadline-dev libgdbm-dev libnss3-dev libgdbm-compat-dev \
+              tk-dev uuid-dev libpng-dev libjpeg-dev \
+              libxml2-dev libxslt1-dev \
+              libxcb1-dev libx11-dev libxext-dev libxfixes-dev \
+              libxi-dev libxrender-dev libxcb-xinerama0-dev \
+              libxkbcommon-x11-dev libxcb-icccm4-dev libxcb-image0-dev \
+              libxcb-keysyms1-dev libxcb-randr0-dev libxcb-render-util0-dev \
+              libxcb-shape0-dev libxcb-sync-dev libxcb-xfixes0-dev \
+              libxcb-xkb-dev libxcb-cursor-dev \
+              python3-dev
+
+      # ════════ Caches ════════
+      # The big one: Qt 5.15.2 Android sysroot (~5 GB).  Saves the 5-hour
+      # source build on every run after the first.
+      - name: Cache Qt 5.15.2 Android (THE big cache)
+        id: qt-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PYQT5_BUILDER_CACHE }}/qt
+          key: pyqt5-qt-${{ env.ARCH }}-v1
+
+      - name: Cache Python+SIP+PyQt5 sysroot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PYQT5_BUILDER_CACHE }}/sysroot
+          key: pyqt5-sysroot-${{ env.ARCH }}-v1
+
+      - name: Cache NDK r21e
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PYQT5_BUILDER_CACHE }}/ndk
+          key: pyqt5-ndk-r21e-v1
+
+      - name: Cache Qt source tarball (~600 MB)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PYQT5_BUILDER_CACHE }}/qt-src
+          key: pyqt5-qt-src-${{ env.QT_VERSION || '5.15.2' }}-v1
+
+      # ════════ Project setup ════════
+      - name: Download project
+        run: |
+          mkdir -p workspace
+          curl -L --fail "$PROJECT_URL" -o project.zip
+          unzip -q project.zip -d workspace
+          MAIN_PY="$(find workspace -name main.py -maxdepth 4 | head -1)"
+          if [ -z "$MAIN_PY" ]; then
+            echo "::error::Project has no main.py"; exit 1
+          fi
+          PROJ_DIR="$(dirname "$MAIN_PY")"
+          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
+          ls -la "$PROJ_DIR"
+
+      - name: Auto-patch PySide6 imports → PyQt5 (if needed)
+        env:
+          PROJ_DIR: ${{ env.PROJ_DIR }}
+        run: |
+          MAIN_PY="$PROJ_DIR/main.py"
+          if grep -q "from PySide6\|import PySide6" "$MAIN_PY"; then
+            echo "Patching PySide6 → PyQt5 in main.py"
+            python3 -c "
+          import re
+          with open('$MAIN_PY') as f: src = f.read()
+          src = re.sub(r'\bfrom PySide6\b', 'from PyQt5', src)
+          src = re.sub(r'\bimport PySide6\b', 'import PyQt5', src)
+          src = re.sub(r'(\bapp\.)exec\(\)', r'\1exec_()', src)
+          with open('$MAIN_PY', 'w') as f: f.write(src)
+          print(open('$MAIN_PY').read())
+          "
+          fi
+
+      - name: Auto-generate minimal .pdt if missing
+        env:
+          PROJ_DIR: ${{ env.PROJ_DIR }}
+        run: |
+          if ! ls "$PROJ_DIR"/*.pdt 2>/dev/null; then
+            APP="$(basename "$PROJ_DIR")"
+            cat > "$PROJ_DIR/${APP}.pdt" <<PDTEOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Project version="11">
+           <Application entrypoint="" isconsole="0" isbundle="0" name="${APP}" script="main.py" syspath="">
+            <PyrccrcFiles/>
+            <Package name=""/>
+            <PyQtModules>
+             <PyQtModule name="QtCore"/>
+             <PyQtModule name="QtGui"/>
+             <PyQtModule name="QtWidgets"/>
+            </PyQtModules>
+            <Stdlib>
+             <Extension name="_sha512"/>
+             <Extension name="_sha256"/>
+             <Extension name="zlib"/>
+            </Stdlib>
+            <OtherExtensionModules/>
+            <Sites/>
+           </Application>
+          </Project>
+          PDTEOF
+            echo "Generated $PROJ_DIR/${APP}.pdt"
+            cat "$PROJ_DIR/${APP}.pdt"
+          fi
+
+      # ════════ The build ════════
+      - name: Install Android SDK packages
+        run: |
+          SDKMANAGER=/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
+          export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+          mkdir -p "$ANDROID_SDK_ROOT/licenses"
+          cp /usr/local/lib/android/sdk/licenses/* "$ANDROID_SDK_ROOT/licenses/" || true
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" \
+              "platform-tools" \
+              "platforms;android-28" \
+              "build-tools;28.0.3"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run the builder
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          # Decide acquisition strategy:
+          #   If user provided a tarball URL, use it (fastest path on warm setup).
+          #   If Qt cache exists, use it.
+          #   Otherwise, build from source.
+          TARBALL_ARG=""
+          if [ -n "$QT_TARBALL_URL" ]; then
+            TARBALL_ARG="--qt-tarball-url $QT_TARBALL_URL"
+          fi
+
+          # In CI we know aqt won't work for Qt 5.15.2 Android, so skip the
+          # 5-minute futile attempt unless the user has a reason to try.
+          set -o pipefail
+          python build_pyqt5_android_v2.py \
+              "$PROJ_DIR" \
+              --arch "$ARCH" \
+              --build-qt-from-source \
+              $TARBALL_ARG \
+              --cache-dir "$PYQT5_BUILDER_CACHE" \
+              --verbose \
+              2>&1 | tee build.log
+
+      - name: Locate APK
+        id: locate
+        if: success()
+        run: |
+          APK="$(find "$PROJ_DIR" -name '*.apk' -type f | head -1)"
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced"
+            exit 1
+          fi
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          ls -la "$APK"
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ env.ARCH }}${{ env.BUILD_ID && format('-{0}', env.BUILD_ID) || '' }}
+          path: ${{ steps.locate.outputs.apk_path }}
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log${{ env.BUILD_ID && format('-{0}', env.BUILD_ID) || '' }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload prebuilt Qt as artifact (so you can save it for future runs)
+        if: success() && steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          # The Qt cache hit logic above is best-effort.  Also tar it up as an
+          # artifact so you can download once and upload to a GitHub Release,
+          # then use --qt-tarball-url in future runs to skip source build entirely.
+          tar -caf qt-5.15.2-${ARCH}.tar.xz \
+              -C "$PYQT5_BUILDER_CACHE/qt/5.15.2" \
+              . || true
+          ls -lh qt-5.15.2-${ARCH}.tar.xz || true
+
+      - name: Upload prebuilt Qt artifact
+        if: success() && steps.qt-cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-5.15.2-${{ env.ARCH }}-prebuilt
+          path: qt-5.15.2-*.tar.xz
+          if-no-files-found: ignore
+          retention-days: 90
