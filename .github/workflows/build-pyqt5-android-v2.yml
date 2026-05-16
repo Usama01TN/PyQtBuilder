@@ -111,9 +111,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.PYQT5_BUILDER_CACHE }}/qt
-          # v3: previous attempts left partial Qt builds in the cache before
-          # gcc-10 PATH shims + comprehensive auto-patching were in place.
-          key: pyqt5-qt-${{ env.ARCH }}-v3
+          # v4: bumped because previous v3 cache may contain partial Qt
+          # install from a build that died at qgrayraster.c due to a
+          # bad patch on qcompilerdetection.h.  Script will also delete
+          # any partial qt_dir at acquisition time as a second defense.
+          key: pyqt5-qt-${{ env.ARCH }}-v4
 
       - name: Cache Python+SIP+PyQt5 sysroot
         uses: actions/cache@v4
