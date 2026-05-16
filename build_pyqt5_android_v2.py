@@ -965,34 +965,36 @@ def _sysroot_spec(pyqt5_modules):
     """
     Generate pyqtdeploy 3.3.0 sysroot TOML.
 
-    Schema verified against pyqtdeploy 3.3.0 source — each plugin's
-    ComponentOption('xxx') declarations dictate which keys are accepted:
+    pyqtdeploy REQUIRES a [Qt] section even when we're using an existing
+    Qt installation — the Python component validates that Qt is declared.
+    But pyqtdeploy explicitly cannot build Qt for Android (its Qt plugin
+    says "cross compiling Qt is not supported"), so we MUST set
+    `install_from_source = false` and pair with `--qmake` on the CLI.
 
+    The version in [Qt] must match what `qmake -query QT_VERSION` reports
+    on our pre-built Qt; mismatch causes a verify error.
+
+    Schema reference (from running pyqtdeploy-sysroot --verify):
       [Python]
-        version                       (from base AbstractComponent)
-        install_host_from_source      (bool, build host Python from source?)
-        dynamic_loading               (bool, allow C ext modules at runtime?)
-
+        version, install_host_from_source, dynamic_loading
+      [Qt]
+        version, install_from_source, configure_options, disabled_features,
+        edition, ssl, skip, static_msvc_runtime
       [SIP]
-        version
-        abi_major_version             REQUIRED — 12 for PyQt5, 13 for PyQt6
-        module_name                   REQUIRED — "PyQt5.sip" for PyQt5
-
+        version, abi_major_version (required), module_name (required)
       [PyQt]
-        version
-        installed_modules             REQUIRED — list of PyQt5.QtX modules
-        disabled_features             optional — list of Qt features to disable
-
-    No [Qt] section: we pass --qmake to pyqtdeploy-sysroot to use the Qt
-    we built ourselves in step 3.
+        version, installed_modules (required), disabled_features
     """
-    # Ensure essentials are always present even if scan missed something
     modules = sorted(set(pyqt5_modules) | {'QtCore', 'QtGui', 'QtWidgets'})
     modules_toml_list = ', '.join(f'"{m}"' for m in modules)
 
     return f'''[Python]
 version = "{PYTHON_VERSION}"
 install_host_from_source = false
+
+[Qt]
+version = "{QT_VERSION}"
+install_from_source = false
 
 [SIP]
 version = "{SIP_VERSION}"
