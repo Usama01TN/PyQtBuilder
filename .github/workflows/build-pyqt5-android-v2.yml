@@ -158,36 +158,8 @@ jobs:
           "
           fi
 
-      - name: Auto-generate minimal .pdt if missing
-        env:
-          PROJ_DIR: ${{ env.PROJ_DIR }}
-        run: |
-          if ! ls "$PROJ_DIR"/*.pdt 2>/dev/null; then
-            APP="$(basename "$PROJ_DIR")"
-            cat > "$PROJ_DIR/${APP}.pdt" <<PDTEOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <Project version="11">
-           <Application entrypoint="" isconsole="0" isbundle="0" name="${APP}" script="main.py" syspath="">
-            <PyrccrcFiles/>
-            <Package name=""/>
-            <PyQtModules>
-             <PyQtModule name="QtCore"/>
-             <PyQtModule name="QtGui"/>
-             <PyQtModule name="QtWidgets"/>
-            </PyQtModules>
-            <Stdlib>
-             <Extension name="_sha512"/>
-             <Extension name="_sha256"/>
-             <Extension name="zlib"/>
-            </Stdlib>
-            <OtherExtensionModules/>
-            <Sites/>
-           </Application>
-          </Project>
-          PDTEOF
-            echo "Generated $PROJ_DIR/${APP}.pdt"
-            cat "$PROJ_DIR/${APP}.pdt"
-          fi
+      # Note: .pdt generation now lives inside build_pyqt5_android_v2.py
+      # (--no-auto-pdt to disable).  No separate step needed here.
 
       # ════════ The build ════════
       - name: Install Android SDK packages
