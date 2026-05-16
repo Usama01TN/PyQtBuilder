@@ -815,22 +815,55 @@ def _ensure_ndk():
 
 
 def _ensure_sdk():
-    """Locate or install Android SDK. Prefer existing $ANDROID_SDK_ROOT."""
+    """
+    Locate Android SDK and ensure pyqtdeploy-compatible layout.
+
+    pyqtdeploy-sysroot 3.3 reads <SDK>/tools/source.properties to detect
+    the SDK Tools version (legacy layout, deprecated by Google since
+    2017).  Modern SDK installs via `sdkmanager` don't populate the
+    `tools/` directory at all, so we drop a minimal source.properties
+    shim there so pyqtdeploy's SDK version check passes.
+
+    The script doesn't change anything else about the SDK — `platforms/`,
+    `build-tools/`, `ndk/`, etc. are used as-is.
+    """
     candidates = [
         os.environ.get('ANDROID_SDK_ROOT'),
         os.environ.get('ANDROID_HOME'),
         '/usr/local/lib/android/sdk',
         str(Path.home() / 'Android' / 'Sdk'),
     ]
+    sdk = None
     for c in candidates:
         if c and exists(join(c, 'platform-tools')):
-            return c
-    raise SystemExit(
-        '  ✗ Android SDK not found.  Install it and set $ANDROID_SDK_ROOT.\n'
-        '    Required packages:\n'
-        f'      platforms;android-{ANDROID_API}\n'
-        f'      build-tools;{BUILD_TOOLS_VER}\n'
-        '      platform-tools')
+            sdk = c
+            break
+    if not sdk:
+        raise SystemExit(
+            '  ✗ Android SDK not found.  Install it and set $ANDROID_SDK_ROOT.\n'
+            '    Required packages:\n'
+            f'      platforms;android-{ANDROID_API}\n'
+            f'      build-tools;{BUILD_TOOLS_VER}\n'
+            '      platform-tools')
+
+    # pyqtdeploy-sysroot wants <SDK>/tools/source.properties with a
+    # Pkg.Revision line.  Modern SDKs put this at cmdline-tools/latest/.
+    # We add a small shim if needed — only the Pkg.Revision line is read
+    # by pyqtdeploy's _get_version, which is called from _get_sdk_version
+    # and compared to (26, 1, 1) — older just warns, doesn't fail.
+    tools_props = Path(sdk) / 'tools' / 'source.properties'
+    if not tools_props.exists():
+        tools_props.parent.mkdir(parents=True, exist_ok=True)
+        tools_props.write_text(
+            '# Compatibility shim for pyqtdeploy-sysroot.\n'
+            '# Modern Android SDK installs (cmdline-tools-based) no longer\n'
+            '# create <SDK>/tools/, but pyqtdeploy hardcodes that path.\n'
+            'Pkg.Revision=26.1.1\n'
+            'Pkg.Desc=Android SDK Tools\n'
+            'Pkg.Path=tools\n'
+        )
+        log.info('  ✓ wrote SDK tools/source.properties shim at %s', tools_props)
+    return sdk
 
 
 def install_ndk_sdk():
