@@ -85,6 +85,22 @@ ARCH_MAP = {
 QT_SRC_URL  = ('https://download.qt.io/archive/qt/5.15/5.15.2/single/'
                'qt-everywhere-src-5.15.2.tar.xz')
 QT_SRC_SHA  = ('3a530d1b243b5dec00bc54937455471aaa3e56849d2593edb8ded07228202240')
+
+# PyQt5 5.15.10 source sdist on PyPI.
+#
+# pyqtdeploy 3.3.0's PyQt component tries to find this tarball by scraping
+# the PyPI project HTML page looking for a `.tar.gz` link, but PyPI's HTML
+# structure has changed since pyqtdeploy was last updated and the scrape
+# returns nothing.  We sidestep that entirely by pre-staging the file in
+# the --source-dir, which pyqtdeploy checks first.
+#
+# files.pythonhosted.org URLs are content-addressed (hash-derived path),
+# so this URL is permanent.  SHA from PyPI's JSON API for v5.15.10.
+PYQT5_SDIST_URL = (
+    'https://files.pythonhosted.org/packages/4d/5d/'
+    'b8b6e26956ec113ad3f566e02abd12ac3a56b103fcc7e0735e27ee4a1df3/'
+    'PyQt5-5.15.10.tar.gz')
+PYQT5_SDIST_SHA = 'd46b7804b1b10a4ff91753f8113e5b5580d2b4462f3226288e2d84497334898a'
 NDK_URL_TPL = 'https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip'
 
 # Cache root (idempotent — re-running picks up where it left off)
@@ -892,6 +908,52 @@ def _ensure_ndk():
     return str(ndk_dir)
 
 
+def _prestage_pyqt5_sdist(sources_dir):
+    """
+    Pre-download the PyQt5 sdist into sources_dir so pyqtdeploy finds it
+    locally and skips its broken PyPI HTML scrape.
+
+    Background: pyqtdeploy 3.3.0's PyQt component does this:
+        1. Look for PyQt5-X.Y.Z.tar.gz in --source-dir.   ← local check
+        2. Look in ~/.pyqtdeploy/cache.                    ← download cache
+        3. Fetch https://pypi.org/project/PyQt5/X.Y.Z/ as HTML.
+        4. Search the page's HTML for a `.tar.gz` link.    ← BREAKS HERE
+        5. Download the link target.
+
+    Step 4 fails on modern PyPI HTML — the link patterns pyqtdeploy looks
+    for changed years ago.  By staging the tarball at step 1, we never
+    reach the broken scraper.
+
+    `pip download --no-binary :all: PyQt5==X.Y.Z` doesn't work as a
+    fallback because pip tries to generate package metadata from source,
+    which needs qmake; we'd hit a sipbuild PyProjectOptionException about
+    qmake before any tarball is saved.  Direct fetch from
+    files.pythonhosted.org sidesteps that entirely — that URL is content-
+    addressed (hash-derived path) and permanent, so the URL above stays
+    valid as long as PyQt5 5.15.10 exists on PyPI.
+    """
+    sources_dir = Path(sources_dir)
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    target = sources_dir / f'PyQt5-{PYQT_VERSION}.tar.gz'
+
+    if target.exists():
+        # Trust the cached file if its size looks sane; full SHA check
+        # would re-hash every run.  pyqtdeploy will tell us if the file
+        # is corrupted (rare; the cache lives on the runner's disk).
+        size = target.stat().st_size
+        if size > 1_000_000:
+            log.info('  ✓ PyQt5 sdist already staged at %s (%d bytes)',
+                     target, size)
+            return
+        log.info('  re-staging PyQt5 sdist (cached file looks truncated: %d B)',
+                 size)
+        target.unlink()
+
+    log.info('  pre-staging PyQt5 sdist (PyPI HTML scrape is broken in pyqtdeploy)')
+    download_file(PYQT5_SDIST_URL, target, expected_sha256=PYQT5_SDIST_SHA)
+    log.info('  ✓ staged %s (%d bytes)', target, target.stat().st_size)
+
+
 def _ensure_sdk():
     """
     Locate Android SDK and ensure pyqtdeploy-compatible layout.
@@ -987,6 +1049,14 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
     sysroots_parent.mkdir(parents=True, exist_ok=True)
     sources_dir = CACHE_DIR / 'sysroot-sources'
     sources_dir.mkdir(exist_ok=True)
+
+    # Pre-stage the PyQt5 sdist into sources_dir.  pyqtdeploy 3.3's PyQt
+    # component would otherwise scrape the PyPI project HTML page looking
+    # for a `.tar.gz` link, but PyPI's HTML changed and the scrape now
+    # returns nothing — pyqtdeploy aborts with "unable to find link to ...".
+    # Pyqtdeploy checks --source-dir BEFORE attempting the scrape, so
+    # staging the file locally short-circuits the broken code path.
+    _prestage_pyqt5_sdist(sources_dir)
 
     spec_file = sysroots_parent / 'sysroot.toml'
     spec_content = _sysroot_spec(args.pyqt5_modules)
