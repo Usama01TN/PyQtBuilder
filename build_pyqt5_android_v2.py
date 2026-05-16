@@ -145,6 +145,230 @@ def download_file(url, dest, expected_sha256=None, max_retries=3):
                 raise
 
 
+# ─── .pdt auto-generation ────────────────────────────────────────────────────
+
+def _scan_pyqt5_modules(project_dir):
+    """Walk all .py files in the project, AST-parse them, and collect every
+    PyQt5 submodule that's imported.  Always includes QtCore/QtGui/QtWidgets
+    so a minimal hello-world doesn't break."""
+    import ast
+    found = {'QtCore', 'QtGui', 'QtWidgets'}
+    skip_dirs = {'__pycache__', '.git', 'venv', '.venv', 'env',
+                 'node_modules', 'build', 'deployment', '.buildozer',
+                 'dist', '.pytest_cache', '.mypy_cache'}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('build-')]
+        for fn in files:
+            if not fn.endswith('.py'):
+                continue
+            path = join(root, fn)
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+                    tree = ast.parse(fh.read())
+            except (SyntaxError, OSError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    # `from PyQt5.QtCore import ...`
+                    if node.module.startswith('PyQt5.'):
+                        found.add(node.module.split('.', 1)[1])
+                    # `from PyQt5 import QtCore, QtNetwork`
+                    elif node.module == 'PyQt5':
+                        for alias in node.names:
+                            if alias.name.startswith('Qt'):
+                                found.add(alias.name)
+                elif isinstance(node, ast.Import):
+                    # `import PyQt5.QtCore`
+                    for alias in node.names:
+                        if alias.name.startswith('PyQt5.'):
+                            found.add(alias.name.split('.', 1)[1])
+    return found
+
+
+def _scan_stdlib_extensions(project_dir):
+    """Return the set of stdlib C extensions to bundle.
+
+    pyqtdeploy needs explicit declarations of which CPython native modules
+    to compile into the embedded interpreter.  Missing them causes
+    ImportError on the device for things people assume are 'just there'.
+
+    Always include the essentials Python startup + common libs need; then
+    add others based on what the project actually imports."""
+    import ast
+
+    # Always include: needed by Python startup, pickle, hashlib, common libs.
+    # These cost ~100 KB total — not worth filtering aggressively.
+    essentials = {
+        '_sha512', '_sha256', '_sha1', '_md5', '_blake2',   # hashlib backends
+        'zlib',                                              # compression
+        '_struct',                                           # struct module
+        '_random',                                           # random module
+        '_datetime',                                         # datetime
+        '_pickle',                                           # pickle
+        '_socket',                                           # very common
+        'array',
+        'select',
+        'binascii',                                          # base64/hex
+        '_csv',
+        '_bisect',
+        '_heapq',
+        '_collections',
+        '_functools',
+        '_operator',
+        'itertools',
+        'math', 'cmath',
+        '_json',
+        '_io',
+        '_codecs',
+        '_decimal',
+        '_string',
+        '_weakref',
+        '_locale',
+        'time',
+        'unicodedata',
+    }
+
+    # Map import names → stdlib extensions they require.  Only added if the
+    # user actually imports the top-level module somewhere in the project.
+    # If you find your app misses an extension at runtime, add to this map.
+    optional_map = {
+        'ssl':       ['_ssl', '_hashlib'],
+        'hashlib':   ['_hashlib'],
+        'hmac':      ['_hashlib'],
+        'socket':    ['_socket', 'select'],
+        'http':      ['_socket'],
+        'urllib':    ['_socket'],
+        'requests':  ['_ssl', '_hashlib', '_socket'],   # popular 3rd-party
+        'sqlite3':   ['_sqlite3'],
+        'bz2':       ['_bz2'],
+        'lzma':      ['_lzma'],
+        'gzip':      ['zlib'],
+        'zipfile':   ['zlib'],
+        'tarfile':   ['zlib', '_bz2', '_lzma'],
+        'pyexpat':   ['pyexpat'],
+        'xml':       ['pyexpat', '_elementtree'],
+        'multiprocessing': ['_multiprocessing', 'mmap', '_socket'],
+        'asyncio':   ['_asyncio', '_socket', 'select'],
+        'decimal':   ['_decimal'],
+        'ctypes':    ['_ctypes'],
+        'queue':     ['_queue'],
+        'curses':    ['_curses'],
+        'readline':  ['readline'],
+        'gettext':   ['_locale'],
+        'locale':    ['_locale'],
+        'mmap':      ['mmap'],
+        'uuid':      ['_uuid'],
+        'fcntl':     ['fcntl'],
+        'grp':       ['grp'],
+        'pwd':       ['pwd'],
+        'syslog':    ['syslog'],
+        'termios':   ['termios'],
+        'audioop':   ['audioop'],
+        'wave':      ['audioop'],
+        'crypt':     ['_crypt'],
+    }
+
+    found_imports = set()
+    skip_dirs = {'__pycache__', '.git', 'venv', '.venv', 'env',
+                 'node_modules', 'build', 'deployment'}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('build-')]
+        for fn in files:
+            if not fn.endswith('.py'):
+                continue
+            try:
+                with open(join(root, fn), encoding='utf-8', errors='ignore') as fh:
+                    tree = ast.parse(fh.read())
+            except (SyntaxError, OSError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        found_imports.add(a.name.split('.')[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    found_imports.add(node.module.split('.')[0])
+
+    exts = set(essentials)
+    for imp_name, ext_list in optional_map.items():
+        if imp_name in found_imports:
+            exts.update(ext_list)
+    return exts
+
+
+def _find_qrc_files(project_dir):
+    """Find Qt resource files (.qrc) that need pyrcc compilation."""
+    return sorted(
+        str(p.relative_to(project_dir))
+        for p in Path(project_dir).rglob('*.qrc')
+        if not any(skip in p.parts for skip in
+                   ('__pycache__', '.git', 'venv', '.venv', 'build', 'deployment'))
+    )
+
+
+def _auto_generate_pdt(project_dir, app_name):
+    """
+    Generate a minimal .pdt file at <project_dir>/<app_name>.pdt based on
+    what the project's source code actually imports.
+
+    Detects:
+      - PyQt5 modules via AST scan of all .py files
+      - Stdlib C extensions (essentials + ones triggered by import scan)
+      - .qrc resource files
+
+    Doesn't detect (use pyqtdeploy GUI if you need these):
+      - Package bundling configuration (bundle/console/sysroot tweaks)
+      - Sites entries (custom syspath dirs)
+      - OtherExtensionModules (third-party C extensions)
+    """
+    pyqt_modules = _scan_pyqt5_modules(project_dir)
+    stdlib_exts  = _scan_stdlib_extensions(project_dir)
+    qrc_files    = _find_qrc_files(project_dir)
+
+    pdt_path = join(project_dir, f'{app_name}.pdt')
+
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<Project version="11">',
+             ' <Application entrypoint="" isconsole="0" isbundle="0"',
+             f'              name="{app_name}" script="main.py" syspath="">']
+
+    if qrc_files:
+        lines.append('  <PyrccrcFiles>')
+        for q in qrc_files:
+            lines.append(f'   <PyrccrcFile name="{q}"/>')
+        lines.append('  </PyrccrcFiles>')
+    else:
+        lines.append('  <PyrccrcFiles/>')
+
+    lines.append('  <Package name=""/>')
+
+    lines.append('  <PyQtModules>')
+    for m in sorted(pyqt_modules):
+        lines.append(f'   <PyQtModule name="{m}"/>')
+    lines.append('  </PyQtModules>')
+
+    lines.append('  <Stdlib>')
+    for e in sorted(stdlib_exts):
+        lines.append(f'   <Extension name="{e}"/>')
+    lines.append('  </Stdlib>')
+
+    lines.extend([
+        '  <OtherExtensionModules/>',
+        '  <Sites/>',
+        ' </Application>',
+        '</Project>',
+    ])
+
+    with open(pdt_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+    log.info('  auto-generated .pdt with:')
+    log.info('    PyQt5 modules     : %d (%s)', len(pyqt_modules),
+             ', '.join(sorted(pyqt_modules)))
+    log.info('    Stdlib extensions : %d', len(stdlib_exts))
+    log.info('    QRC files         : %d', len(qrc_files))
+    return pdt_path
+
+
 # ─── Step 1 — Preflight ──────────────────────────────────────────────────────
 
 def preflight(args):
@@ -159,13 +383,20 @@ def preflight(args):
         raise SystemExit(f'  ✗ main.py not found at {main_py}')
 
     pdts = sorted(Path(args.project_dir).glob('*.pdt'))
-    if not pdts:
+    if pdts:
+        args.pdt_file = str(pdts[0])
+        log.info('  ✓ .pdt file  : %s (using existing)', args.pdt_file)
+    elif args.no_auto_pdt:
         raise SystemExit(
             f'  ✗ No .pdt file found in {args.project_dir}.\n'
-            f'    pyqtdeploy requires a target file. Generate one with:\n'
-            f'      pip install pyqtdeploy\n'
-            f'      pyqtdeploy myapp.pdt   # opens GUI')
-    args.pdt_file = str(pdts[0])
+            f'    --no-auto-pdt is set, so refusing to auto-generate.\n'
+            f'    Either generate one with `pip install pyqtdeploy && pyqtdeploy myapp.pdt`,\n'
+            f'    or drop --no-auto-pdt to let the builder scaffold one.')
+    else:
+        app_name = args.pdt_app_name or basename(args.project_dir.rstrip('/'))
+        log.info('  no .pdt found — auto-generating from project imports')
+        args.pdt_file = _auto_generate_pdt(args.project_dir, app_name)
+        log.info('  ✓ .pdt file  : %s (auto-generated)', args.pdt_file)
 
     # Verify the project uses PyQt5, not PySide6
     with open(main_py) as f:
@@ -184,7 +415,6 @@ def preflight(args):
 
     log.info('  ✓ project_dir: %s', args.project_dir)
     log.info('  ✓ main.py    : %s', main_py)
-    log.info('  ✓ .pdt file  : %s', args.pdt_file)
     log.info('  ✓ arch       : %s (%s native)', args.arch, ARCH_MAP[args.arch][1])
 
 
@@ -642,6 +872,14 @@ def parse_args():
 
     p.add_argument('--cache-dir', default=str(CACHE_DIR),
                    help=f'Cache directory (default: {CACHE_DIR})')
+
+    pdt_group = p.add_argument_group('.pdt auto-generation')
+    pdt_group.add_argument('--no-auto-pdt', action='store_true',
+                           help='Fail if project has no .pdt (default: auto-generate)')
+    pdt_group.add_argument('--pdt-app-name', default=None,
+                           help='App name for auto-generated .pdt '
+                                '(default: project dir basename)')
+
     p.add_argument('--verbose', '-v', action='store_true',
                    help='Verbose logging')
     return p.parse_args()
