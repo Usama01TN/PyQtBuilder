@@ -451,9 +451,79 @@ def setup_venv(args):
     else:
         log.info('  reusing venv at %s', venv_dir)
 
+    # Patch pyqtdeploy for sip-module 6.x's lowercase sdist naming.  Idempotent
+    # — re-runs against a cached venv that was created before this fix will
+    # apply it (the patch checks for its own marker before editing).
+    _patch_pyqtdeploy_sip_case(str(venv_dir))
+
     log.info('  ✓ pyqtdeploy %s, sip %s, PyQt-builder %s',
              PYQTDEPLOY_VER, SIP_VERSION, PYQT_BUILDER_VER)
     return str(venv_dir), py
+
+
+def _patch_pyqtdeploy_sip_case(venv_dir):
+    """
+    Patch pyqtdeploy 3.3.0's SIP.py for sip-module 6.x's lowercase sdist naming.
+
+    The bug: SIP.py's `get_archive()` runs
+        sip-module --sdist PyQt5.sip --abi-version 12
+    then globs for `PyQt5_sip-12.*.tar.gz` (CamelCase from module_name).  But
+    sip-module 6.x produces `pyqt5_sip-12.14.0.tar.gz` (all lowercase), so the
+    glob finds nothing and pyqtdeploy aborts with:
+        SIP: sip-module didn't create an sdist.
+
+    The fix: lowercase the glob pattern.  This makes it match what sip-module
+    actually produces.  As a bonus, `archive_root` (derived from the archive
+    filename by stripping the extension) will also be lowercase, which matches
+    the lowercase top-level directory inside the tarball — so the subsequent
+    `os.chdir(archive_root)` succeeds without further patches.
+
+    Idempotent via a marker comment.  Doesn't touch SIP.py's `install()` body
+    because nothing there depends on the case of the directory name.
+    """
+    plugin = None
+    for pv in ['3.10', '3.11', '3.12', '3.9', '3.13']:
+        cand = (Path(venv_dir) / 'lib' / f'python{pv}' / 'site-packages'
+                / 'pyqtdeploy' / 'sysroot' / 'plugins' / 'SIP.py')
+        if cand.exists():
+            plugin = cand
+            break
+    if plugin is None:
+        # Last-resort glob (in case site-packages dir layout differs)
+        for cand in Path(venv_dir).glob('lib/python*/site-packages/pyqtdeploy/sysroot/plugins/SIP.py'):
+            plugin = cand
+            break
+    if plugin is None:
+        log.warning('  could not locate pyqtdeploy SIP.py in venv — sdist may fail')
+        return
+
+    content = plugin.read_text()
+    marker = '# PYQT5_BUILDER_LOWERCASE_SDIST_PATCH'
+    if marker in content:
+        log.info('  ✓ pyqtdeploy SIP plugin already patched (lowercase sdist)')
+        return
+
+    old = ("        pattern = '{}-{}.*.tar.gz'.format(\n"
+           "                self.module_name.replace('.', '_'), self.abi_major_version)")
+    new = ("        " + marker + ": sip-module 6.x produces lowercase tarballs\n"
+           "        # (pyqt5_sip-12.14.0.tar.gz) but pyqtdeploy preserved the\n"
+           "        # original CamelCase from module_name.  Lowercase the pattern\n"
+           "        # so it matches sip-module's actual output; archive_root will\n"
+           "        # then also be lowercase, matching the tarball's internal dir.\n"
+           "        pattern = '{}-{}.*.tar.gz'.format(\n"
+           "                self.module_name.replace('.', '_').lower(),\n"
+           "                self.abi_major_version)")
+
+    if old not in content:
+        log.warning('  pyqtdeploy SIP.py format unexpected — case patch not applied')
+        log.warning('    (the script will continue but SIP install will likely fail)')
+        return
+
+    try:
+        plugin.write_text(content.replace(old, new))
+        log.info('  ✓ patched pyqtdeploy SIP plugin at %s', plugin)
+    except OSError as e:
+        log.warning('  could not write patched SIP.py: %s', e)
 
 
 # ─── Step 3 — Acquire Qt 5.15.2 Android (the load-bearing step) ──────────────
