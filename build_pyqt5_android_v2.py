@@ -101,6 +101,26 @@ PYQT5_SDIST_URL = (
     'b8b6e26956ec113ad3f566e02abd12ac3a56b103fcc7e0735e27ee4a1df3/'
     'PyQt5-5.15.10.tar.gz')
 PYQT5_SDIST_SHA = 'd46b7804b1b10a4ff91753f8113e5b5580d2b4462f3226288e2d84497334898a'
+
+# PyQt5 features that aren't compilable when Qt is built for Android.
+# These are guarded by `%If (PyQt_<NAME>)` blocks in PyQt5's .sip files.
+# pyqtdeploy writes the list into bindings_config['disabled-features'],
+# which sip-install applies to every PyQt5 binding (QtCore, QtGui, ...).
+#
+#   PyQt_Desktop_OpenGL — desktop-only OpenGL classes (QOpenGLTimeMonitor,
+#       QOpenGLTimerQuery, QOpenGLFunctions_<version>, QOpenGLVersionProfile,
+#       and related QVector specializations).  Android Qt uses OpenGL ES, so
+#       these classes literally don't exist in <QtGui> on Android; if sip
+#       generates wrappers for them anyway the build fails like
+#         "no member named 'QOpenGLTimeMonitor' in the global namespace"
+#       on every desktop-GL class in QtGui (we hit ~20 such errors).
+#
+# Future additions if other modules break later (e.g. if you add
+# QtPrintSupport): PyQt_PrintDialog, PyQt_PrintPreviewDialog,
+# PyQt_PrintPreviewWidget, PyQt_Printer.
+PYQT5_ANDROID_DISABLED_FEATURES = [
+    'PyQt_Desktop_OpenGL',
+]
 NDK_URL_TPL = 'https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip'
 
 # Cache root (idempotent — re-running picks up where it left off)
@@ -1160,6 +1180,7 @@ def _sysroot_spec(pyqt5_modules):
     """
     modules = sorted(set(pyqt5_modules) | {'QtCore', 'QtGui', 'QtWidgets'})
     modules_toml_list = ', '.join(f'"{m}"' for m in modules)
+    disabled_toml_list = ', '.join(f'"{f}"' for f in PYQT5_ANDROID_DISABLED_FEATURES)
 
     return f'''[Python]
 version = "{PYTHON_VERSION}"
@@ -1177,6 +1198,7 @@ module_name = "PyQt5.sip"
 [PyQt]
 version = "{PYQT_VERSION}"
 installed_modules = [{modules_toml_list}]
+disabled_features = [{disabled_toml_list}]
 '''
 
 
