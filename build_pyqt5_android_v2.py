@@ -61,10 +61,11 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 8  # 2026-05: bullet-proofed .pdt format — auto-gen
-                            # produces TOML, stale XML files are deleted,
-                            # and an existing .pdt is validated to be TOML
-                            # before use (no silent reuse of XML files).
+BUILDER_SCRIPT_VERSION = 9  # 2026-05: dropped tomllib/tomli/toml dependency
+                            # from .pdt validator — Python 3.10 GHA runners
+                            # don't have any of them by default.  XML-format
+                            # detection alone is enough; pyqtdeploy reports
+                            # other format errors clearly itself.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -1301,18 +1302,26 @@ def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
 
 def _validate_or_rewrite_pdt_as_toml(args):
     """
-    Make sure args.pdt_file is a TOML-format project file.
+    Make sure args.pdt_file is NOT in legacy XML format.
 
-    If it contains XML (legacy pyqtdeploy 2.x format), or anything that
-    doesn't parse as TOML, we delete it and regenerate via
-    _auto_generate_pdt — unless --no-auto-pdt is set, in which case we
-    fail fast with an actionable error.
+    pyqtdeploy 3.x parses .pdt files as TOML.  If we hand it a 2.x XML
+    file (e.g. a stale leftover from a previous build, or one bundled in
+    a project zip) it bails out with a cryptic
+        Found invalid character in key name: '?'
+    error from its TOML parser tripping on `<?xml`.  We catch that case
+    here, delete the offending file, and regenerate as TOML via the
+    same auto-gen we use for fresh projects.
 
-    This is a belt-and-braces defense — preflight already attempts to
-    catch XML .pdt files and regenerate, but a .pdt may also arrive via
-    a path we don't control (e.g., bundled in a project zip).  Doing
-    the validation here, right before invoking pyqtdeploy-build, makes
-    every code path safe.
+    We deliberately do NOT try to fully parse the file as TOML to verify
+    correctness — that would require a TOML library (tomllib is 3.11+,
+    tomli/toml aren't installed by default in the GHA runner's outer
+    Python).  Any other format problem is reported clearly by pyqtdeploy
+    itself, so the extra dependency wasn't worth it.
+
+    Belt-and-braces with preflight's XML detection — preflight tries to
+    catch this at startup, but a .pdt may also arrive via a path we
+    don't control.  Validating again right before invocation guarantees
+    we never feed XML into pyqtdeploy-build.
     """
     pdt = Path(args.pdt_file)
     try:
@@ -1321,48 +1330,25 @@ def _validate_or_rewrite_pdt_as_toml(args):
         raise SystemExit(f'  ✗ cannot read .pdt at {pdt}: {e}')
 
     leading = head.lstrip()
-    is_xml = leading.startswith('<?xml') or leading.startswith('<Project')
-
-    if is_xml:
-        log.warning('  ! .pdt at %s is in legacy XML format', pdt)
-        log.warning('    pyqtdeploy 3.x only accepts TOML — regenerating')
-
-        if args.no_auto_pdt:
-            raise SystemExit(
-                f'  ✗ .pdt at {pdt} is XML (pyqtdeploy 2.x format) but\n'
-                f'    --no-auto-pdt was given, so I will not auto-regenerate.\n'
-                f'    Either delete the file (we will scaffold a TOML one) or\n'
-                f'    convert it to TOML manually (open in pyqtdeploy GUI and Save).')
-
-        app_name = args.pdt_app_name or pdt.stem
-        pdt.unlink()
-        # Re-run the auto-generator
-        args.pdt_file = _auto_generate_pdt(args.project_dir, app_name)
-        log.info('  ✓ rewrote as TOML at %s', args.pdt_file)
+    if not (leading.startswith('<?xml') or leading.startswith('<Project')):
+        # Not XML — trust it.  pyqtdeploy itself will surface any other
+        # format issue with a clear error.
         return
 
-    # Not XML — try to parse as TOML to catch other format problems early.
-    try:
-        import tomllib              # 3.11+
-    except ImportError:
-        try:
-            import tomli as tomllib  # 3.10 backport
-        except ImportError:
-            import toml as _toml_legacy
-            try:
-                _toml_legacy.loads(head)
-                return
-            except Exception as e:
-                raise SystemExit(
-                    f'  ✗ .pdt at {pdt} is not valid TOML.\n    {e}')
-    try:
-        tomllib.loads(head)
-    except Exception as e:
+    log.warning('  ! .pdt at %s is in legacy XML format', pdt)
+    log.warning('    pyqtdeploy 3.x only accepts TOML — regenerating')
+
+    if args.no_auto_pdt:
         raise SystemExit(
-            f'  ✗ .pdt at {pdt} is not valid TOML.\n    {e}\n'
-            f'    First 80 chars: {head[:80]!r}\n'
-            f'    Delete the file and re-run; the script will scaffold a\n'
-            f'    clean one (unless --no-auto-pdt is set).')
+            f'  ✗ .pdt at {pdt} is XML (pyqtdeploy 2.x format) but\n'
+            f'    --no-auto-pdt was given, so I will not auto-regenerate.\n'
+            f'    Either delete the file (we will scaffold a TOML one) or\n'
+            f'    convert it to TOML manually (open in pyqtdeploy GUI and Save).')
+
+    app_name = args.pdt_app_name or pdt.stem
+    pdt.unlink()
+    args.pdt_file = _auto_generate_pdt(args.project_dir, app_name)
+    log.info('  ✓ rewrote as TOML at %s', args.pdt_file)
 
 
 # ─── Step 7 — qmake + make + androiddeployqt → APK ──────────────────────────
