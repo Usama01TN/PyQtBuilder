@@ -61,11 +61,11 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 9  # 2026-05: dropped tomllib/tomli/toml dependency
-                            # from .pdt validator — Python 3.10 GHA runners
-                            # don't have any of them by default.  XML-format
-                            # detection alone is enough; pyqtdeploy reports
-                            # other format errors clearly itself.
+BUILDER_SCRIPT_VERSION = 10  # 2026-05: Step 6 (pyqtdeploy-build) now sets the
+                             # same three Android env vars (ANDROID_NDK_ROOT,
+                             # ANDROID_NDK_PLATFORM, ANDROID_SDK_ROOT) that
+                             # Step 5 sets — pyqtdeploy-build's preflight
+                             # checks all three just like sysroot does.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -1281,6 +1281,17 @@ def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
 
     qmake = Path(qt_dir) / 'bin' / 'qmake'
     env = os.environ.copy()
+    # pyqtdeploy-build's preflight requires the SAME three Android env vars
+    # that pyqtdeploy-sysroot does — its `Verifying target architecture
+    # 'android-64'...` step checks all of them and aborts if any is missing:
+    #   * ANDROID_NDK_ROOT     — path to NDK install
+    #   * ANDROID_NDK_PLATFORM — "android-<API>" (just the API level number)
+    #   * ANDROID_SDK_ROOT     — path to SDK install
+    # These are idempotent lookups; _ensure_ndk/_ensure_sdk return cached
+    # paths if the install already exists.
+    env['ANDROID_NDK_ROOT']     = _ensure_ndk()
+    env['ANDROID_NDK_PLATFORM'] = f'android-{ANDROID_API}'
+    env['ANDROID_SDK_ROOT']     = _ensure_sdk()
     # pyqtdeploy-build looks up the sysroot via the qmake's Qt install,
     # but the SYSROOT env var helps in some configurations.
     env['SYSROOT'] = sysroot_dir
