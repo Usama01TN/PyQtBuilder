@@ -47,6 +47,7 @@ import logging
 import multiprocessing
 import os
 import re
+import ast
 import shutil
 import stat
 import subprocess
@@ -61,11 +62,13 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 10  # 2026-05: Step 6 (pyqtdeploy-build) now sets the
-                             # same three Android env vars (ANDROID_NDK_ROOT,
-                             # ANDROID_NDK_PLATFORM, ANDROID_SDK_ROOT) that
-                             # Step 5 sets — pyqtdeploy-build's preflight
-                             # checks all three just like sysroot does.
+BUILDER_SCRIPT_VERSION = 11  # 2026-05: switched .pdt generator to the pyqt-crom
+                             # `entry_point = "pkg.mod:main"` pattern.  Now
+                             # auto-wraps flat main.py into a Python package
+                             # with `def main():` — fixes the GC-of-widgets
+                             # crash where exec_() returned 0 in 175ms and the
+                             # app died with SIGABRT during HWUI teardown.
+                             # Added PyQt_Printer to disabled features.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -124,6 +127,11 @@ PYQT5_SDIST_SHA = 'd46b7804b1b10a4ff91753f8113e5b5580d2b4462f3226288e2d844973348
 # PyQt_PrintPreviewWidget, PyQt_Printer.
 PYQT5_ANDROID_DISABLED_FEATURES = [
     'PyQt_Desktop_OpenGL',
+    # PyQt_Printer: Android has no Qt printer plugin.  The pyqt-crom-main
+    # reference project disables this for android targets — without it,
+    # PyQt5 5.15.10's QtGui bindings reference QPrinter classes that
+    # the Qt-for-Android headers don't declare.
+    'PyQt_Printer',
 ]
 NDK_URL_TPL = 'https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip'
 
@@ -353,83 +361,318 @@ def _find_qrc_files(project_dir):
 
 def _auto_generate_pdt(project_dir, app_name):
     """
-    Generate a TOML .pdt project file at <project_dir>/<app_name>.pdt.
+    Generate a .pdt and rearrange the user's source files into the
+    pyqtdeploy-friendly package layout.
 
-    pyqtdeploy 3.x uses TOML for .pdt files, NOT the legacy XML format.
-    Confirmed by reading pyqtdeploy/project/project.py:_load_toml — it
-    calls toml.load(f) and parses keys like:
+    Why this needs to do more than just write a TOML file
+    -----------------------------------------------------
+    pyqtdeploy 3.x supports two ways to define what code to run:
 
-        version = 0
-        sysroot = "/path/to/sysroot.toml"  (absolute or rel to .pdt dir)
-        sysroots_dir = ""                  (empty → derived from sysroot)
-        parts = ["PyQt5:PyQt5.QtCore", "Python:hashlib", ...]
+      [Application]
+      script = "main.py"             # FORM A — run the script as __main__
+      entry_point = ""
 
-        [Application]
-        name, script, entry_point, is_console, is_bundle,
-        qmake_configuration, syspath
+      OR
 
-        [Application.Package]   (optional)
-        name, exclude, Content
+      [Application]
+      script = ""
+      entry_point = "pkg.mod:main"   # FORM B — import pkg.mod, call mod.main()
 
-    Parts use scoped names: `<component>:<part_name>`.  For PyQt5
-    modules, the part name happens to include "PyQt5." again (because
-    _ALL_PARTS keys are "PyQt5", "PyQt5.QtCore", "PyQt5.QtGui", ...).
-    So the scoped form is "PyQt5:PyQt5.QtCore" — looks redundant, but
-    that's what pyqtdeploy actually expects.
+    FORM A is broken on Android for typical PyQt5 hello-worlds because
+    top-level locals get garbage-collected before app.exec_() can paint.
+    Classic failure mode (we hit this — see crash log analysis):
 
-    Detects:
-      - PyQt5 modules via AST scan of all .py files
-      - Stdlib C extensions (essentials + extras triggered by imports)
+        app = QApplication([])
+        QLabel("Hi").show()    # ← returned label has no ref, GC'd
+        app.exec_()            # ← no live windows → returns 0 immediately
+        # app dies in ~175ms, HWUI render thread races during teardown,
+        # SIGABRT in libc from pthread_mutex_lock on a destroyed mutex.
+
+    FORM B fixes this because `main()`'s local frame holds strong refs
+    to every widget for the entire lifetime of app.exec_().  This is the
+    pattern every working pyqt-crom example uses, e.g.:
+
+        def main():
+            app = QApplication([])
+            main_window = MainWindow()
+            main_window.showMaximized()
+            app.exec()
+
+    What this function does
+    -----------------------
+    1. Ensure a package layout exists:  <project>/<pkg_name>/{__init__.py,main.py}
+       If the user uploaded a flat main.py at the project root, we MOVE
+       it into the package and AST-wrap top-level code in `def main():`.
+       If the package already exists (subsequent runs, or user opted in
+       to the layout themselves), we leave it alone.
+    2. Scan PyQt5 imports across the package to populate `parts`.
+    3. Emit the TOML with `entry_point` (not `script`).
+
+    The generated TOML matches the proven pyqt-crom-main template
+    byte-for-byte in structure.
     """
-    pyqt_modules = _scan_pyqt5_modules(project_dir)
-    stdlib_exts  = _scan_stdlib_extensions(project_dir)
+    project = Path(project_dir)
 
-    pdt_path = join(project_dir, f'{app_name}.pdt')
+    # Step 1 — convert flat layout to package layout (idempotent).
+    pkg_name, module_name = _ensure_package_layout(project, app_name)
+    pkg_dir = project / pkg_name
 
-    # Pick the entry script.  main.py is the convention; we fall back
-    # if needed but never silently make up a path.
-    script = 'main.py'
-    for candidate in ('main.py', 'app.py', '__main__.py'):
-        if exists(join(project_dir, candidate)):
-            script = candidate
-            break
+    # Step 2 — scan the PACKAGE (not just project root) for PyQt5 imports.
+    pyqt_modules = _scan_pyqt5_modules(str(pkg_dir))
+    if not pyqt_modules:
+        # Fallback to scanning whole project in case user has other helper
+        # files at project root (we still bundle them via Application.Package).
+        pyqt_modules = _scan_pyqt5_modules(project_dir)
+    pyqt_modules = sorted(set(pyqt_modules) | {'QtCore', 'QtGui', 'QtWidgets'})
 
-    # Path to the sysroot.toml (generated by build_sysroot in Step 5).
-    # Absolute path so it works regardless of where .pdt is invoked from.
+    # Step 3 — emit the .pdt
+    pdt_path = project / f'{app_name}.pdt'
     sysroot_toml_abs = str(CACHE_DIR / 'sysroot' / 'sysroot.toml')
 
-    # Build the parts list with scoped names.
-    parts_lines = []
-    for m in sorted(pyqt_modules):
-        parts_lines.append(f'    "PyQt5:PyQt5.{m}",')
-    for e in sorted(stdlib_exts):
-        parts_lines.append(f'    "Python:{e}",')
+    # Parts: pyqt-crom uses scoped form "PyQt:PyQt5.QtCore" — note PyQt
+    # (no '5') as the component scope.  Verified across all working
+    # examples (demo, graphics, bluetooth_scanner, database).
+    parts = [f'PyQt:PyQt5.{m}' for m in pyqt_modules]
+    parts.append('Python:logging')  # widely useful for app-side logging
 
-    parts_block = '[\n' + '\n'.join(parts_lines) + '\n]' if parts_lines else '[]'
+    parts_toml = ', '.join(f'"{p}"' for p in parts)
+
+    # Build the [[Application.Package.Content]] entries.  We only need
+    # to list the files that are visible at the top of the package dir.
+    pkg_files = sorted(p.name for p in pkg_dir.iterdir() if p.is_file())
+    content_blocks = []
+    for fname in pkg_files:
+        content_blocks.append(
+            '[[Application.Package.Content]]\n'
+            f'name = "{fname}"\n'
+            'included = true\n'
+            'is_directory = false\n'
+        )
+    content_section = '\n'.join(content_blocks)
 
     pdt_content = f'''version = 0
 sysroot = "{sysroot_toml_abs}"
 sysroots_dir = ""
-parts = {parts_block}
+parts = [ {parts_toml},]
 
 [Application]
-entry_point = ""
-is_bundle = false
+entry_point = "{pkg_name}.{module_name}:main"
 is_console = false
+is_bundle = false
 name = "{app_name}"
 qmake_configuration = ""
-script = "{script}"
+script = ""
 syspath = ""
+
+[Application.Package]
+name = "{pkg_name}"
+exclude = [ "*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi", "__pycache__", "*-info", "EGG_INFO", "*.so",]
+{content_section}
 '''
 
-    with open(pdt_path, 'w') as f:
-        f.write(pdt_content)
+    pdt_path.write_text(pdt_content)
 
-    log.info('  auto-generated .pdt (TOML) at %s with:', pdt_path)
-    log.info('    PyQt5 modules     : %d (%s)', len(pyqt_modules),
-             ', '.join(sorted(pyqt_modules)))
-    log.info('    Stdlib extensions : %d', len(stdlib_exts))
-    log.info('    entry script      : %s', script)
+    log.info('  auto-generated .pdt (TOML, pyqt-crom layout) at %s with:', pdt_path)
+    log.info('    package          : %s/', pkg_name)
+    log.info('    entry_point      : %s.%s:main', pkg_name, module_name)
+    log.info('    PyQt5 modules    : %d (%s)', len(pyqt_modules), ', '.join(pyqt_modules))
+    log.info('    package files    : %d (%s)', len(pkg_files), ', '.join(pkg_files))
+    return str(pdt_path)
+
+
+def _ensure_package_layout(project_dir, app_name):
+    """
+    Make sure the user's source code is arranged as a Python package
+    that pyqtdeploy's entry_point system can consume.
+
+    BEFORE (typical user upload):
+        project_dir/
+        ├── main.py                  ← script-style, top-level code
+        └── (other files)
+
+    AFTER:
+        project_dir/
+        ├── <pkg>/
+        │   ├── __init__.py          ← empty marker
+        │   └── main.py              ← code wrapped in def main():
+        └── (other files unchanged)
+
+    The transformation is idempotent — if <pkg>/ already exists with
+    the right shape we leave it alone.  This means re-running the
+    builder against the same project_dir is a no-op once it's been
+    converted once.
+
+    Returns (pkg_name, module_name).
+    """
+    project = Path(project_dir)
+
+    # Naming derived from app_name.  e.g. "testapp" → "testapp_pkg".
+    # Strip anything that isn't a valid Python identifier character.
+    base = re.sub(r'[^a-zA-Z0-9_]', '_', app_name.lower())
+    pkg_name = f'{base}_pkg'
+    module_name = 'main'
+    pkg_dir = project / pkg_name
+
+    # Already converted?
+    if (pkg_dir.is_dir()
+            and (pkg_dir / '__init__.py').exists()
+            and (pkg_dir / f'{module_name}.py').exists()):
+        log.info('  ✓ package layout already exists at %s/', pkg_name)
+        return pkg_name, module_name
+
+    # Find the source script to move.  main.py is the convention; fall
+    # back to other common names without making up paths.
+    src_script = None
+    for candidate in ('main.py', 'app.py', '__main__.py'):
+        cand_path = project / candidate
+        if cand_path.exists() and cand_path.is_file():
+            src_script = cand_path
+            break
+    if src_script is None:
+        # Last resort: a single .py file at project root.
+        py_files = [p for p in project.glob('*.py') if p.is_file()]
+        if len(py_files) == 1:
+            src_script = py_files[0]
+        elif not py_files:
+            raise SystemExit(
+                f'  ✗ No Python source files found in {project}.\n'
+                f'    The builder needs at least main.py at the project root.')
+        else:
+            raise SystemExit(
+                f'  ✗ Cannot determine the entry script: {len(py_files)} .py\n'
+                f'    files at project root: {[p.name for p in py_files]}.\n'
+                f'    Rename one to main.py, or pre-create the package layout\n'
+                f'    yourself: {pkg_name}/__init__.py + {pkg_name}/main.py')
+
+    src_text = src_script.read_text(encoding='utf-8', errors='replace')
+
+    # AST-wrap top-level code in def main() if it isn't already.
+    wrapped_text = _wrap_in_def_main(src_text)
+
+    # Move the file into the package.
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / '__init__.py').write_text('')
+    (pkg_dir / f'{module_name}.py').write_text(wrapped_text)
+
+    # Remove the original flat-layout script so pyqtdeploy doesn't see
+    # two copies and get confused.  Keep a small note so the user sees
+    # what happened if they look at the workspace.
+    note = (
+        f'# Original {src_script.name} was moved into {pkg_name}/{module_name}.py\n'
+        f'# and top-level code was wrapped in def main() to fix the GC-eats-widget\n'
+        f'# bug that prevented PyQt5 apps from running on Android.\n')
+    src_script.unlink()
+    (project / f'.{src_script.name}.moved').write_text(note)
+
+    log.info('  ✓ created package layout %s/ from %s', pkg_name, src_script.name)
+    log.info('    wrapped top-level code in def main() (fixes GC-of-widgets crash)')
+    return pkg_name, module_name
+
+
+def _wrap_in_def_main(source):
+    """
+    Wrap top-level executable code in `def main(): ...`.
+
+    Pure-AST transform.  Hoistable nodes (imports, function defs, class
+    defs, __future__ pragmas, UPPERCASE constant assignments) stay at
+    module level.  Everything else moves into the body of a new main()
+    function — so that local variables like `app = QApplication(...)`
+    and `window = QMainWindow()` hold strong references throughout
+    app.exec_() and don't get GC'd.
+
+    Idempotent — if a top-level `def main()` already exists, leave the
+    source alone (just add `if __name__ == "__main__": main()` if it's
+    missing, so the file is still runnable for desktop testing).
+
+    Fails open: if the source is unparseable, return it unchanged and
+    let pyqtdeploy surface the syntax error naturally.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    # Does a top-level `def main()` already exist?
+    has_main_func = any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == 'main'
+        for n in tree.body
+    )
+
+    # Detect existing `if __name__ == "__main__":` guard
+    def is_name_main_guard(n):
+        if not isinstance(n, ast.If):
+            return False
+        try:
+            txt = ast.unparse(n.test)
+        except Exception:
+            return False
+        return '__name__' in txt and '__main__' in txt
+    has_main_guard = any(is_name_main_guard(n) for n in tree.body)
+
+    if has_main_func:
+        # Already structured.  Make sure there's an `if __name__` guard
+        # so the file runs standalone on a desktop too (helpful for
+        # debugging before re-running the build).
+        if not has_main_guard:
+            return (source.rstrip()
+                    + '\n\n\nif __name__ == "__main__":\n    main()\n')
+        return source
+
+    # No top-level main() — we need to wrap.
+    # Partition nodes:
+    #   - HOIST: imports, function defs, class defs, __future__ stuff,
+    #            UPPERCASE module-level constants — stay at module level.
+    #   - WRAP : everything else — moves into def main() body.
+    HOISTABLE_TYPES = (ast.Import, ast.ImportFrom, ast.FunctionDef,
+                       ast.AsyncFunctionDef, ast.ClassDef)
+
+    def is_uppercase_const_assign(n):
+        if not isinstance(n, ast.Assign):
+            return False
+        return all(isinstance(t, ast.Name) and t.id.isupper() for t in n.targets)
+
+    def is_existing_main_guard(n):
+        return is_name_main_guard(n)
+
+    hoisted, wrapped_body = [], []
+    for n in tree.body:
+        if isinstance(n, HOISTABLE_TYPES) or is_uppercase_const_assign(n):
+            hoisted.append(n)
+        elif is_existing_main_guard(n):
+            # Drop any existing __main__ guard — we'll re-emit a clean one.
+            continue
+        else:
+            wrapped_body.append(n)
+
+    if not wrapped_body:
+        # File only has imports + class/function defs.  Add a tiny stub
+        # so pyqtdeploy has a callable entry point.
+        return (source.rstrip()
+                + '\n\n\ndef main():\n    pass\n\n\n'
+                + 'if __name__ == "__main__":\n    main()\n')
+
+    # Build the new source.  ast.unparse() is 3.9+; we require 3.9+ in
+    # the workflow already (we use Python 3.10 in CI for the builder
+    # script's own interpreter).
+    preamble = '\n'.join(ast.unparse(n) for n in hoisted)
+    body_text = '\n'.join(ast.unparse(n) for n in wrapped_body)
+    # Indent the body for inclusion inside `def main():`
+    indented_body = '\n'.join('    ' + line if line.strip() else ''
+                              for line in body_text.splitlines())
+
+    new_source = (
+        '# Auto-wrapped by build_pyqt5_android.py: top-level code moved\n'
+        '# into def main() so local variables hold strong references to\n'
+        '# widgets throughout app.exec_().  Without this, PyQt5 apps on\n'
+        '# Android exit immediately with rc=0 because Python GC eats the\n'
+        '# widgets before exec_() can paint them.\n\n'
+        + preamble
+        + '\n\n\ndef main():\n'
+        + indented_body
+        + '\n\n\nif __name__ == "__main__":\n'
+        + '    main()\n'
+    )
+    return new_source
     log.info('    sysroot.toml path : %s', sysroot_toml_abs)
     return pdt_path
 
