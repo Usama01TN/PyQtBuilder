@@ -62,21 +62,36 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 11  # 2026-05: switched .pdt generator to the pyqt-crom
-                             # `entry_point = "pkg.mod:main"` pattern.  Now
-                             # auto-wraps flat main.py into a Python package
-                             # with `def main():` — fixes the GC-of-widgets
-                             # crash where exec_() returned 0 in 175ms and the
-                             # app died with SIGABRT during HWUI teardown.
-                             # Added PyQt_Printer to disabled features.
+BUILDER_SCRIPT_VERSION = 12  # 2026-05: aligned all versions with pyqt-crom-main
+                             # reference (Python 3.10.12, sip 6.7.12,
+                             # PyQt-builder 1.15.3).  sip 6.7.x produces
+                             # CamelCase sdist tarballs so the previous
+                             # lowercase-only SIP.py patch is upgraded to
+                             # match both casings.  Sysroot cache invalidated
+                             # in workflow (pyqt5-sysroot-..-v2) because
+                             # cached sysroot has Python 3.10.14 binaries.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
 PYQT_VERSION     = '5.15.10'
-SIP_VERSION      = '6.8.3'
-PYQT_BUILDER_VER = '1.16.3'      # pip package "PyQt-builder"
+# Pinned to pyqt-crom-main's reference.  Empirical finding: both sip
+# 6.7.12 AND 6.8.3 emit lowercase sdist names (pyqt5_sip-12.13.0.tar.gz
+# and pyqt5_sip-12.14.0.tar.gz respectively), but pyqtdeploy 3.3.0's
+# hardcoded glob pattern is CamelCase — so the SIP.py case-insensitive
+# patch in _patch_pyqtdeploy_sip_case() is needed regardless of sip
+# version.  Pinning 6.7.12 matches pyqt-crom's tested combo.
+SIP_VERSION      = '6.7.12'
+# PyQt-builder 1.15.3 matches pyqt-crom-main.  1.16.x has minor feature
+# additions; staying on the reference version reduces moving parts.
+PYQT_BUILDER_VER = '1.15.3'      # pip package "PyQt-builder"
 PYQTDEPLOY_VER   = '3.3.0'
-PYTHON_VERSION   = '3.10.14'
+
+# Python source.  pyqt-crom uses 3.10.12 (per their
+# utils/resources/download_sources.sh).  We pinned 3.10.14 earlier on
+# a hunch; switching to 3.10.12 matches the working reference exactly.
+# pyqtdeploy's Manifest-based incremental rebuild will rebuild Python
+# in the sysroot on first run after this change (~10-15 min once).
+PYTHON_VERSION   = '3.10.12'
 ANDROID_API      = 28
 NDK_VERSION      = '21.4.7075529'
 BUILD_TOOLS_VER  = '28.0.3'
@@ -816,30 +831,72 @@ def _patch_pyqtdeploy_sip_case(venv_dir):
         return
 
     content = plugin.read_text()
-    marker = '# PYQT5_BUILDER_LOWERCASE_SDIST_PATCH'
+    marker = '# PYQT5_BUILDER_SIP_CASE_FIX_V2'
+    legacy_marker = '# PYQT5_BUILDER_LOWERCASE_SDIST_PATCH'
+
     if marker in content:
-        log.info('  ✓ pyqtdeploy SIP plugin already patched (lowercase sdist)')
+        log.info('  ✓ pyqtdeploy SIP plugin already patched (case-insensitive)')
         return
+
+    # If a legacy v1 (lowercase-only) patch is present, we need to revert
+    # it first so we can apply the better v2 case-insensitive version.
+    # v1 hard-coded lowercase, which would BREAK with sip 6.7.12 since
+    # 6.7.12 produces CamelCase (PyQt5_sip-12.13.0.tar.gz).
+    if legacy_marker in content:
+        log.info('  reverting legacy v1 SIP patch to apply v2 (case-insensitive)')
+        v1_block = (
+            "        " + legacy_marker + ": sip-module 6.x produces lowercase tarballs\n"
+            "        # (pyqt5_sip-12.14.0.tar.gz) but pyqtdeploy preserved the\n"
+            "        # original CamelCase from module_name.  Lowercase the pattern\n"
+            "        # so it matches sip-module's actual output; archive_root will\n"
+            "        # then also be lowercase, matching the tarball's internal dir.\n"
+            "        pattern = '{}-{}.*.tar.gz'.format(\n"
+            "                self.module_name.replace('.', '_').lower(),\n"
+            "                self.abi_major_version)")
+        v1_restored = ("        pattern = '{}-{}.*.tar.gz'.format(\n"
+                       "                self.module_name.replace('.', '_'), self.abi_major_version)")
+        if v1_block in content:
+            content = content.replace(v1_block, v1_restored)
+        else:
+            log.warning('  legacy v1 patch present but not in expected form — skipping revert')
 
     old = ("        pattern = '{}-{}.*.tar.gz'.format(\n"
-           "                self.module_name.replace('.', '_'), self.abi_major_version)")
-    new = ("        " + marker + ": sip-module 6.x produces lowercase tarballs\n"
-           "        # (pyqt5_sip-12.14.0.tar.gz) but pyqtdeploy preserved the\n"
-           "        # original CamelCase from module_name.  Lowercase the pattern\n"
-           "        # so it matches sip-module's actual output; archive_root will\n"
-           "        # then also be lowercase, matching the tarball's internal dir.\n"
+           "                self.module_name.replace('.', '_'), self.abi_major_version)\n"
+           "        archives = glob.glob(pattern)")
+    new = ("        " + marker + ": match BOTH casings so this works\n"
+           "        # regardless of sip version:\n"
+           "        #   sip 6.7.x: PyQt5_sip-12.13.0.tar.gz (CamelCase)\n"
+           "        #   sip 6.8.x: pyqt5_sip-12.14.0.tar.gz (lowercase, PEP 625)\n"
+           "        # If we matched only one casing we'd silently break the other.\n"
            "        pattern = '{}-{}.*.tar.gz'.format(\n"
-           "                self.module_name.replace('.', '_').lower(),\n"
-           "                self.abi_major_version)")
+           "                self.module_name.replace('.', '_'), self.abi_major_version)\n"
+           "        archives = glob.glob(pattern) + glob.glob(pattern.lower())")
 
     if old not in content:
-        log.warning('  pyqtdeploy SIP.py format unexpected — case patch not applied')
-        log.warning('    (the script will continue but SIP install will likely fail)')
-        return
+        # Try without the glob line being on the same patch — maybe it's
+        # already partially modified.
+        old_alt = ("        pattern = '{}-{}.*.tar.gz'.format(\n"
+                   "                self.module_name.replace('.', '_'), self.abi_major_version)")
+        if old_alt in content:
+            new_alt = ("        " + marker + ": match BOTH casings (CamelCase from sip 6.7.x,\n"
+                       "        # lowercase from sip 6.8.x PEP-625).\n"
+                       "        pattern = '{}-{}.*.tar.gz'.format(\n"
+                       "                self.module_name.replace('.', '_'), self.abi_major_version)")
+            content = content.replace(old_alt, new_alt)
+            # Patch the subsequent glob.glob() call too
+            content = content.replace(
+                'archives = glob.glob(pattern)',
+                'archives = glob.glob(pattern) + glob.glob(pattern.lower())', 1)
+        else:
+            log.warning('  pyqtdeploy SIP.py format unexpected — case patch not applied')
+            log.warning('    (the script will continue but SIP install may fail)')
+            return
+    else:
+        content = content.replace(old, new)
 
     try:
-        plugin.write_text(content.replace(old, new))
-        log.info('  ✓ patched pyqtdeploy SIP plugin at %s', plugin)
+        plugin.write_text(content)
+        log.info('  ✓ patched pyqtdeploy SIP plugin at %s (case-insensitive)', plugin)
     except OSError as e:
         log.warning('  could not write patched SIP.py: %s', e)
 
