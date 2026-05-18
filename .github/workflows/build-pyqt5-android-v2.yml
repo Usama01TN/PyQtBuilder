@@ -121,7 +121,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.PYQT5_BUILDER_CACHE }}/sysroot
-          key: pyqt5-sysroot-${{ env.ARCH }}-v1
+          # v2: bumped because we aligned versions with pyqt-crom-main
+          # (Python 3.10.14 → 3.10.12, sip 6.8.3 → 6.7.12).  Cached
+          # sysroot from v1 has the old binaries.  pyqtdeploy's Manifest
+          # would detect the mismatch and rebuild Python+SIP+PyQt anyway,
+          # but starting from a clean cache key is faster and avoids any
+          # half-state from earlier builder iterations.
+          key: pyqt5-sysroot-${{ env.ARCH }}-v2
 
       - name: Cache NDK r21e
         uses: actions/cache@v4
