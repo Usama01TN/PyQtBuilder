@@ -62,14 +62,12 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 12  # 2026-05: aligned all versions with pyqt-crom-main
-                             # reference (Python 3.10.12, sip 6.7.12,
-                             # PyQt-builder 1.15.3).  sip 6.7.x produces
-                             # CamelCase sdist tarballs so the previous
-                             # lowercase-only SIP.py patch is upgraded to
-                             # match both casings.  Sysroot cache invalidated
-                             # in workflow (pyqt5-sysroot-..-v2) because
-                             # cached sysroot has Python 3.10.14 binaries.
+BUILDER_SCRIPT_VERSION = 13  # 2026-05: preflight now re-locates main.py after
+                             # the package-layout transform (which moves
+                             # main.py from project root into <pkg>/main.py).
+                             # Previously preflight kept the old path and the
+                             # subsequent PySide6 import check tried to read
+                             # the deleted file.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -703,9 +701,23 @@ def preflight(args):
     if not os.path.isdir(args.project_dir):
         raise SystemExit(f'  ✗ Project dir not found: {args.project_dir}')
 
+    # main.py may live at the project root (typical first run) OR inside
+    # a package subdirectory like <project>/<pkg>/main.py (subsequent
+    # runs after _ensure_package_layout has done its work).  Accept both.
     main_py = join(args.project_dir, 'main.py')
     if not exists(main_py):
-        raise SystemExit(f'  ✗ main.py not found at {main_py}')
+        candidates = sorted(Path(args.project_dir).rglob('main.py'))
+        candidates = [
+            p for p in candidates
+            if not any(part.startswith('.') or part in {'venv', '.venv', 'build', '__pycache__'}
+                       for part in p.parts)
+        ]
+        if not candidates:
+            raise SystemExit(
+                f'  ✗ main.py not found at {main_py} or anywhere under {args.project_dir}.\n'
+                f'    The builder expects a Python entry script named main.py.')
+        main_py = str(candidates[0])
+        log.debug('  main.py found inside package: %s', main_py)
 
     pdts = sorted(Path(args.project_dir).glob('*.pdt'))
 
@@ -742,7 +754,26 @@ def preflight(args):
         args.pyqt5_modules = sorted(_scan_pyqt5_modules(args.project_dir))
         log.info('  ✓ .pdt file  : %s (auto-generated)', args.pdt_file)
 
-    # Verify the project uses PyQt5, not PySide6
+    # Verify the project uses PyQt5, not PySide6.  Note: by this point
+    # _auto_generate_pdt may have moved main.py from <project>/main.py
+    # into <project>/<pkg>/main.py (the package layout transform).  We
+    # re-locate it before the import check.
+    if not exists(main_py):
+        candidates = sorted(Path(args.project_dir).rglob('main.py'))
+        # Skip anything inside hidden dirs, venvs, build outputs, etc.
+        candidates = [
+            p for p in candidates
+            if not any(part.startswith('.') or part in {'venv', '.venv', 'build', '__pycache__'}
+                       for part in p.parts)
+        ]
+        if candidates:
+            main_py = str(candidates[0])
+            log.debug('  re-located main.py after package layout: %s', main_py)
+        else:
+            raise SystemExit(
+                f'  ✗ main.py disappeared after auto-gen.  Looked under {args.project_dir}.\n'
+                f'    This is a bug — please report.')
+
     with open(main_py) as f:
         src = f.read()
     if 'PySide6' in src or 'PySide2' in src:
