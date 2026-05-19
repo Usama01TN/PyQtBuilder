@@ -62,13 +62,16 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 17  # 2026-05: full path-naming alignment with
-                             # pyqtdeploy 3.3.0's `sysroot-<target>` layout.
-                             # Both the build_sysroot cache check AND the
-                             # run_pyqtdeploy symlink now use the prefixed
-                             # form, eliminating the mismatch where
-                             # pyqtdeploy-build couldn't find the sysroot
-                             # at <project>/sysroot-android-64.
+BUILDER_SCRIPT_VERSION = 18  # 2026-05: sysroot cache self-heals on poisoned
+                             # state.  Marker check now verifies key binaries
+                             # (host/bin/python3.10, host/bin/sip-build,
+                             # include/python3.10/Python.h) actually exist
+                             # instead of trusting the marker file alone.
+                             # If pyqtdeploy-sysroot completes "successfully"
+                             # but skips Python because of a stale Manifest
+                             # claim, we retry with --force after deleting
+                             # the Manifest.  Fixes the
+                             # "<sysroot>/host/bin/python3.10 ENOENT" error.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -1499,9 +1502,26 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
     # path doesn't fall through to the fallback finder on every run.
     sysroot_dir = sysroots_parent / f'sysroot-{args.arch}'
     marker = sysroot_dir / '.sysroot-complete'
+
+    # Cache fast-path — but only if the sysroot ACTUALLY contains the
+    # binaries we depend on.  A poisoned cache (marker present but
+    # contents stale or incomplete) caused a confusing failure in
+    # pyqtdeploy-build: it tried to exec <sysroot>/host/bin/python3.10
+    # and got ENOENT.  Verify before trusting the marker.
     if marker.exists():
-        log.info('  ✓ sysroot already built: %s', sysroot_dir)
-        return str(sysroot_dir)
+        missing = _sysroot_missing_files(sysroot_dir)
+        if not missing:
+            log.info('  ✓ sysroot already built: %s', sysroot_dir)
+            return str(sysroot_dir)
+        log.warning('  ! marker says complete but %d expected file(s) missing:',
+                    len(missing))
+        for f in missing:
+            log.warning('      missing: %s', f)
+        log.warning('  ! treating as poisoned cache — will rebuild from scratch')
+        try:
+            marker.unlink()
+        except OSError:
+            pass
 
     sysroots_parent.mkdir(parents=True, exist_ok=True)
     sources_dir = CACHE_DIR / 'sysroot-sources'
@@ -1603,9 +1623,95 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
                     f'    Contents of {sysroots_parent}:\n'
                     + '\n'.join(f'      {p.name}' for p in sysroots_parent_kids))
 
+    # Completeness check — pyqtdeploy may have exited 0 while skipping
+    # components whose Manifest entries claim "already installed" (e.g.
+    # when a cache from an earlier builder version is restored).  In
+    # that case ONLY the new components (we recently added [zlib]) get
+    # processed.  The result is a sysroot missing host/bin/python3.10,
+    # which pyqtdeploy-build later fails on with ENOENT.
+    missing = _sysroot_missing_files(sysroot_dir)
+    if missing:
+        log.warning('  ! pyqtdeploy-sysroot exited 0 but %d expected file(s) missing:',
+                    len(missing))
+        for f in missing:
+            log.warning('      missing: %s', f)
+        log.info('  ↻ retrying with --force to rebuild ALL components')
+
+        # Clear the Manifest so pyqtdeploy starts fresh.  Belt-and-braces
+        # with --force; some versions of pyqtdeploy honour --force only
+        # if the Manifest is absent.
+        manifest = sysroot_dir / 'Manifest'
+        if manifest.exists():
+            log.info('  removing stale Manifest at %s', manifest)
+            manifest.unlink()
+
+        cmd_force = cmd + ['--force']
+        # Insert --force before the positional spec_file argument so we
+        # don't have it after a positional (some argparse setups choke).
+        cmd_force = [
+            str(sysroot_bin),
+            '--force',
+            '--source-dir',   str(sources_dir),
+            '--sysroots-dir', str(sysroots_parent),
+            '--qmake',        str(qmake),
+            '--target',       args.arch,
+            '--jobs',         str(nproc),
+            '--verbose',
+            str(spec_file),
+        ]
+        run(cmd_force, env=env)
+
+        # Verify again — if still missing, something is fundamentally
+        # broken (likely a build-time failure that pyqtdeploy silently
+        # downgraded to a warning).  Bail out with diagnostics.
+        missing = _sysroot_missing_files(sysroot_dir)
+        if missing:
+            raise SystemExit(
+                f'  ✗ pyqtdeploy-sysroot --force ran successfully but the sysroot\n'
+                f'    is STILL incomplete.  Missing files:\n'
+                + '\n'.join(f'      {f}' for f in missing) + '\n'
+                f'    This usually means a host/target build failed silently.\n'
+                f'    Check the pyqtdeploy-sysroot output above for compiler\n'
+                f'    errors.  You may need to clear the GHA cache key\n'
+                f'    pyqt5-sysroot-{args.arch}-v2 to force a clean rebuild.')
+
     (sysroot_dir / '.sysroot-complete').touch()
     log.info('  ✓ sysroot built at %s', sysroot_dir)
     return str(sysroot_dir)
+
+
+def _sysroot_missing_files(sysroot_dir):
+    """
+    Return a list of EXPECTED files that don't exist in the sysroot.
+
+    These are paths pyqtdeploy-build will invoke or `#include` from
+    during the freeze step.  If any are missing the sysroot is unusable
+    even if pyqtdeploy-sysroot reported success.
+
+    The most important is the host Python interpreter — pyqtdeploy-build
+    runs it directly to execute freeze.py.  If that's missing, the
+    failure is loud and reproducible (the symptom that brought us here).
+    """
+    sysroot = Path(sysroot_dir)
+    py_maj_min = f'{PYTHON_VERSION.rsplit(".", 1)[0]}'   # "3.10"
+    expected = [
+        # Host interpreter — used by pyqtdeploy-build to run freeze.py
+        sysroot / 'host' / 'bin' / f'python{py_maj_min}',
+        # Host SIP build tools — needed for generating PyQt5 sip C++ sources
+        sysroot / 'host' / 'bin' / 'sip-build',
+        # Target Python headers — needed for the cross-compile
+        sysroot / 'include' / f'python{py_maj_min}' / 'Python.h',
+    ]
+    missing = [p for p in expected if not p.exists()]
+
+    # Special case the bin dir: pyqtdeploy may install a `python3` symlink
+    # instead of `python3.10`.  If the major-minor version isn't there
+    # but `python3` is, that's still fine for our purposes.
+    if any('host/bin/python' in str(p) for p in missing):
+        py3 = sysroot / 'host' / 'bin' / 'python3'
+        if py3.exists():
+            missing = [p for p in missing if 'host/bin/python' not in str(p)]
+    return missing
 
 
 def _sysroot_spec(pyqt5_modules):
