@@ -62,16 +62,15 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 18  # 2026-05: sysroot cache self-heals on poisoned
-                             # state.  Marker check now verifies key binaries
-                             # (host/bin/python3.10, host/bin/sip-build,
-                             # include/python3.10/Python.h) actually exist
-                             # instead of trusting the marker file alone.
-                             # If pyqtdeploy-sysroot completes "successfully"
-                             # but skips Python because of a stale Manifest
-                             # claim, we retry with --force after deleting
-                             # the Manifest.  Fixes the
-                             # "<sysroot>/host/bin/python3.10 ENOENT" error.
+BUILDER_SCRIPT_VERSION = 19  # 2026-05: simplified _sysroot_missing_files to
+                             # only check the host Python interpreter.  v18
+                             # incorrectly required host/bin/sip-build and
+                             # include/python3.10/Python.h inside the sysroot,
+                             # but sip-build lives in the venv (it's the PIP
+                             # tool) and Python.h is placed by pyqtdeploy in
+                             # locations that vary with target Python config.
+                             # The host Python interpreter is the only file
+                             # pyqtdeploy-build directly execs from the sysroot.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -1682,36 +1681,52 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
 
 def _sysroot_missing_files(sysroot_dir):
     """
-    Return a list of EXPECTED files that don't exist in the sysroot.
+    Return a list of files pyqtdeploy-build will fail without.
 
-    These are paths pyqtdeploy-build will invoke or `#include` from
-    during the freeze step.  If any are missing the sysroot is unusable
-    even if pyqtdeploy-sysroot reported success.
+    Background — what to check, what not to
+    ----------------------------------------
+    The previous version of this check required `host/bin/sip-build`
+    and `include/python3.10/Python.h` inside the sysroot, but those
+    aren't actually placed there by pyqtdeploy:
 
-    The most important is the host Python interpreter — pyqtdeploy-build
-    runs it directly to execute freeze.py.  If that's missing, the
-    failure is loud and reproducible (the symptom that brought us here).
+      • `sip-build` is the host-side PIP tool from the `sip` package
+        we installed in the venv (`pip install sip==6.7.12`).  It
+        lives at <venv>/bin/sip-build, not in the sysroot.
+
+      • `Python.h` for the target ends up in the cross-compiled
+        Python's include tree, typically at
+        <sysroot>/lib/python3.10/site-packages/... or
+        <sysroot>/lib/cmake/... depending on how the target Python
+        was configured.  pyqtdeploy itself will surface a clear
+        error if it can't find this — we shouldn't second-guess.
+
+    The ONE file pyqtdeploy-build genuinely cannot proceed without
+    is the host Python interpreter — it execs
+
+        <sysroot>/host/bin/python<X>.<Y> -OO freeze.py jobs.csv
+
+    directly, and a missing interpreter is an ENOENT that doesn't
+    bubble up as a useful error message (the symptom that brought
+    us here in the first place).  So we check JUST that.
+
+    Returns:
+      list of `Path` objects for files that should exist but don't.
+      Empty list means "good to go".
     """
     sysroot = Path(sysroot_dir)
-    py_maj_min = f'{PYTHON_VERSION.rsplit(".", 1)[0]}'   # "3.10"
-    expected = [
-        # Host interpreter — used by pyqtdeploy-build to run freeze.py
-        sysroot / 'host' / 'bin' / f'python{py_maj_min}',
-        # Host SIP build tools — needed for generating PyQt5 sip C++ sources
-        sysroot / 'host' / 'bin' / 'sip-build',
-        # Target Python headers — needed for the cross-compile
-        sysroot / 'include' / f'python{py_maj_min}' / 'Python.h',
-    ]
-    missing = [p for p in expected if not p.exists()]
+    py_maj_min = PYTHON_VERSION.rsplit('.', 1)[0]   # "3.10.12" → "3.10"
 
-    # Special case the bin dir: pyqtdeploy may install a `python3` symlink
-    # instead of `python3.10`.  If the major-minor version isn't there
-    # but `python3` is, that's still fine for our purposes.
-    if any('host/bin/python' in str(p) for p in missing):
-        py3 = sysroot / 'host' / 'bin' / 'python3'
-        if py3.exists():
-            missing = [p for p in missing if 'host/bin/python' not in str(p)]
-    return missing
+    # Accept any of: python3.10, python3.X (without minor), python3
+    # pyqtdeploy normally installs python<maj>.<min> but some configs
+    # link python3 as well.
+    candidates = [
+        sysroot / 'host' / 'bin' / f'python{py_maj_min}',
+        sysroot / 'host' / 'bin' / f'python{py_maj_min.split(".")[0]}',
+        sysroot / 'host' / 'bin' / 'python',
+    ]
+    if any(c.exists() for c in candidates):
+        return []   # host Python is present somewhere expected
+    return [candidates[0]]   # report the canonical path as missing
 
 
 def _sysroot_spec(pyqt5_modules):
