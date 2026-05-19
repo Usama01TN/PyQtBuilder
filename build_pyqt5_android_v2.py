@@ -62,13 +62,13 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 15  # 2026-05: preflight now scans ALL .py files under
-                             # the project (not just files literally named
-                             # main.py) so the PySide6 import check survives
-                             # the package-layout transform's rename to
-                             # <app>_app.py.  Added _project_python_sources
-                             # helper that excludes venvs/build outputs/hidden
-                             # dirs while keeping the auto-generated *_pkg/.
+BUILDER_SCRIPT_VERSION = 17  # 2026-05: full path-naming alignment with
+                             # pyqtdeploy 3.3.0's `sysroot-<target>` layout.
+                             # Both the build_sysroot cache check AND the
+                             # run_pyqtdeploy symlink now use the prefixed
+                             # form, eliminating the mismatch where
+                             # pyqtdeploy-build couldn't find the sysroot
+                             # at <project>/sysroot-android-64.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -1494,7 +1494,10 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
 
     arch_qt, _ = ARCH_MAP[args.arch]
     sysroots_parent = CACHE_DIR / 'sysroot'
-    sysroot_dir = sysroots_parent / args.arch
+    # pyqtdeploy-sysroot creates `<sysroots-dir>/sysroot-<target>/`.
+    # We use the same naming for our cache check so the warm-cache
+    # path doesn't fall through to the fallback finder on every run.
+    sysroot_dir = sysroots_parent / f'sysroot-{args.arch}'
     marker = sysroot_dir / '.sysroot-complete'
     if marker.exists():
         log.info('  ✓ sysroot already built: %s', sysroot_dir)
@@ -1570,18 +1573,35 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
     run(cmd, env=env)
 
     if not sysroot_dir.exists():
-        # pyqtdeploy may have used a different sub-directory name.  Find it.
-        candidates = [d for d in sysroots_parent.iterdir() if d.is_dir()
-                      and (d.name == args.arch or d.name == arch_qt
-                           or 'sysroot' in d.name.lower())]
-        if candidates:
-            sysroot_dir = candidates[0]
-            log.info('  ! sysroot landed at %s (renaming/symlinking)', sysroot_dir)
+        # If our expected path is empty, pyqtdeploy used some other name.
+        # Search candidates in order of preference:
+        #   1. sysroot-<target>   ← canonical pyqtdeploy 3.3 layout
+        #   2. <target>           ← seen in some older pyqtdeploy versions
+        #   3. <arch_qt>          ← e.g. android_arm64_v8a
+        prefs = [
+            f'sysroot-{args.arch}',
+            args.arch,
+            arch_qt,
+        ]
+        sysroots_parent_kids = list(sysroots_parent.iterdir())
+        kid_names = {d.name: d for d in sysroots_parent_kids if d.is_dir()}
+        for name in prefs:
+            if name in kid_names:
+                sysroot_dir = kid_names[name]
+                log.info('  ! sysroot landed at %s (using fallback name)', sysroot_dir)
+                break
         else:
-            raise SystemExit(
-                f'  ✗ pyqtdeploy-sysroot reported success but no sysroot dir at\n'
-                f'    {sysroot_dir}\n    Contents of {sysroots_parent}:\n'
-                + '\n'.join(f'      {p.name}' for p in sysroots_parent.iterdir()))
+            # No exact match — try a fuzzy "contains sysroot" heuristic
+            fuzzy = [d for n, d in kid_names.items() if 'sysroot' in n.lower()]
+            if fuzzy:
+                sysroot_dir = fuzzy[0]
+                log.info('  ! sysroot landed at %s (fuzzy match)', sysroot_dir)
+            else:
+                raise SystemExit(
+                    f'  ✗ pyqtdeploy-sysroot reported success but no sysroot dir\n'
+                    f'    matching any of {prefs}.\n'
+                    f'    Contents of {sysroots_parent}:\n'
+                    + '\n'.join(f'      {p.name}' for p in sysroots_parent_kids))
 
     (sysroot_dir / '.sysroot-complete').touch()
     log.info('  ✓ sysroot built at %s', sysroot_dir)
@@ -1743,11 +1763,19 @@ def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
     (matching pyqt-crom-main byte-for-byte).  That means pyqtdeploy-build
     will look for the sysroot at:
 
-        <project_dir>/<target>/    (e.g. .../testapp/android-64/)
+        <project_dir>/sysroot-<target>/    (e.g. .../testapp/sysroot-android-64/)
 
-    But our actual cross-compiled sysroot lives in CACHE_DIR (so it
-    survives runner restarts via GitHub Actions cache).  We bridge this
-    by symlinking the expected project-dir path to the cache path.  The
+    Note the `sysroot-` prefix — pyqtdeploy-sysroot creates the
+    directory with that prefix when invoked with --sysroots-dir+--target,
+    and pyqtdeploy-build expects to find it with the same prefix.
+    Symlinking with just `<target>` (no prefix) fails with:
+
+        pyqtdeploy-build: the sysroot directory
+        '<project_dir>/sysroot-<target>' does not exist
+
+    Our actual cross-compiled sysroot lives in CACHE_DIR (so it survives
+    runner restarts via GitHub Actions cache).  We bridge this by
+    symlinking the expected project-dir path to the cache path.  The
     symlink is transparent to pyqtdeploy-build and keeps the on-disk
     file layout byte-equivalent to pyqt-crom (a symlink isn't a file).
     """
@@ -1756,9 +1784,19 @@ def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
     # Validate .pdt format — see docstring above.
     _validate_or_rewrite_pdt_as_toml(args)
 
-    # Bridge: project_dir/<target> → sysroot_dir (in CACHE_DIR).
+    # Bridge: project_dir/sysroot-<target> → sysroot_dir (in CACHE_DIR).
+    #
+    # pyqtdeploy-sysroot creates `sysroot-<target>/` (with prefix) inside
+    # --sysroots-dir.  pyqtdeploy-build, when resolving the sysroot via
+    # the .pdt's sysroots_dir, ALSO looks for `sysroot-<target>/` — the
+    # prefix is not optional.  Earlier code symlinked just `<target>`,
+    # which caused:
+    #     pyqtdeploy-build: the sysroot directory '...workspace/testapp/
+    #     sysroot-android-64' does not exist
+    # The fix is to symlink with the same `sysroot-<target>` naming so
+    # both tools agree on the path.
     project = Path(args.project_dir)
-    expected_sysroot_path = project / args.arch
+    expected_sysroot_path = project / f'sysroot-{args.arch}'
     sysroot_actual = Path(sysroot_dir)
     if expected_sysroot_path.is_symlink() or expected_sysroot_path.exists():
         # Already linked?  If it points at the right place, leave it.
