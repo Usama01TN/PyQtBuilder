@@ -62,16 +62,13 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 14  # 2026-05: full byte-for-byte alignment with
-                             # pyqt-crom-main/examples/demo/demo_project/.
-                             # config.pdt (not <app>.pdt), sysroot.toml in
-                             # project dir with relative reference, module
-                             # named <app>_app.py (not main.py), sysroot
-                             # spec has nested [PyQt.android]/[Qt.android]
-                             # sections, [zlib] component added (was missing
-                             # — caused silent stdlib breakage), Python uses
-                             # install_host_from_source = true for known-good
-                             # host/target ABI compat.
+BUILDER_SCRIPT_VERSION = 15  # 2026-05: preflight now scans ALL .py files under
+                             # the project (not just files literally named
+                             # main.py) so the PySide6 import check survives
+                             # the package-layout transform's rename to
+                             # <app>_app.py.  Added _project_python_sources
+                             # helper that excludes venvs/build outputs/hidden
+                             # dirs while keeping the auto-generated *_pkg/.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -706,8 +703,49 @@ def _wrap_in_def_main(source):
         + '    main()\n'
     )
     return new_source
-    log.info('    sysroot.toml path : %s', sysroot_toml_abs)
-    return pdt_path
+
+
+# ─── Project source discovery ────────────────────────────────────────────────
+
+def _project_python_sources(project_dir):
+    """
+    Return a sorted list of all Python source files under project_dir
+    that the builder should consider — excluding venvs, build outputs,
+    hidden directories, and bytecode caches.
+
+    Used by preflight to:
+      • Verify at least one .py file exists.
+      • Scan for PySide6/PySide2 imports (regardless of filename).
+      • Pick the entry source for log lines after the package-layout
+        transform may have renamed main.py to <app>_app.py.
+
+    Excludes anything under:
+      • Hidden dirs (any path component starting with '.')
+      • venv, .venv, env, .env
+      • build-* (qmake build outputs)
+      • __pycache__, *.egg-info
+      • node_modules (just in case)
+      • Any *_pkg/ contents are KEPT — that's where the auto-generated
+        package layout lives.
+    """
+    EXCLUDED_DIRS = {
+        'venv', '.venv', 'env', '.env', 'node_modules',
+        '__pycache__', '.git', '.tox', '.pytest_cache',
+    }
+    EXCLUDED_DIR_PREFIXES = ('build-', '.')         # build-android-64, .anything
+
+    out = []
+    for p in sorted(Path(project_dir).rglob('*.py')):
+        parts = p.relative_to(project_dir).parts
+        if any(
+            part in EXCLUDED_DIRS or
+            (part != p.name and part.startswith(EXCLUDED_DIR_PREFIXES)) or
+            part.endswith('.egg-info')
+            for part in parts
+        ):
+            continue
+        out.append(str(p))
+    return out
 
 
 # ─── Step 1 — Preflight ──────────────────────────────────────────────────────
@@ -721,23 +759,20 @@ def preflight(args):
     if not os.path.isdir(args.project_dir):
         raise SystemExit(f'  ✗ Project dir not found: {args.project_dir}')
 
-    # main.py may live at the project root (typical first run) OR inside
-    # a package subdirectory like <project>/<pkg>/main.py (subsequent
-    # runs after _ensure_package_layout has done its work).  Accept both.
-    main_py = join(args.project_dir, 'main.py')
-    if not exists(main_py):
-        candidates = sorted(Path(args.project_dir).rglob('main.py'))
-        candidates = [
-            p for p in candidates
-            if not any(part.startswith('.') or part in {'venv', '.venv', 'build', '__pycache__'}
-                       for part in p.parts)
-        ]
-        if not candidates:
-            raise SystemExit(
-                f'  ✗ main.py not found at {main_py} or anywhere under {args.project_dir}.\n'
-                f'    The builder expects a Python entry script named main.py.')
-        main_py = str(candidates[0])
-        log.debug('  main.py found inside package: %s', main_py)
+    # The entry script may live at the project root (typical first run)
+    # OR inside a package subdir like <project>/<pkg>/<app>_app.py
+    # (subsequent runs after _ensure_package_layout has done its work).
+    # Accept any layout that has at least one .py file under the project.
+    src_files = _project_python_sources(args.project_dir)
+    if not src_files:
+        raise SystemExit(
+            f'  ✗ No Python source files found under {args.project_dir}.\n'
+            f'    The builder expects a Python entry script (main.py or\n'
+            f'    a package containing <app>_app.py).')
+    # main_py is used for the "✓ main.py" log line at the end of preflight;
+    # the actual entry-script resolution happens inside _ensure_package_layout.
+    flat_main = join(args.project_dir, 'main.py')
+    main_py = flat_main if exists(flat_main) else src_files[0]
 
     pdts = sorted(Path(args.project_dir).glob('*.pdt'))
 
@@ -774,32 +809,41 @@ def preflight(args):
         args.pyqt5_modules = sorted(_scan_pyqt5_modules(args.project_dir))
         log.info('  ✓ .pdt file  : %s (auto-generated)', args.pdt_file)
 
-    # Verify the project uses PyQt5, not PySide6.  Note: by this point
-    # _auto_generate_pdt may have moved main.py from <project>/main.py
-    # into <project>/<pkg>/main.py (the package layout transform).  We
-    # re-locate it before the import check.
-    if not exists(main_py):
-        candidates = sorted(Path(args.project_dir).rglob('main.py'))
-        # Skip anything inside hidden dirs, venvs, build outputs, etc.
-        candidates = [
-            p for p in candidates
-            if not any(part.startswith('.') or part in {'venv', '.venv', 'build', '__pycache__'}
-                       for part in p.parts)
-        ]
-        if candidates:
-            main_py = str(candidates[0])
-            log.debug('  re-located main.py after package layout: %s', main_py)
-        else:
-            raise SystemExit(
-                f'  ✗ main.py disappeared after auto-gen.  Looked under {args.project_dir}.\n'
-                f'    This is a bug — please report.')
-
-    with open(main_py) as f:
-        src = f.read()
-    if 'PySide6' in src or 'PySide2' in src:
+    # Verify the project uses PyQt5, not PySide6.
+    #
+    # By this point _auto_generate_pdt may have moved main.py into a
+    # package and renamed it to <app>_app.py.  So we don't trust the
+    # original filename — instead we scan every .py file under the
+    # project (excluding venvs, build outputs, hidden dirs, cache
+    # directories) and check each.  This also handles complex projects
+    # that span multiple files: even if main.py is clean, a helper
+    # module might still reference PySide.
+    src_files = _project_python_sources(args.project_dir)
+    if not src_files:
         raise SystemExit(
-            '  ✗ main.py uses PySide imports — this builder is for PyQt5.\n'
-            '    Either rewrite to use `from PyQt5...` or use the PySide6 builder.')
+            f'  ✗ No Python source files found under {args.project_dir}\n'
+            f'    after auto-generation.  This is a bug — please report.')
+
+    for src_path in src_files:
+        try:
+            text = Path(src_path).read_text(encoding='utf-8', errors='replace')
+        except OSError as e:
+            log.debug('  could not read %s: %s', src_path, e)
+            continue
+        if 'PySide6' in text or 'PySide2' in text:
+            raise SystemExit(
+                f'  ✗ {Path(src_path).name} uses PySide imports — this\n'
+                f'    builder is for PyQt5.  Either rewrite to use\n'
+                f'    `from PyQt5...` or use the PySide6 builder.')
+
+    # Pick the entry source for the "✓ main.py" log line below.  Prefer
+    # the actual entry module (inside the auto-generated package, if we
+    # made one); fall back to whatever is first in our scan.
+    entry_candidates = [p for p in src_files if p.endswith('_app.py')]
+    if entry_candidates:
+        main_py = entry_candidates[0]
+    else:
+        main_py = src_files[0]
 
     # Verify disk space
     stat_result = shutil.disk_usage(args.project_dir)
