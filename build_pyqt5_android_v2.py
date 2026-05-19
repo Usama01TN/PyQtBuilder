@@ -62,12 +62,16 @@ from pathlib import Path
 # Bumped on each significant fix so we can verify from build logs whether
 # CI is running the latest pushed script.  If the build log doesn't show
 # this version, the user's GitHub repo has a stale build_pyqt5_android.py.
-BUILDER_SCRIPT_VERSION = 13  # 2026-05: preflight now re-locates main.py after
-                             # the package-layout transform (which moves
-                             # main.py from project root into <pkg>/main.py).
-                             # Previously preflight kept the old path and the
-                             # subsequent PySide6 import check tried to read
-                             # the deleted file.
+BUILDER_SCRIPT_VERSION = 14  # 2026-05: full byte-for-byte alignment with
+                             # pyqt-crom-main/examples/demo/demo_project/.
+                             # config.pdt (not <app>.pdt), sysroot.toml in
+                             # project dir with relative reference, module
+                             # named <app>_app.py (not main.py), sysroot
+                             # spec has nested [PyQt.android]/[Qt.android]
+                             # sections, [zlib] component added (was missing
+                             # — caused silent stdlib breakage), Python uses
+                             # install_host_from_source = true for known-good
+                             # host/target ABI compat.
 
 # ─── Pinned versions (must match each other to build successfully) ─────────
 QT_VERSION       = '5.15.2'
@@ -374,84 +378,88 @@ def _find_qrc_files(project_dir):
 
 def _auto_generate_pdt(project_dir, app_name):
     """
-    Generate a .pdt and rearrange the user's source files into the
-    pyqtdeploy-friendly package layout.
+    Generate config.pdt + sysroot.toml + package layout, all
+    byte-equivalent to pyqt-crom-main/examples/demo/demo_project/.
 
-    Why this needs to do more than just write a TOML file
-    -----------------------------------------------------
-    pyqtdeploy 3.x supports two ways to define what code to run:
+    Layout produced
+    ---------------
+        <project_dir>/
+        ├── config.pdt                ← pyqtdeploy project file (TOML)
+        ├── sysroot.toml              ← sysroot spec (read by pyqtdeploy-sysroot)
+        └── <app>_pkg/
+            ├── __init__.py           ← empty marker
+            └── <app>_app.py          ← code wrapped in def main():
 
-      [Application]
-      script = "main.py"             # FORM A — run the script as __main__
-      entry_point = ""
+    Three reasons this matches pyqt-crom's structure verbatim:
 
-      OR
+    1. The .pdt is named `config.pdt` (not `<app>.pdt`).  All five
+       working pyqt-crom examples — demo, graphics_playground,
+       bluetooth_scanner, database_management, network — use
+       this exact filename.
 
-      [Application]
-      script = ""
-      entry_point = "pkg.mod:main"   # FORM B — import pkg.mod, call mod.main()
+    2. The sysroot.toml is written IN THE PROJECT DIR, and the .pdt
+       references it relatively as `sysroot = "sysroot.toml"`.
+       pyqtdeploy resolves the path against the .pdt's own directory,
+       so this works correctly.  Putting it in CACHE_DIR (our earlier
+       attempt) required absolute paths and broke pyqt-crom's
+       conventions in subtle ways.
 
-    FORM A is broken on Android for typical PyQt5 hello-worlds because
-    top-level locals get garbage-collected before app.exec_() can paint.
-    Classic failure mode (we hit this — see crash log analysis):
+    3. The module file inside the package is named `<base>_app.py`
+       (matching demo_pkg/demo_app.py, graphics_playground_pkg/
+       graphics_playground_app.py, etc).  Not main.py.  The
+       entry_point string is `<pkg>.<mod>:main`.
 
-        app = QApplication([])
-        QLabel("Hi").show()    # ← returned label has no ref, GC'd
-        app.exec_()            # ← no live windows → returns 0 immediately
-        # app dies in ~175ms, HWUI render thread races during teardown,
-        # SIGABRT in libc from pthread_mutex_lock on a destroyed mutex.
+    Application.Package.Content — about the entry-point bug
+    -------------------------------------------------------
+    `script = ""` and `entry_point = "pkg.mod:main"` tells pyqtdeploy's
+    runtime wrapper to import `pkg.mod` and call `mod.main()`.  This
+    pattern fixes the crash where flat-script top-level locals get
+    garbage-collected before app.exec_() can paint.  Inside a function
+    frame the locals stay alive throughout the event loop.
 
-    FORM B fixes this because `main()`'s local frame holds strong refs
-    to every widget for the entire lifetime of app.exec_().  This is the
-    pattern every working pyqt-crom example uses, e.g.:
-
-        def main():
-            app = QApplication([])
-            main_window = MainWindow()
-            main_window.showMaximized()
-            app.exec()
-
-    What this function does
-    -----------------------
-    1. Ensure a package layout exists:  <project>/<pkg_name>/{__init__.py,main.py}
-       If the user uploaded a flat main.py at the project root, we MOVE
-       it into the package and AST-wrap top-level code in `def main():`.
-       If the package already exists (subsequent runs, or user opted in
-       to the layout themselves), we leave it alone.
-    2. Scan PyQt5 imports across the package to populate `parts`.
-    3. Emit the TOML with `entry_point` (not `script`).
-
-    The generated TOML matches the proven pyqt-crom-main template
-    byte-for-byte in structure.
+    See _ensure_package_layout for the AST transformation that
+    converts user-provided flat main.py code into this form.
     """
     project = Path(project_dir)
 
-    # Step 1 — convert flat layout to package layout (idempotent).
+    # Step 1 — package layout (idempotent).
     pkg_name, module_name = _ensure_package_layout(project, app_name)
     pkg_dir = project / pkg_name
 
-    # Step 2 — scan the PACKAGE (not just project root) for PyQt5 imports.
+    # Step 2 — scan the package source for PyQt5 module usage.
     pyqt_modules = _scan_pyqt5_modules(str(pkg_dir))
     if not pyqt_modules:
-        # Fallback to scanning whole project in case user has other helper
-        # files at project root (we still bundle them via Application.Package).
         pyqt_modules = _scan_pyqt5_modules(project_dir)
     pyqt_modules = sorted(set(pyqt_modules) | {'QtCore', 'QtGui', 'QtWidgets'})
 
-    # Step 3 — emit the .pdt
-    pdt_path = project / f'{app_name}.pdt'
-    sysroot_toml_abs = str(CACHE_DIR / 'sysroot' / 'sysroot.toml')
+    # Step 3 — write sysroot.toml IN the project dir (pyqt-crom style).
+    # The same content also lives at CACHE_DIR/sysroot/sysroot.toml for
+    # the cached build_sysroot path; we write to both so either reader
+    # finds it.
+    sysroot_toml_text = _sysroot_spec(pyqt_modules)
+    project_sysroot_toml = project / 'sysroot.toml'
+    project_sysroot_toml.write_text(sysroot_toml_text)
+    # Mirror to cache so the cached-sysroot codepath also sees the
+    # current content.  Cheap, idempotent.
+    try:
+        cache_sysroot_dir = CACHE_DIR / 'sysroot'
+        cache_sysroot_dir.mkdir(parents=True, exist_ok=True)
+        (cache_sysroot_dir / 'sysroot.toml').write_text(sysroot_toml_text)
+    except OSError as e:
+        log.debug('  could not mirror sysroot.toml to cache: %s', e)
 
-    # Parts: pyqt-crom uses scoped form "PyQt:PyQt5.QtCore" — note PyQt
-    # (no '5') as the component scope.  Verified across all working
-    # examples (demo, graphics, bluetooth_scanner, database).
+    # Step 4 — emit config.pdt.
+    # Parts: scoped form "PyQt:PyQt5.QtCore".  pyqt-crom-main uses a
+    # MINIMAL parts list (just "PyQt:PyQt5.QtWidgets" for the demo,
+    # since QtCore+QtGui are transitive dependencies).  We expand to
+    # whatever the user's source actually imports, plus Python:logging
+    # because most non-trivial apps want it.
     parts = [f'PyQt:PyQt5.{m}' for m in pyqt_modules]
-    parts.append('Python:logging')  # widely useful for app-side logging
-
+    parts.append('Python:logging')
     parts_toml = ', '.join(f'"{p}"' for p in parts)
 
-    # Build the [[Application.Package.Content]] entries.  We only need
-    # to list the files that are visible at the top of the package dir.
+    # [[Application.Package.Content]] entries — one per file in the
+    # package directory.  Each entry needs name + included + is_directory.
     pkg_files = sorted(p.name for p in pkg_dir.iterdir() if p.is_file())
     content_blocks = []
     for fname in pkg_files:
@@ -463,29 +471,39 @@ def _auto_generate_pdt(project_dir, app_name):
         )
     content_section = '\n'.join(content_blocks)
 
-    pdt_content = f'''version = 0
-sysroot = "{sysroot_toml_abs}"
-sysroots_dir = ""
-parts = [ {parts_toml},]
-
-[Application]
-entry_point = "{pkg_name}.{module_name}:main"
-is_console = false
-is_bundle = false
-name = "{app_name}"
-qmake_configuration = ""
-script = ""
-syspath = ""
-
-[Application.Package]
-name = "{pkg_name}"
-exclude = [ "*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi", "__pycache__", "*-info", "EGG_INFO", "*.so",]
-{content_section}
-'''
-
+    # config.pdt — byte-equivalent layout to pyqt-crom's:
+    #   - top-level: version, sysroot (relative), sysroots_dir, parts
+    #   - [Application]: entry_point, is_console, is_bundle, name,
+    #                    qmake_configuration, script (empty!), syspath
+    #   - [Application.Package]: name, exclude, then nested
+    #     [[Application.Package.Content]] tables
+    pdt_path = project / 'config.pdt'        # ← NOT <app>.pdt
+    pdt_content = (
+        f'version = 0\n'
+        f'sysroot = "sysroot.toml"\n'        # ← RELATIVE, like pyqt-crom
+        f'sysroots_dir = ""\n'
+        f'parts = [ {parts_toml},]\n'
+        f'\n'
+        f'[Application]\n'
+        f'entry_point = "{pkg_name}.{module_name}:main"\n'
+        f'is_console = false\n'
+        f'is_bundle = false\n'
+        f'name = "{app_name}"\n'
+        f'qmake_configuration = ""\n'
+        f'script = ""\n'
+        f'syspath = ""\n'
+        f'\n'
+        f'[Application.Package]\n'
+        f'name = "{pkg_name}"\n'
+        f'exclude = [ "*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi",'
+        f' "__pycache__", "*-info", "EGG_INFO", "*.so",]\n'
+        f'{content_section}'
+    )
     pdt_path.write_text(pdt_content)
 
-    log.info('  auto-generated .pdt (TOML, pyqt-crom layout) at %s with:', pdt_path)
+    log.info('  auto-generated pyqt-crom-style project:')
+    log.info('    config.pdt       : %s', pdt_path)
+    log.info('    sysroot.toml     : %s', project_sysroot_toml)
     log.info('    package          : %s/', pkg_name)
     log.info('    entry_point      : %s.%s:main', pkg_name, module_name)
     log.info('    PyQt5 modules    : %d (%s)', len(pyqt_modules), ', '.join(pyqt_modules))
@@ -495,35 +513,37 @@ exclude = [ "*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi", "__pycache__", "*-info"
 
 def _ensure_package_layout(project_dir, app_name):
     """
-    Make sure the user's source code is arranged as a Python package
-    that pyqtdeploy's entry_point system can consume.
+    Arrange user source as a Python package, byte-equivalent to the
+    pyqt-crom-main demo project layout.
 
     BEFORE (typical user upload):
         project_dir/
         ├── main.py                  ← script-style, top-level code
         └── (other files)
 
-    AFTER:
+    AFTER (matches pyqt-crom-main/examples/demo/demo_project/):
         project_dir/
-        ├── <pkg>/
-        │   ├── __init__.py          ← empty marker
-        │   └── main.py              ← code wrapped in def main():
+        ├── <app>_pkg/
+        │   ├── __init__.py          ← empty
+        │   └── <app>_app.py         ← def main(): inside
         └── (other files unchanged)
 
-    The transformation is idempotent — if <pkg>/ already exists with
-    the right shape we leave it alone.  This means re-running the
-    builder against the same project_dir is a no-op once it's been
-    converted once.
+    The module is named "<app>_app.py" (not "main.py") to mirror
+    pyqt-crom's convention (demo_pkg/demo_app.py, graphics_playground_pkg/
+    graphics_playground_app.py, …).  The entry_point string in config.pdt
+    becomes "<app>_pkg.<app>_app:main".
 
-    Returns (pkg_name, module_name).
+    Idempotent — re-running is a no-op once converted.
+
+    Returns (pkg_name, module_name) for use in config.pdt generation.
     """
     project = Path(project_dir)
 
-    # Naming derived from app_name.  e.g. "testapp" → "testapp_pkg".
-    # Strip anything that isn't a valid Python identifier character.
+    # Strip non-identifier chars from app_name to form the python package
+    # and module names.  "TestApp" → "testapp", "my-app" → "my_app".
     base = re.sub(r'[^a-zA-Z0-9_]', '_', app_name.lower())
     pkg_name = f'{base}_pkg'
-    module_name = 'main'
+    module_name = f'{base}_app'             # ← pyqt-crom convention
     pkg_dir = project / pkg_name
 
     # Already converted?
@@ -533,16 +553,16 @@ def _ensure_package_layout(project_dir, app_name):
         log.info('  ✓ package layout already exists at %s/', pkg_name)
         return pkg_name, module_name
 
-    # Find the source script to move.  main.py is the convention; fall
-    # back to other common names without making up paths.
+    # Find the source script.  We accept several common names but always
+    # rename to <module_name>.py inside the package — that's what
+    # config.pdt's entry_point will reference.
     src_script = None
-    for candidate in ('main.py', 'app.py', '__main__.py'):
+    for candidate in ('main.py', f'{module_name}.py', 'app.py', '__main__.py'):
         cand_path = project / candidate
         if cand_path.exists() and cand_path.is_file():
             src_script = cand_path
             break
     if src_script is None:
-        # Last resort: a single .py file at project root.
         py_files = [p for p in project.glob('*.py') if p.is_file()]
         if len(py_files) == 1:
             src_script = py_files[0]
@@ -555,30 +575,30 @@ def _ensure_package_layout(project_dir, app_name):
                 f'  ✗ Cannot determine the entry script: {len(py_files)} .py\n'
                 f'    files at project root: {[p.name for p in py_files]}.\n'
                 f'    Rename one to main.py, or pre-create the package layout\n'
-                f'    yourself: {pkg_name}/__init__.py + {pkg_name}/main.py')
+                f'    yourself: {pkg_name}/__init__.py + {pkg_name}/{module_name}.py')
 
     src_text = src_script.read_text(encoding='utf-8', errors='replace')
 
     # AST-wrap top-level code in def main() if it isn't already.
     wrapped_text = _wrap_in_def_main(src_text)
 
-    # Move the file into the package.
+    # Build the package layout, byte-equivalent to pyqt-crom's.
     pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / '__init__.py').write_text('')
     (pkg_dir / f'{module_name}.py').write_text(wrapped_text)
 
-    # Remove the original flat-layout script so pyqtdeploy doesn't see
-    # two copies and get confused.  Keep a small note so the user sees
-    # what happened if they look at the workspace.
+    # Remove the original flat-layout script.
     note = (
         f'# Original {src_script.name} was moved into {pkg_name}/{module_name}.py\n'
-        f'# and top-level code was wrapped in def main() to fix the GC-eats-widget\n'
-        f'# bug that prevented PyQt5 apps from running on Android.\n')
+        f'# (pyqt-crom naming) and top-level code was wrapped in def main()\n'
+        f'# so widget local variables hold strong references throughout\n'
+        f'# app.exec_() — fixes the rapid-exit crash on Android.\n')
     src_script.unlink()
     (project / f'.{src_script.name}.moved').write_text(note)
 
-    log.info('  ✓ created package layout %s/ from %s', pkg_name, src_script.name)
-    log.info('    wrapped top-level code in def main() (fixes GC-of-widgets crash)')
+    log.info('  ✓ created package layout %s/%s.py from %s',
+             pkg_name, module_name, src_script.name)
+    log.info('    wrapped top-level code in def main() (fixes GC crash)')
     return pkg_name, module_name
 
 
@@ -1526,49 +1546,126 @@ def build_sysroot(args, qt_dir, ndk_path, venv_dir):
 
 def _sysroot_spec(pyqt5_modules):
     """
-    Generate pyqtdeploy 3.3.0 sysroot TOML.
+    Generate sysroot.toml byte-equivalent to pyqt-crom-main's reference.
 
-    pyqtdeploy REQUIRES a [Qt] section even when we're using an existing
-    Qt installation — the Python component validates that Qt is declared.
-    But pyqtdeploy explicitly cannot build Qt for Android (its Qt plugin
-    says "cross compiling Qt is not supported"), so we MUST set
-    `install_from_source = false` and pair with `--qmake` on the CLI.
+    The crucial structural points (gleaned from reading pyqtdeploy's
+    specification.py:create_components_for_target, lines 151-167):
 
-    The version in [Qt] must match what `qmake -query QT_VERSION` reports
-    on our pre-built Qt; mismatch causes a verify error.
+      • Components are TOP-LEVEL sections.  pyqtdeploy expects:
+        [Python], [Qt], [SIP], [PyQt], [zlib]
+        Each is parsed as its own plugin.
 
-    Schema reference (from running pyqtdeploy-sysroot --verify):
-      [Python]
-        version, install_host_from_source, dynamic_loading
-      [Qt]
-        version, install_from_source, configure_options, disabled_features,
-        edition, ssl, skip, static_msvc_runtime
-      [SIP]
-        version, abi_major_version (required), module_name (required)
-      [PyQt]
-        version, installed_modules (required), disabled_features
+      • Platform-specific overrides go in NESTED sub-sections:
+        [PyQt.android], [Qt.android], [Python.win], [zlib.win], …
+        When the target platform matches the sub-section's name
+        (.android, .ios, .linux, .macos, .win), pyqtdeploy does:
+            default_config.update(target_config)
+        So nested values override flat ones for that specific target.
+
+      • zlib is its own component.  Without [zlib], Python is compiled
+        without zlib support and stdlib modules that need compression
+        (zipimport on .zip files, gzip, tarfile, requests/urllib over
+        compressed responses) fail to import — leading to silent app
+        exits during frozen-module init.  pyqt-crom-main includes
+        [zlib] (with install_from_source = false → use system zlib)
+        and we mirror that exactly.
+
+      • [Python] uses install_host_from_source = true.  This makes
+        pyqtdeploy build its OWN host Python from the same source
+        tarball as the target, ensuring host/target byte-code
+        compatibility and known-good include paths.
+
+    This whole TOML is sourced verbatim from:
+        pyqt-crom-main/examples/demo/demo_project/sysroot.toml
+    with only the versions parameterised.
     """
     modules = sorted(set(pyqt5_modules) | {'QtCore', 'QtGui', 'QtWidgets'})
-    modules_toml_list = ', '.join(f'"{m}"' for m in modules)
-    disabled_toml_list = ', '.join(f'"{f}"' for f in PYQT5_ANDROID_DISABLED_FEATURES)
+    modules_list = ', '.join(f'"{m}"' for m in modules)
 
-    return f'''[Python]
+    # Android disabled features.  We use the exact list pyqt-crom uses;
+    # PYQT5_ANDROID_DISABLED_FEATURES module-level constant remains the
+    # single source of truth.
+    android_disabled = ', '.join(f'"{f}"' for f in PYQT5_ANDROID_DISABLED_FEATURES)
+
+    return f'''# The sysroot for the application.
+# Generated by build_pyqt5_android.py (BUILDER_SCRIPT_VERSION>=14)
+# byte-equivalent to pyqt-crom-main/examples/demo/demo_project/sysroot.toml
+
+# Python ######################################################################
+
+[Python]
 version = "{PYTHON_VERSION}"
+install_host_from_source = true
+
+[Python.win]
 install_host_from_source = false
 
-[Qt]
-version = "{QT_VERSION}"
-install_from_source = false
-
-[SIP]
-version = "{SIP_VERSION}"
-abi_major_version = 12
-module_name = "PyQt5.sip"
+# PyQt ########################################################################
 
 [PyQt]
 version = "{PYQT_VERSION}"
-installed_modules = [{modules_toml_list}]
-disabled_features = [{disabled_toml_list}]
+
+[PyQt.android]
+disabled_features = [{android_disabled}]
+installed_modules = [{modules_list}]
+
+[PyQt.ios]
+disabled_features = ["PyQt_Desktop_OpenGL", "PyQt_MacOSXOnly",
+        "PyQt_MacCocoaViewContainer", "PyQt_Printer", "PyQt_Process",
+        "PyQt_NotBootstrapped"]
+installed_modules = [{modules_list}]
+
+[PyQt.linux]
+installed_modules = [{modules_list}]
+
+[PyQt.macos]
+installed_modules = [{modules_list}]
+
+[PyQt.win]
+disabled_features = ["PyQt_Desktop_OpenGL"]
+installed_modules = [{modules_list}]
+
+# Qt ##########################################################################
+
+[Qt]
+version = "{QT_VERSION}"
+edition = "opensource"
+configure_options = ["-opengl", "desktop", "-no-dbus", "-qt-pcre"]
+skip = ["qtactiveqt", "qtdoc", "qtgamepad",
+        "qtquickcontrols", "qtquickcontrols2",
+        "qtremoteobjects", "qtscript", "qtscxml", "qtserialbus",
+        "qtserialport", "qtspeech", "qtsvg", "qttools", "qttranslations",
+        "qtwayland", "qtwebchannel", "qtwebengine", "qtwebsockets",
+        "qtwebview", "qtxmlpatterns"]
+
+[Qt.android]
+install_from_source = false
+
+[Qt.ios]
+install_from_source = false
+
+[Qt.linux]
+
+[Qt.macos]
+
+[Qt.win]
+static_msvc_runtime = true
+
+# SIP #########################################################################
+
+[SIP]
+abi_major_version = 12
+module_name = "PyQt5.sip"
+
+# zlib ########################################################################
+
+[zlib]
+install_from_source = false
+
+[zlib.win]
+version = "1.2.13"
+install_from_source = true
+static_msvc_runtime = true
 '''
 
 
@@ -1591,16 +1688,59 @@ def run_pyqtdeploy(args, sysroot_dir, venv_dir, qt_dir):
     this, we delete the file and regenerate the .pdt as TOML — so the
     user doesn't need to manually delete cached stale files between runs.
 
-    pyqtdeploy-build's CLI doesn't have a --sysroot-dir flag.  It locates
-    the sysroot via the qmake we pass with --qmake (which lives inside the
-    Qt that the sysroot is configured against).
+    Sysroot path resolution
+    ------------------------
+    Reading pyqtdeploy/project/project.py:Project.absolute_sysroots_dir:
+
+        if self.sysroots_dir == '':
+            return os.path.dirname(self.absolute_sysroot_toml)
+
+    Our config.pdt has `sysroots_dir = ""` and `sysroot = "sysroot.toml"`
+    (matching pyqt-crom-main byte-for-byte).  That means pyqtdeploy-build
+    will look for the sysroot at:
+
+        <project_dir>/<target>/    (e.g. .../testapp/android-64/)
+
+    But our actual cross-compiled sysroot lives in CACHE_DIR (so it
+    survives runner restarts via GitHub Actions cache).  We bridge this
+    by symlinking the expected project-dir path to the cache path.  The
+    symlink is transparent to pyqtdeploy-build and keeps the on-disk
+    file layout byte-equivalent to pyqt-crom (a symlink isn't a file).
     """
     log.info('Step 6/7 — pyqtdeploy-build on %s', basename(args.pdt_file))
 
     # Validate .pdt format — see docstring above.
     _validate_or_rewrite_pdt_as_toml(args)
 
-    build_dir = Path(args.project_dir) / f'build-{args.arch}'
+    # Bridge: project_dir/<target> → sysroot_dir (in CACHE_DIR).
+    project = Path(args.project_dir)
+    expected_sysroot_path = project / args.arch
+    sysroot_actual = Path(sysroot_dir)
+    if expected_sysroot_path.is_symlink() or expected_sysroot_path.exists():
+        # Already linked?  If it points at the right place, leave it.
+        # Otherwise replace.
+        if expected_sysroot_path.is_symlink():
+            current_target = os.readlink(str(expected_sysroot_path))
+            if Path(current_target).resolve() == sysroot_actual.resolve():
+                log.info('  ✓ sysroot symlink already in place: %s -> %s',
+                         expected_sysroot_path.name, sysroot_actual)
+            else:
+                expected_sysroot_path.unlink()
+                expected_sysroot_path.symlink_to(sysroot_actual)
+                log.info('  ↻ updated sysroot symlink: %s -> %s',
+                         expected_sysroot_path.name, sysroot_actual)
+        elif expected_sysroot_path.is_dir():
+            # Real dir exists where we want the symlink — leave it (user might
+            # have intentionally pre-staged something) but warn.
+            log.warning('  ! %s exists as a directory; pyqtdeploy-build may '
+                        'use it instead of cached sysroot at %s',
+                        expected_sysroot_path, sysroot_actual)
+    else:
+        expected_sysroot_path.symlink_to(sysroot_actual)
+        log.info('  ✓ symlinked %s -> %s (so pyqtdeploy-build finds the '
+                 'cached sysroot)', expected_sysroot_path.name, sysroot_actual)
+
+    build_dir = project / f'build-{args.arch}'
     if build_dir.exists():
         shutil.rmtree(build_dir)
 
