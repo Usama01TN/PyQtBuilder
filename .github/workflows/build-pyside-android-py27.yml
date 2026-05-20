@@ -55,8 +55,14 @@ env:
   # Default Necessitas SDK installer URL — the official "Final Beta 0.3.71"
   # 64-bit Linux offline installer from SourceForge.  Contains everything
   # bundled: Qt 4.8.2 for Android, NDK r8b, Android SDK with platform 14,
-  # Qt Creator.  Stable URL since 2013.
-  DEFAULT_NECESSITAS_URL: "https://master.dl.sourceforge.net/project/necessitas/Necessitas%20Final/Final%20Beta/0.3.71/necessitas-NecessitasQt-final-installer-linux-x86_64-0.3.71-experimental.run"
+  # Qt Creator.  Stable since 2013.
+  #
+  # We do not pin a single URL — `master.dl.sourceforge.net` started
+  # returning 403 from individual mirrors in May 2026.  The acquisition
+  # step below iterates through a list of SourceForge URL patterns
+  # (project/files/download → CDN selector, downloads.sourceforge.net →
+  # explicit CDN, plus individual fallback mirrors) and uses whichever
+  # one returns a sufficiently large file first.
 
   # Qt Installer Framework "controller" script — JavaScript that answers
   # every page of the installer wizard automatically.  Stored as a
@@ -224,19 +230,95 @@ jobs:
           set -e
           NECESSITAS="$NECESSITAS_INSTALL_DIR"
           mkdir -p "$NECESSITAS"
-
-          # Pick the URL: user-provided override, or SourceForge default.
-          URL="${NECESSITAS_SDK_URL:-$DEFAULT_NECESSITAS_URL}"
-          echo "Source: $URL"
-
           cd /tmp
-          # SourceForge requires a real-looking User-Agent or it serves an
-          # HTML landing page instead of the file.
-          curl -L --fail --retry 5 --retry-delay 10 \
-               --insecure \
-               -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
-               -o necessitas.dl \
-               "$URL"
+
+          # Try several URLs.  SourceForge's individual mirrors started
+          # 403'ing in mid-2026, so we lead with the canonical /download
+          # endpoint that lets SF pick a working mirror at request time.
+          # The download is ~650 MB; we sanity-check the result is at least
+          # 100 MB to detect HTML error pages masquerading as the file.
+          #
+          # If the user passed a custom URL via necessitas_sdk_url, we use
+          # only that one and don't iterate through the SourceForge list.
+          if [ -n "$NECESSITAS_SDK_URL" ]; then
+              URLS=( "$NECESSITAS_SDK_URL" )
+          else
+              REL_PATH="Necessitas%20Final/Final%20Beta/0.3.71/necessitas-NecessitasQt-final-installer-linux-x86_64-0.3.71-experimental.run"
+              URLS=(
+                "https://sourceforge.net/projects/necessitas/files/${REL_PATH}/download"
+                "https://downloads.sourceforge.net/project/necessitas/${REL_PATH}"
+                "https://altushost-swe.dl.sourceforge.net/project/necessitas/${REL_PATH}"
+                "https://netcologne.dl.sourceforge.net/project/necessitas/${REL_PATH}"
+                "https://master.dl.sourceforge.net/project/necessitas/${REL_PATH}"
+              )
+          fi
+
+          MIN_INSTALLER_SIZE=104857600   # 100 MB — installer is ~650 MB
+          MIN_ARCHIVE_SIZE=1048576       # 1 MB — minimum for a tar/zip
+          DOWNLOAD_OK=0
+
+          for URL in "${URLS[@]}"; do
+              echo "::group::Trying $URL"
+              rm -f necessitas.dl
+
+              # curl flags chosen for SourceForge's quirks:
+              #   -L           follow mirror-selection redirects
+              #   --fail       treat HTTP 4xx/5xx as curl error
+              #   --retry 3    retry on transient network errors
+              #   -A           SourceForge serves HTML landing pages to
+              #                 generic User-Agents
+              #   --referer    some mirrors check Referer for hotlink prevention
+              #   --insecure   tolerate legacy mirror TLS certs
+              #
+              # We DON'T use `--fail-with-body` because some mirrors close
+              # the connection mid-download on rate-limit (curl exit 18).
+              if curl -L --fail --retry 3 --retry-delay 5 \
+                      --max-time 600 \
+                      --insecure \
+                      -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                      --referer "https://sourceforge.net/" \
+                      -o necessitas.dl \
+                      "$URL"; then
+                  SIZE=$(stat -c %s necessitas.dl 2>/dev/null || echo 0)
+                  echo "downloaded $SIZE bytes"
+
+                  # Decide minimum acceptable size based on URL pattern.
+                  # User-provided URLs may point to a tarball (smaller) or
+                  # to a `.run` file (large).  Default URLs are all `.run`.
+                  MIN_SIZE=$MIN_INSTALLER_SIZE
+                  case "$URL" in
+                    *.tar.gz|*.tar.xz|*.tgz|*.zip|*.tar) MIN_SIZE=$MIN_ARCHIVE_SIZE ;;
+                  esac
+
+                  if [ "$SIZE" -ge "$MIN_SIZE" ]; then
+                      echo "✓ accepted ($SIZE bytes >= $MIN_SIZE)"
+                      DOWNLOAD_OK=1
+                      echo "::endgroup::"
+                      break
+                  else
+                      echo "rejected: $SIZE bytes < $MIN_SIZE (probably an HTML error page)"
+                      head -c 500 necessitas.dl || true
+                      echo
+                  fi
+              else
+                  echo "curl failed for this URL"
+              fi
+              echo "::endgroup::"
+          done
+
+          if [ "$DOWNLOAD_OK" != "1" ]; then
+              echo "::error::All download URLs failed or returned undersized responses."
+              echo "::error::Tried URLs:"
+              for U in "${URLS[@]}"; do echo "::error::  $U"; done
+              echo ""
+              echo "::error::Workarounds:"
+              echo "::error::  1) Re-run later — SourceForge mirrors are flaky."
+              echo "::error::  2) Mirror the installer yourself (e.g. as a GitHub"
+              echo "::error::     Release asset) and pass its URL via the"
+              echo "::error::     necessitas_sdk_url workflow input."
+              exit 22
+          fi
+
           ls -lh necessitas.dl
 
           MIME="$(file --mime-type -b necessitas.dl)"
@@ -252,7 +334,9 @@ jobs:
             application/x-shellscript|text/x-shellscript)
               IS_RUN_INSTALLER=1 ;;
           esac
-          case "$URL" in
+          # Also accept the .run extension as a strong hint (some mirrors
+          # serve the file with octet-stream MIME).
+          case "${URLS[0]}" in
             *.run|*.run/download) IS_RUN_INSTALLER=1 ;;
           esac
 
