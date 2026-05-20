@@ -1,53 +1,56 @@
 name: build-pyside-android-py27
 
-# PySide 1 (Qt 4.8) → Android APK using pyside_android_builder_py27.py.
+# PySide 1 (Qt 4.8) -> Android APK via build_pyside_android.py.
 #
-# This is a Python 2.7 + Necessitas SDK build from the 2013 era.  Building
-# it on modern GitHub Actions runners (Ubuntu 22.04+) requires several
-# compatibility hoops that this workflow handles automatically:
+# Building a 2013-era Python 2.7 + Necessitas SDK stack on modern Ubuntu
+# runners involves several compatibility hoops, all handled below:
 #
-#   - Python 2.7 is no longer in main Ubuntu repos → installed via deadsnakes PPA.
-#   - Java 8 (not 11/17) → Necessitas's Android SDK API 14 needs it.
-#   - Necessitas SDK itself is ~500 MB and originally hosted on Sourceforge.
-#     The user supplies a working URL via the necessitas_sdk_url input.
-#   - shiboken (host) is no longer in Ubuntu 22.04 main repos.  The workflow
-#     attempts to install `shiboken` via apt as a best effort and continues
-#     even if it fails (the builder uses host shiboken only for shiboken-tool
-#     generator binary; --pyside-stage skips most host-shiboken work).
+#   - Python 2.7 was dropped from Ubuntu 22.04 main repos.  We install it
+#     from the deadsnakes PPA.
+#   - Necessitas's Android SDK platform 14 needs Java 8 (newer JDKs break
+#     the build.xml).  We pin actions/setup-java to version 8.
+#   - The Necessitas SDK itself (~500 MB) is no longer on a stable CDN.
+#     The workflow takes its URL as an input — you must host the archive
+#     yourself (e.g. as a GitHub Release asset).
+#   - Host shiboken is no longer in main Ubuntu repos.  The builder uses
+#     a self-contained cross-compile that doesn't strictly require it.
 #
-# CRITICAL: this build can take 90-120 minutes from cold (Shiboken + PySide
-# cross-compile is slow on a 2-CPU runner).  Subsequent runs that hit the
-# Necessitas cache + provide --pyside-stage finish in ~15 min.
+# Total runtime (cold cache):          ~70-90 min
+# Total runtime (warm cache + stage):  ~10 min
+#
+# The first successful run uploads a `pyside-stage-prebuilt` artifact.
+# Host that as a Release asset and pass its URL via pyside_stage_url on
+# future runs to skip the slow cross-compile.
 
 on:
   workflow_dispatch:
     inputs:
       project_url:
-        description: "Public URL to PySide/Qt4 project zip (must contain main.py)"
+        description: "Public URL to PySide/Qt4 project zip (must contain main.py at root or one level deep)."
         required: true
         default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt4.zip"
       necessitas_sdk_url:
-        description: "URL to a Necessitas SDK archive (.tar.gz / .tar.xz / .zip) containing NecessitasQt/ + android-ndk-* + android-sdk/"
+        description: "URL to a Necessitas SDK archive (.tar.gz / .tar.xz / .zip).  Must contain NecessitasQt/, android-ndk-*, android-sdk/."
         required: true
         default: ""
       app_name:
-        description: "Application display name"
+        description: "Application display name (used for the APK + Java class names)."
         required: false
         default: "TestApp"
       unique_name:
-        description: "Android package name (com.example.X)"
+        description: "Android package name (com.example.X).  Default: com.example.<app_name>."
         required: false
         default: "com.example.TestApp"
       pyside_stage_url:
-        description: "OPTIONAL: URL to a pre-built PySide stage tarball (skips ~60 min of cross-compile)"
+        description: "OPTIONAL: URL to a pre-built PySide stage tarball.  Skips the ~60-min Shiboken/PySide cross-compile."
         required: false
         default: ""
       build_threads:
-        description: "Parallel make jobs (set to 1 if hitting 'cc1plus: Internal error: Killed')"
+        description: "Parallel make jobs.  Set to 1 if you hit 'cc1plus: Internal error: Killed'."
         required: false
         default: "2"
       build_id:
-        description: "Optional build ID suffix for the APK artifact name"
+        description: "Optional build ID suffix for the APK artifact name."
         required: false
         default: ""
 
@@ -57,33 +60,42 @@ jobs:
     timeout-minutes: 180
 
     env:
-      PROJECT_URL:        ${{ github.event.inputs.project_url }}
-      NECESSITAS_SDK_URL: ${{ github.event.inputs.necessitas_sdk_url }}
-      APP_NAME:           ${{ github.event.inputs.app_name }}
-      UNIQUE_NAME:        ${{ github.event.inputs.unique_name }}
-      PYSIDE_STAGE_URL:   ${{ github.event.inputs.pyside_stage_url }}
-      BUILD_THREADS:      ${{ github.event.inputs.build_threads }}
-      BUILD_ID:           ${{ github.event.inputs.build_id }}
-      PYSIDE_CACHE:       /home/runner/pyside-cache
+      PROJECT_URL:          ${{ github.event.inputs.project_url }}
+      NECESSITAS_SDK_URL:   ${{ github.event.inputs.necessitas_sdk_url }}
+      APP_NAME:             ${{ github.event.inputs.app_name }}
+      UNIQUE_NAME:          ${{ github.event.inputs.unique_name }}
+      PYSIDE_STAGE_URL:     ${{ github.event.inputs.pyside_stage_url }}
+      BUILD_THREADS:        ${{ github.event.inputs.build_threads }}
+      BUILD_ID:             ${{ github.event.inputs.build_id }}
+      # The builder uses --cache-dir for ALL its persistent state:
+      # cloned repos, downloads, stage/ tree, artifacts.  We cache this
+      # whole directory via actions/cache.
+      PYSIDE_BUILDER_CACHE: /home/runner/pyside-cache
 
     steps:
-      - name: Checkout
+      - name: Checkout repository (contains build_pyside_android.py)
         uses: actions/checkout@v4
 
       - name: Sanity-check inputs
         run: |
           if [ -z "$NECESSITAS_SDK_URL" ]; then
-            echo "::error::necessitas_sdk_url is required.  The Necessitas SDK"
-            echo "::error::is no longer on a stable public CDN — you need to"
-            echo "::error::host the archive yourself (e.g. as a GitHub Release"
-            echo "::error::asset) and provide that URL here."
+            echo "::error::necessitas_sdk_url is required."
+            echo "::error::The Necessitas SDK is no longer on a stable public CDN."
+            echo "::error::Mirror it yourself (e.g. as a GitHub Release asset)"
+            echo "::error::and provide that URL here."
             exit 1
           fi
-          echo "project   : $PROJECT_URL"
-          echo "necessitas: $NECESSITAS_SDK_URL"
-          echo "app       : $APP_NAME ($UNIQUE_NAME)"
+          if [ ! -f build_pyside_android.py ]; then
+            echo "::error::build_pyside_android.py not found at repo root."
+            exit 1
+          fi
+          echo "  project_url    : $PROJECT_URL"
+          echo "  necessitas_url : $NECESSITAS_SDK_URL"
+          echo "  app_name       : $APP_NAME"
+          echo "  unique_name    : $UNIQUE_NAME"
+          echo "  build_threads  : $BUILD_THREADS"
 
-      - name: Free disk space (builder requires ~8 GB minimum)
+      - name: Free disk space (cross-compile needs ~10 GB)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
                       /usr/local/lib/android/sdk/ndk \
@@ -95,20 +107,22 @@ jobs:
           docker system prune -af || true
           df -h /
 
-      # ════════ Python 2.7 (host interpreter for the builder) ════════
+      # ════════ Python 2.7 ════════
+      # The builder script is Python 2.7-only.  Ubuntu 22.04 dropped py2.7
+      # from main repos; deadsnakes is the canonical workaround.
       - name: Install Python 2.7 from deadsnakes PPA
         run: |
-          # Python 2.7 was dropped from Ubuntu 22.04 main repos.  deadsnakes
-          # is the canonical PPA for legacy Python builds.
           sudo add-apt-repository -y ppa:deadsnakes/ppa
           sudo apt-get update
           sudo apt-get install -y python2.7 python2.7-dev
           python2.7 --version
-          # Some scripts assume `python2` exists too.
+          # Some scripts also expect `python2` on PATH.
           sudo ln -sf /usr/bin/python2.7 /usr/local/bin/python2 || true
 
-      # ════════ Java 8 (Android SDK API 14 needs old Java) ════════
-      - name: Set up JDK 8
+      # ════════ Java 8 for Necessitas's ant build ════════
+      # Necessitas's android/build.xml uses ant tasks that broke in JDK 9+.
+      # actions/setup-java exposes Java 8 (Temurin) reliably.
+      - name: Set up JDK 8 (required by Necessitas's ant build)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -118,78 +132,76 @@ jobs:
       - name: Install host build dependencies
         run: |
           sudo apt-get install -y --no-install-recommends \
-              build-essential cmake git ant unzip wget curl xz-utils \
-              libxml2-utils                                            \
-              libssl-dev zlib1g-dev libffi-dev                         \
-              ca-certificates
-          # `shiboken` (the legacy Qt4/Py2 host tool) is no longer in
-          # Ubuntu 22.04 main repos.  Best-effort attempt: try, but
-          # don't fail the build if it's not available.  Most invocations
-          # of host shiboken are during the Shiboken/PySide cross-compile
-          # bootstrap, and supplying --pyside-stage skips that entirely.
-          sudo apt-get install -y shiboken 2>/dev/null \
-              || echo "::warning::host shiboken not available — use --pyside-stage to skip Shiboken/PySide rebuild"
+              build-essential cmake git ant unzip wget curl xz-utils file \
+              libssl-dev zlib1g-dev libffi-dev ca-certificates
           cmake --version
           ant -version
           git --version
 
       # ════════ Caches ════════
-      # Necessitas SDK is ~500 MB → cache it across runs.
+
+      # The big one: cache the whole builder workspace (stage/, downloads,
+      # cloned repos).  Keyed on a hash of the builder script so any change
+      # to the build logic invalidates the cache cleanly.
+      - name: Cache builder workspace
+        id: builder-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PYSIDE_BUILDER_CACHE }}
+          key: pyside-builder-${{ hashFiles('build_pyside_android.py') }}-v1
+          restore-keys: |
+            pyside-builder-
+
+      # Necessitas SDK lives outside the builder cache because it's
+      # independently expensive to fetch and unrelated to script changes.
       - name: Cache Necessitas SDK
         id: necessitas-cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.PYSIDE_CACHE }}/necessitas
+          path: /home/runner/necessitas
           key: necessitas-sdk-${{ hashFiles('build-pyside-android-py27.yml') }}-v1
-
-      # Pre-built PySide stage (~300 MB) — only present if user provided URL.
-      - name: Cache PySide stage
-        if: env.PYSIDE_STAGE_URL != ''
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.PYSIDE_CACHE }}/pyside-stage
-          key: pyside-stage-${{ hashFiles('build-pyside-android-py27.yml') }}-v1
 
       # ════════ Acquire Necessitas SDK ════════
       - name: Download + extract Necessitas SDK
         run: |
-          mkdir -p "$PYSIDE_CACHE"
-          NECESSITAS="$PYSIDE_CACHE/necessitas"
+          NECESSITAS=/home/runner/necessitas
 
-          # Skip if cache restored a populated directory
           if [ -d "$NECESSITAS" ] && [ -n "$(ls -A "$NECESSITAS" 2>/dev/null)" ]; then
-            echo "✓ Necessitas already cached:"
+            echo "✓ Necessitas already cached at $NECESSITAS"
             ls -la "$NECESSITAS" | head -20
             echo "NECESSITAS_DIR=$NECESSITAS" >> "$GITHUB_ENV"
             exit 0
           fi
 
           mkdir -p "$NECESSITAS"
-          cd "$PYSIDE_CACHE"
+          cd /tmp
 
           echo "Downloading Necessitas from: $NECESSITAS_SDK_URL"
-          # --insecure: modrana.org and other legacy hosts often have stale certs
-          # --retry: be patient with old infrastructure
+          # --insecure: legacy mirrors often have stale certs.
+          # --retry: be patient with old infrastructure.
           curl -L --fail --retry 5 --retry-delay 10 \
                --insecure \
                -o necessitas.archive \
                "$NECESSITAS_SDK_URL"
           ls -lh necessitas.archive
 
-          # Auto-detect archive format and extract
           MIME="$(file --mime-type -b necessitas.archive)"
           echo "archive type: $MIME"
           case "$MIME" in
             application/gzip|application/x-gzip)
-              tar -xzf necessitas.archive -C "$NECESSITAS" --strip-components=1 || \
-                tar -xzf necessitas.archive -C "$NECESSITAS"
+              tar -xzf necessitas.archive -C "$NECESSITAS" --strip-components=1 2>/dev/null \
+                || tar -xzf necessitas.archive -C "$NECESSITAS"
               ;;
             application/x-xz)
-              tar -xJf necessitas.archive -C "$NECESSITAS" --strip-components=1 || \
-                tar -xJf necessitas.archive -C "$NECESSITAS"
+              tar -xJf necessitas.archive -C "$NECESSITAS" --strip-components=1 2>/dev/null \
+                || tar -xJf necessitas.archive -C "$NECESSITAS"
               ;;
             application/zip)
               unzip -q necessitas.archive -d "$NECESSITAS"
+              ;;
+            application/x-tar)
+              tar -xf necessitas.archive -C "$NECESSITAS" --strip-components=1 2>/dev/null \
+                || tar -xf necessitas.archive -C "$NECESSITAS"
               ;;
             *)
               echo "::error::Unknown archive type: $MIME"
@@ -199,52 +211,70 @@ jobs:
           esac
           rm -f necessitas.archive
 
-          # The archive might unpack with a wrapper directory.  Find the
-          # actual Necessitas root by looking for hallmark sub-dirs
-          # (NecessitasQt + android-ndk-*).
-          if [ ! -d "$NECESSITAS/NecessitasQt" ]; then
-            REAL_ROOT=""
+          # Find the real Necessitas root (the archive may have a wrapper dir).
+          # Hallmarks: NecessitasQt/ + an android-ndk-* directory.
+          if [ ! -d "$NECESSITAS/NecessitasQt" ] && \
+             ! ls -d "$NECESSITAS"/android-ndk-* >/dev/null 2>&1; then
             for d in "$NECESSITAS"/*/; do
               if [ -d "$d/NecessitasQt" ] || ls -d "$d"/android-ndk-* >/dev/null 2>&1; then
-                REAL_ROOT="${d%/}"
+                echo "Flattening wrapper dir: $d -> $NECESSITAS"
+                shopt -s dotglob
+                mv "$d"/* "$NECESSITAS"/
+                rmdir "$d"
+                shopt -u dotglob
                 break
               fi
             done
-            if [ -n "$REAL_ROOT" ]; then
-              echo "Necessitas archive had a wrapper dir; using $REAL_ROOT"
-              NECESSITAS="$REAL_ROOT"
-            fi
           fi
 
-          # Verify it looks plausible
           echo "Necessitas root contents:"
           ls -la "$NECESSITAS" | head -20
-          if ! ls -d "$NECESSITAS"/android-ndk-* >/dev/null 2>&1; then
-            echo "::warning::No android-ndk-* directory inside Necessitas — the build will likely fail."
+
+          # Diagnostics for the most common layout failures.
+          if ! ls -d "$NECESSITAS"/android-ndk-* >/dev/null 2>&1 && \
+             [ ! -d "$NECESSITAS/android-ndk" ]; then
+            echo "::warning::No android-ndk-* in Necessitas root — build will likely fail."
           fi
-          if [ ! -d "$NECESSITAS/NecessitasQt" ]; then
-            echo "::warning::No NecessitasQt directory inside Necessitas — the build will likely fail."
+          if [ ! -d "$NECESSITAS/NecessitasQt" ] && \
+             [ ! -d "$NECESSITAS/Android/Qt" ]; then
+            echo "::warning::Neither NecessitasQt/ nor Android/Qt/ found — Qt detection will fail."
           fi
 
           echo "NECESSITAS_DIR=$NECESSITAS" >> "$GITHUB_ENV"
 
-      # ════════ Acquire pre-built PySide stage (optional) ════════
-      - name: Download + extract PySide stage (if URL provided)
+      # ════════ Pre-built PySide stage (optional, big speedup) ════════
+      - name: Download + extract pre-built PySide stage (if URL provided)
         if: env.PYSIDE_STAGE_URL != ''
         run: |
-          STAGE="$PYSIDE_CACHE/pyside-stage"
+          STAGE=/home/runner/pyside-stage
           if [ -d "$STAGE" ] && [ -n "$(ls -A "$STAGE" 2>/dev/null)" ]; then
-            echo "✓ PySide stage already cached"
+            echo "✓ Stage already populated"
             echo "PYSIDE_STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
             exit 0
           fi
           mkdir -p "$STAGE"
-          cd "$PYSIDE_CACHE"
-          curl -L --fail --retry 5 -o pyside-stage.tar.gz "$PYSIDE_STAGE_URL"
-          tar -xzf pyside-stage.tar.gz -C "$STAGE" --strip-components=1 || \
-            tar -xzf pyside-stage.tar.gz -C "$STAGE"
-          rm -f pyside-stage.tar.gz
+          cd /tmp
+          curl -L --fail --retry 5 -o pyside-stage.archive "$PYSIDE_STAGE_URL"
+          MIME="$(file --mime-type -b pyside-stage.archive)"
+          case "$MIME" in
+            application/gzip|application/x-gzip)
+              tar -xzf pyside-stage.archive -C "$STAGE" --strip-components=1 2>/dev/null \
+                || tar -xzf pyside-stage.archive -C "$STAGE"
+              ;;
+            application/x-xz)
+              tar -xJf pyside-stage.archive -C "$STAGE" --strip-components=1 2>/dev/null \
+                || tar -xJf pyside-stage.archive -C "$STAGE"
+              ;;
+            application/zip)
+              unzip -q pyside-stage.archive -d "$STAGE"
+              ;;
+            *)
+              echo "::error::Unknown stage archive type: $MIME"; exit 1
+              ;;
+          esac
+          rm -f pyside-stage.archive
           echo "PYSIDE_STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
+          ls -la "$STAGE" | head
 
       # ════════ Project setup ════════
       - name: Download project
@@ -252,10 +282,9 @@ jobs:
           mkdir -p workspace
           curl -L --fail "$PROJECT_URL" -o project.zip
           unzip -q project.zip -d workspace
-          # Find main.py — the builder needs the directory that contains it
-          MAIN_PY="$(find workspace -name main.py -maxdepth 4 | head -1)"
+          MAIN_PY="$(find workspace -name main.py -maxdepth 4 -type f | head -1)"
           if [ -z "$MAIN_PY" ]; then
-            echo "::error::Project has no main.py"
+            echo "::error::Project has no main.py within 4 directory levels."
             exit 1
           fi
           PROJ_DIR="$(dirname "$MAIN_PY")"
@@ -269,34 +298,39 @@ jobs:
         run: |
           set -o pipefail
 
-          # Compose the optional --pyside-stage flag
-          STAGE_ARG=""
+          # Compose --pyside-stage / --skip-build flags if a pre-built
+          # stage was supplied.
+          STAGE_ARGS=""
           if [ -n "$PYSIDE_STAGE_DIR" ]; then
-            STAGE_ARG="--pyside-stage $PYSIDE_STAGE_DIR --skip-build"
+            STAGE_ARGS="--pyside-stage $PYSIDE_STAGE_DIR --skip-build"
           fi
 
-          # The builder uses Python 2.7
-          python2.7 pyside_android_builder_py27.py \
-            --project-dir   "$PROJ_DIR" \
-            --necessitas-sdk "$NECESSITAS_DIR" \
-            --app-name      "$APP_NAME" \
-            --unique-name   "$UNIQUE_NAME" \
-            --build-threads "$BUILD_THREADS" \
-            $STAGE_ARG \
-            --verbose \
-            2>&1 | tee build.log
+          # The builder needs Python 2.7.  Everything else (cache dir,
+          # SDK path, app naming) is passed via flags.
+          python2.7 build_pyside_android.py \
+              --project-dir    "$PROJ_DIR" \
+              --necessitas-sdk "$NECESSITAS_DIR" \
+              --cache-dir      "$PYSIDE_BUILDER_CACHE" \
+              --app-name       "$APP_NAME" \
+              --unique-name    "$UNIQUE_NAME" \
+              --build-threads  "$BUILD_THREADS" \
+              $STAGE_ARGS \
+              --verbose \
+              2>&1 | tee build.log
 
       - name: Locate APK
         id: locate
         if: success()
         run: |
-          # Builder puts the APK at:
-          #   <project_dir>/build/android/bin/<app_name>-debug.apk
-          # but the exact path can vary if the project gets renamed.
-          # Fallback: search for any .apk under the project.
-          APK="$(find "$PROJ_DIR" -name '*.apk' -type f | head -1)"
+          # The builder copies the final APK to its artifacts/ dir, and
+          # ALSO leaves the original at example-project/android/bin/.
+          # Prefer the artifacts/ copy (it has the renamed filename).
+          APK="$(find "$PYSIDE_BUILDER_CACHE/artifacts" -name '*.apk' -type f 2>/dev/null | head -1)"
           if [ -z "$APK" ]; then
-            echo "::error::No APK produced — check build.log artifact"
+            APK="$(find "$PYSIDE_BUILDER_CACHE/example-project" -name '*.apk' -type f 2>/dev/null | head -1)"
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced — check build-log artifact"
             exit 1
           fi
           echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
@@ -319,15 +353,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # Optional: tar up the PySide stage so the user can host it for future
-      # runs (skipping the 60-min Shiboken/PySide rebuild).
-      - name: Tar PySide stage as artifact
+      # Tar up the freshly-built stage tree so the user can host it as a
+      # release asset and use --pyside-stage on future runs (skipping
+      # the 60-min cross-compile).  Only emitted on cold-cache runs.
+      - name: Tar PySide stage as artifact (cold-cache runs only)
         if: success() && env.PYSIDE_STAGE_URL == ''
         run: |
-          STAGE_FOUND="$(find "$PROJ_DIR" -type d -name 'stage' -o -name 'pyside-stage' 2>/dev/null | head -1)"
-          if [ -n "$STAGE_FOUND" ]; then
-            tar -czf pyside-stage.tar.gz -C "$STAGE_FOUND" .
+          STAGE_DIR="$PYSIDE_BUILDER_CACHE/build-scripts/stage"
+          if [ -d "$STAGE_DIR" ] && [ -n "$(ls -A "$STAGE_DIR" 2>/dev/null)" ]; then
+            tar -czf pyside-stage.tar.gz -C "$STAGE_DIR" .
             ls -lh pyside-stage.tar.gz
+          else
+            echo "Stage dir empty or missing — not creating artifact."
           fi
 
       - name: Upload PySide stage tarball
