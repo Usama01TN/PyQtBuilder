@@ -115,7 +115,15 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 1
+BUILDER_SCRIPT_VERSION = 2   # 2026-05: appended `-include new -include cstddef
+                             # -include cstring -include cstdlib -include cstdio
+                             # -include cstdint -include climits -fpermissive`
+                             # to env.sh's CXXFLAGS to compensate for modern
+                             # GCC's stricter include hygiene.  Qt 4.8.0
+                             # headers from 2011 used placement new and other
+                             # constructs that historically relied on STL
+                             # headers being auto-included via the old GCC
+                             # implicit-include chain.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -579,16 +587,77 @@ def configure_env(args):
         'export BUILD_THREAD_COUNT=%d' % args.build_threads,
         env_text, count=1, flags=re.MULTILINE)
 
+    # Modern-GCC compatibility flags for Qt 4.8 headers.
+    #
+    # Qt 4.8.0 was released in 2011 against GCC 4.x.  Its headers
+    # (qmap.h, qlist.h, qvector.h, ...) use placement new and other
+    # constructs that historically relied on STL headers being
+    # auto-included via include-chain pollution.  Modern GCC (11+)
+    # tightened up include hygiene, so qmap.h fails with:
+    #
+    #     qmap.h:456: error: no matching function for call to
+    #         'operator new(unsigned int, int*)'
+    #
+    # The fix is `-include <header>` flags which prepend the listed
+    # headers to every translation unit — the equivalent of adding
+    # an `#include` at the top of every .cpp file.
+    #
+    # We also add `-fpermissive` because Qt 4.8 uses several
+    # constructs that modern GCC considers errors but older GCC
+    # considered warnings (e.g. converting string literals to char*,
+    # implicit declarations, narrowing conversions in initialiser lists).
+    compat_flags = (
+        '-include cstddef '       # <cstddef> for std::size_t, NULL
+        '-include cstring '       # <cstring> for memcpy, memset, strlen
+        '-include new '           # <new> for placement new (qmap.h:456)
+        '-include cstdlib '       # <cstdlib> for malloc, free, exit
+        '-include cstdio '        # <cstdio> for FILE, fprintf
+        '-include cstdint '       # <cstdint> for int32_t etc.
+        '-include climits '       # <climits> for INT_MAX etc.
+        '-fpermissive'            # downgrade many C++11+ errors to warnings
+    )
+
+    # Append the flags to whichever line(s) of env.sh export CXXFLAGS or
+    # CFLAGS.  We match `export X="..."` and `export X='...'` styles and
+    # also bare `X=...` assignments.
+    def _patch_flag_line(name, value, text):
+        """Append `value` to every assignment of CXX/CFLAGS in `text`."""
+        # Matches: export NAME="…" / export NAME='…' / NAME="…" / etc.
+        pattern = re.compile(
+            r'^(\s*(?:export\s+)?' + re.escape(name) + r'\s*=\s*["\'])([^"\']*)(["\'].*)$',
+            re.MULTILINE)
+        def repl(m):
+            existing = m.group(2)
+            if value in existing:
+                return m.group(0)        # already present, leave alone
+            sep = '' if (existing == '' or existing.endswith(' ')) else ' '
+            return m.group(1) + existing + sep + value + m.group(3)
+        return pattern.sub(repl, text)
+
+    env_text = _patch_flag_line('CXXFLAGS', compat_flags, env_text)
+    env_text = _patch_flag_line('CFLAGS', '-include cstddef -include cstring', env_text)
+
+    # If env.sh DOESN'T set CXXFLAGS itself (some forks rely on cmake's
+    # default), append an explicit export so our flags reach the compile.
+    if 'CXXFLAGS' not in env_text:
+        env_text = env_text.rstrip() + (
+            '\n\n# Appended by build_pyside_android.py — modern GCC needs\n'
+            '# explicit STL includes that Qt 4.8 headers expect to be\n'
+            '# auto-included via the old GCC implicit-include chain.\n'
+            'export CXXFLAGS="${CXXFLAGS:-} ' + compat_flags + '"\n')
+        log.info('  (env.sh had no CXXFLAGS — appended an explicit export)')
+
     if args.dry_run:
         log.info('  [dry-run] would write env.sh with:')
         log.info('    NECESSITAS_DIR    = %s', args.sdk.root)
         log.info('    ANDROID_NDK       = %s', args.sdk.ndk)
         log.info('    QT_DIR            = %s', args.sdk.qt_dir)
         log.info('    BUILD_THREAD_COUNT= %d', args.build_threads)
+        log.info('    +CXXFLAGS additions: %s', compat_flags)
     else:
         with open(env_path, 'wb') as f:
             f.write(env_text.encode('utf-8'))
-        log.info('  ✓ wrote %s', env_path)
+        log.info('  ✓ wrote %s (with modern-GCC compat flags)', env_path)
 
     # De-promptify build_shiboken.sh and build_pyside.sh
     for script in ('build_shiboken.sh', 'build_pyside.sh'):
