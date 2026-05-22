@@ -65,96 +65,128 @@ env:
   # one returns a sufficiently large file first.
 
   # Qt Installer Framework "controller" script — JavaScript that answers
-  # every page of the installer wizard automatically.  Stored as a
-  # workflow-level env var to dodge the YAML/heredoc indentation conflict
-  # that bites when you embed a here-doc directly inside `run: |`.
+  # every page of the installer wizard automatically.
   #
-  # Reference: https://doc.qt.io/qtinstallerframework/noninteractive.html
-  # Necessitas's installer is QIF 1.4-era so we keep to the basic API.
+  # IMPORTANT: this script targets QIF 1.0 (October 2011 build, as found
+  # in the Necessitas online installer).  QIF 1.0's JavaScript API is
+  # MUCH smaller than later versions.  Things that DO NOT work in 1.0:
+  #
+  #   * installer.setMessageBoxAutomaticAnswer()  — added in 1.3
+  #   * installer.autoRejectMessageBoxes()        — added in 1.2
+  #   * installer.installationFinished.connect()  — signal binding
+  #     from JS came in 1.2+
+  #   * QMessageBox.Yes / .Ignore enums           — not exposed in 1.0
+  #
+  # Calling any of those at script load time triggers a JS TypeError,
+  # which becomes `qFatal("This seems to be broken, check this!!!!")`
+  # and the installer aborts with SIGABRT (we hit this exact path
+  # before this rewrite).
+  #
+  # The safe API surface in QIF 1.0 is small but sufficient:
+  #
+  #   * Controller constructor (must exist, can be empty)
+  #   * Controller.prototype.<PageName>Callback methods
+  #   * gui.clickButton(buttons.NextButton | FinishButton | ...)
+  #   * gui.currentPageWidget()  — for setting line-edit text, etc.
+  #   * installer.environmentVariable("X")
   QIF_AUTO_SCRIPT: |
+    // Empty constructor — DO NOT call any installer.* methods here.
+    // QIF 1.0 will load this script at startup, and any TypeError
+    // raised during construction aborts the installer with SIGABRT.
     function Controller() {
-        installer.autoRejectMessageBoxes();
-        installer.installationFinished.connect(function() {
-            try { gui.clickButton(buttons.NextButton); } catch (e) {}
-        });
-        // Online installers can briefly show a "fetching server list"
-        // dialog before the first page.  Auto-accept it.
-        installer.setMessageBoxAutomaticAnswer("OverwriteTargetDirectory", QMessageBox.Yes);
-        installer.setMessageBoxAutomaticAnswer("installationErrorWithRetry", QMessageBox.Ignore);
-        installer.setMessageBoxAutomaticAnswer("DownloadError", QMessageBox.Ignore);
-        installer.setMessageBoxAutomaticAnswer("archiveDownloadError", QMessageBox.Ignore);
     }
+
     Controller.prototype.WelcomePageCallback = function() {
+        // Welcome page sometimes has a brief delay before NextButton
+        // becomes enabled.  Pass a small delay to clickButton.
         gui.clickButton(buttons.NextButton, 3000);
     };
+
     Controller.prototype.CredentialsPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.IntroductionPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-    // Online-installer extra pages — they appear before TargetDirectory
-    // depending on QIF version.  Each just clicks Next; we don't change
-    // the repo/server because the installer's defaults point at the
-    // Necessitas component servers which is what we want.
+
+    // Online-installer extra pages.  In QIF 1.0 the names may differ;
+    // we just provide callbacks for each known name and let the others
+    // sit unused.  If a page has no callback, QIF defaults to the
+    // current page's own behavior, which usually means "wait for user".
+    // We accept that risk — if a page hangs, the timeout catches it.
     Controller.prototype.RepositoryCategoryPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.FetchSetupConfigurationPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.ServerSelectionPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.TargetDirectoryPageCallback = function() {
         var widget = gui.currentPageWidget();
         var target = installer.environmentVariable("NECESSITAS_TARGET");
-        if (widget.TargetDirectoryLineEdit !== undefined) {
-            widget.TargetDirectoryLineEdit.setText(target);
-        } else if (widget.TargetDirectory !== undefined) {
-            widget.TargetDirectory.setText(target);
+        // QIF 1.0 used the camelCase property name targetDirectoryLineEdit.
+        // QIF 1.4+ used TargetDirectoryLineEdit (capital).  Try both.
+        try {
+            if (widget.targetDirectoryLineEdit !== undefined) {
+                widget.targetDirectoryLineEdit.setText(target);
+            } else if (widget.TargetDirectoryLineEdit !== undefined) {
+                widget.TargetDirectoryLineEdit.setText(target);
+            }
+        } catch (e) {
+            // Don't abort if we can't set the target — the default may
+            // already be acceptable.
         }
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.ComponentSelectionPageCallback = function() {
         var widget = gui.currentPageWidget();
-        if (widget.selectAll !== undefined) {
-            widget.selectAll();
-        }
+        try {
+            if (widget.selectAll !== undefined) {
+                widget.selectAll();
+            }
+        } catch (e) {}
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.LicenseAgreementPageCallback = function() {
         var widget = gui.currentPageWidget();
-        if (widget.AcceptLicenseRadioButton !== undefined) {
-            widget.AcceptLicenseRadioButton.setChecked(true);
-        } else if (widget.acceptLicense !== undefined) {
-            widget.acceptLicense.setChecked(true);
-        } else {
-            var checks = widget.findChildren("QCheckBox");
-            for (var i = 0; i < checks.length; i++) {
-                checks[i].setChecked(true);
+        try {
+            // QIF 1.0 used `acceptLicense` (camelCase, no underscores).
+            // QIF 1.4+ exposed an AcceptLicenseRadioButton property.
+            if (widget.acceptLicense !== undefined) {
+                widget.acceptLicense.setChecked(true);
+            } else if (widget.AcceptLicenseRadioButton !== undefined) {
+                widget.AcceptLicenseRadioButton.setChecked(true);
             }
-            var radios = widget.findChildren("QRadioButton");
-            for (var j = 0; j < radios.length; j++) {
-                if (radios[j].text && radios[j].text.toLowerCase().indexOf("accept") >= 0) {
-                    radios[j].setChecked(true);
-                }
-            }
-        }
+        } catch (e) {}
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.StartMenuDirectoryPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
+
     Controller.prototype.ReadyForInstallationPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-    Controller.prototype.PerformInstallationPageCallback = function() {};
+
+    Controller.prototype.PerformInstallationPageCallback = function() {
+        // No-op — wait for the install to complete.  QIF 1.0 advances
+        // this page automatically when the install finishes.
+    };
+
     Controller.prototype.FinishedPageCallback = function() {
-        var widget = gui.currentPageWidget();
-        if (widget.LaunchQtCreatorCheckBoxForm !== undefined) {
-            widget.LaunchQtCreatorCheckBoxForm.launchQtCreatorCheckBox.setChecked(false);
-        }
+        // Click Finish to close the wizard.  We deliberately don't
+        // touch the "Launch Qt Creator" checkbox state because the
+        // form property names vary across QIF versions and a bad
+        // dotted-property lookup throws TypeError here too.
         gui.clickButton(buttons.FinishButton);
     };
 
