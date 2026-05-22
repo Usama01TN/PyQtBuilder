@@ -115,30 +115,24 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 4   # 2026-05: complete NDK rework + shiboken source
-                             # compatibility flags.
+BUILDER_SCRIPT_VERSION = 5   # 2026-05: NDK r8b is gone from Google's CDN
+                             # (Google removed it ~2017 when restructuring
+                             # /android/ndk/ → /android/repository/).
                              #
-                             # Discovered that:
-                             #   1. env.sh hardcodes NDK r6b paths (STL 4.4.3,
-                             #      linux-x86 prebuilt) that don't exist on
-                             #      most installs.
-                             #   2. Necessitas's online installer often fails
-                             #      to actually download the NDK (component
-                             #      server is dead since ~2014).
-                             #   3. shiboken-android source files miss
-                             #      `#include <list>` / `<string>` /
-                             #      `<utility>` etc.  Patching Qt headers
-                             #      alone is insufficient.
+                             # v5 switches the default NDK to r10e (the
+                             # oldest still hosted by Google) and tries a
+                             # list of currently-working URLs:
+                             #   - dl.google.com/android/repository/
+                             #     android-ndk-{r10e, r12b, r13b, r17c}-
+                             #     linux-x86_64.zip
                              #
-                             # v4 fixes by:
-                             #   - probing the actual NDK contents and
-                             #     substituting discovered paths into env.sh
-                             #   - downloading NDK r8b from Google's archive
-                             #     if Necessitas's NDK is incomplete
-                             #   - expanding -include flags to include all
-                             #     C++ STL headers shiboken's source uses
-                             #     (list, vector, map, set, string, utility,
-                             #     algorithm, sstream)
+                             # User can override with NDK_DOWNLOAD_URL env
+                             # var to point at a self-hosted mirror (e.g.
+                             # GitHub Release asset).
+                             #
+                             # The .zip vs .tar.bz2 detection now sniffs
+                             # the file's magic bytes rather than trusting
+                             # the URL extension.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -576,14 +570,36 @@ def setup_workspace(args):
 # multiple GCC versions (4.4.3, 4.6, 4.7).  4.4.3 matches what env.sh
 # expects.
 
-GOOGLE_NDK_URL = (
-    'https://dl.google.com/android/ndk/'
-    'android-ndk-r8b-linux-x86_64.tar.bz2')
+# NDK download URL list — ordered by preference.  Google's CDN at
+# dl.google.com/android/repository/ is the canonical permanent home for
+# NDKs and has been stable for ~10 years.  NDK r8b (what M4rtinK's
+# scripts originally targeted) was REMOVED from Google's CDN in ~2017
+# when they restructured /android/ndk/ → /android/repository/.  The
+# oldest NDK still hosted is r10e (released March 2015, last with GCC
+# 4.x), which is what we target now.  Our v4 NDK-path probing logic
+# substitutes whatever STL/toolchain version is found into env.sh, so
+# it doesn't matter that r10e is 4.6/4.8/4.9 instead of r8b's 4.4.3.
+#
+# The user can override the list entirely via the NDK_DOWNLOAD_URL
+# environment variable — if both lists below fail, set that to a
+# self-hosted URL (e.g. a GitHub Release asset).
+NDK_DOWNLOAD_URLS = [
+    # Primary: NDK r10e from Google CDN (.zip, ~400MB).
+    # Stable, still hosted as of 2026.  This is the file Google itself
+    # links from developer.android.com/ndk/downloads/older_releases.
+    'https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip',
 
-# Mirror of the same NDK on archive.org in case Google's CDN moves.
-GOOGLE_NDK_URL_MIRROR = (
-    'https://archive.org/download/android-ndk-r8b-linux-x86_64/'
-    'android-ndk-r8b-linux-x86_64.tar.bz2')
+    # Secondary: NDK r12b (similar era, also still hosted).  Some
+    # people find r12b builds cleaner than r10e.
+    'https://dl.google.com/android/repository/android-ndk-r12b-linux-x86_64.zip',
+
+    # Tertiary: NDK r13b
+    'https://dl.google.com/android/repository/android-ndk-r13b-linux-x86_64.zip',
+
+    # Quaternary: NDK r17c — the last NDK with GCC 4.9 at all.
+    # If r10e/r12b/r13b are gone, this is the fallback.
+    'https://dl.google.com/android/repository/android-ndk-r17c-linux-x86_64.zip',
+]
 
 
 def _probe_ndk(ndk_dir):
@@ -700,67 +716,157 @@ def _probe_ndk(ndk_dir):
     return info
 
 
-def _download_ndk_r8b(dest_dir, dry_run=False):
+def _download_ndk(dest_parent_dir, dry_run=False):
     """
-    Download NDK r8b from Google's archive and extract to *dest_dir*.
+    Download a working Android NDK from Google's CDN and extract it to
+    *dest_parent_dir*.  Returns the path to the extracted android-ndk-*/
+    subdirectory.
 
-    Returns the path to the extracted android-ndk-r8b/ subdir.
+    Tries URLs in this order:
+      1. The user's override URL ($NDK_DOWNLOAD_URL env var, if set)
+      2. Each URL in NDK_DOWNLOAD_URLS (r10e → r12b → r13b → r17c)
+
+    Handles both .zip (NDK r10e and newer) and .tar.bz2 (NDK r9 and
+    older) by sniffing the file's content rather than trusting the URL
+    extension.
+
+    File size sanity check: any download under 50 MB is rejected as a
+    likely HTML error page or partial transfer.
     """
-    log.info('  downloading NDK r8b from Google archive (this is large, ~120 MB)')
-    parent = os.path.dirname(os.path.realpath(dest_dir))
-    _makedirs(parent)
+    log.info('  acquiring Android NDK (one-time, ~400-500 MB download)')
+    _makedirs(dest_parent_dir)
 
-    archive = os.path.join(parent, 'android-ndk-r8b-linux-x86_64.tar.bz2')
+    # User-provided override via env var takes priority.  Useful when
+    # the user has mirrored an NDK to their own GitHub Release etc.
+    user_url = os.environ.get('NDK_DOWNLOAD_URL', '').strip()
+    urls = [user_url] if user_url else []
+    urls += NDK_DOWNLOAD_URLS
 
-    # Try Google first, then mirror.  curl handles bz2 streaming better
-    # than urllib2 for big files.
-    for url in (GOOGLE_NDK_URL, GOOGLE_NDK_URL_MIRROR):
+    archive_path = os.path.join(dest_parent_dir, 'ndk-download.archive')
+    chosen_url = None
+    MIN_NDK_BYTES = 50 * 1024 * 1024   # 50 MB — well under any real NDK
+
+    for url in urls:
         log.info('  trying %s', url)
         if dry_run:
-            open(archive, 'w').close()
+            open(archive_path, 'w').close()
+            chosen_url = url
             break
-        # Use curl via subprocess — more reliable than urllib2 for ~120MB
-        rc = run(['curl', '-L', '--fail', '--retry', '3',
-                  '--retry-delay', '5', '--max-time', '600',
-                  '-A', 'Mozilla/5.0',
-                  '-o', archive, url],
-                 check=False, dry_run=False)
-        if rc == 0 and os.path.getsize(archive) > 100 * 1024 * 1024:
-            log.info('  ✓ downloaded %d bytes', os.path.getsize(archive))
-            break
-        log.warning('  ! download from this URL failed, trying next')
-        try:
-            os.remove(archive)
-        except OSError:
-            pass
-    else:
+
+        # Clean any partial file from a previous attempt
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+
+        rc = run([
+            'curl', '-L', '--fail', '--retry', '3',
+            '--retry-delay', '5', '--max-time', '900',
+            '-A', 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0',
+            '-o', archive_path, url,
+        ], check=False, dry_run=False)
+
+        if rc != 0:
+            log.warning('  ! curl failed for this URL (exit %d)', rc)
+            continue
+
+        size = os.path.getsize(archive_path) if os.path.isfile(archive_path) else 0
+        if size < MIN_NDK_BYTES:
+            log.warning('  ! got only %d bytes (need ≥ %d) — likely error page',
+                        size, MIN_NDK_BYTES)
+            try:
+                # Peek the first few bytes to log what we got
+                with open(archive_path, 'rb') as f:
+                    head = f.read(200)
+                log.warning('    file head: %r', head[:150])
+            except (IOError, OSError):
+                pass
+            continue
+
+        log.info('  ✓ downloaded %d bytes (%.1f MB)', size, size / (1024.0 * 1024.0))
+        chosen_url = url
+        break
+
+    if chosen_url is None:
+        # Last resort error message — tell the user exactly what to do.
         raise SystemExit(
-            '  X could not download NDK r8b from either Google or archive.org.\n'
-            '    Network may be restricted, or both mirrors may be down.')
+            '  X All NDK download URLs failed.\n'
+            '\n'
+            '    Tried in order:\n'
+            + ''.join('      %s\n' % u for u in urls) +
+            '\n'
+            '    Workarounds:\n'
+            '\n'
+            '    A) Set NDK_DOWNLOAD_URL env var to a self-hosted mirror.\n'
+            '       Upload an NDK r8e/r9d/r10e .tar.bz2 or .zip to a\n'
+            '       GitHub Release on your repo, then in the workflow:\n'
+            '\n'
+            '         env:\n'
+            '           NDK_DOWNLOAD_URL: "https://github.com/USER/REPO/releases/download/v1/android-ndk-r10e.zip"\n'
+            '\n'
+            '    B) Pre-build the Shiboken+PySide stage tarball locally\n'
+            '       on a machine with a working NDK install, then pass\n'
+            '       --pyside-stage URL to skip the cross-compile entirely.\n'
+            '\n'
+            '    C) Switch to the PyQt5/Qt5 builder (build_pyqt5_android.py).\n'
+            '       The PyQt5 build chain uses Qt 5 and modern toolchains\n'
+            '       that aren\'t bit-rotting like the Necessitas stack.')
 
     if dry_run:
-        log.info('  [dry-run] would extract %s -> %s', archive, dest_dir)
-        return os.path.join(parent, 'android-ndk-r8b')
+        # Return a plausible extracted path so downstream steps see something
+        return os.path.join(dest_parent_dir, 'android-ndk-r10e')
 
-    log.info('  extracting NDK (slow — ~120 MB of small files)')
-    run(['tar', '-xjf', archive, '-C', parent], dry_run=False)
-    os.remove(archive)
+    # Sniff the archive type by reading magic bytes rather than trusting
+    # the URL extension.  Real archives:
+    #   .zip          : starts with "PK\x03\x04" or "PK\x05\x06"
+    #   .tar.bz2      : starts with "BZh"
+    #   .tar.gz       : starts with "\x1f\x8b"
+    #   .tar.xz       : starts with "\xfd7zXZ"
+    with open(archive_path, 'rb') as f:
+        magic = f.read(6)
 
-    real_ndk = os.path.join(parent, 'android-ndk-r8b')
-    if not os.path.isdir(real_ndk):
+    log.info('  extracting NDK (this is the slow part — ~500MB of small files)')
+    if magic.startswith(b'PK'):
+        log.info('  detected ZIP archive')
+        run(['unzip', '-q', archive_path, '-d', dest_parent_dir], dry_run=False)
+    elif magic.startswith(b'BZh'):
+        log.info('  detected bzip2 tarball')
+        run(['tar', '-xjf', archive_path, '-C', dest_parent_dir], dry_run=False)
+    elif magic.startswith(b'\x1f\x8b'):
+        log.info('  detected gzip tarball')
+        run(['tar', '-xzf', archive_path, '-C', dest_parent_dir], dry_run=False)
+    elif magic.startswith(b'\xfd7zXZ'):
+        log.info('  detected xz tarball')
+        run(['tar', '-xJf', archive_path, '-C', dest_parent_dir], dry_run=False)
+    else:
         raise SystemExit(
-            '  X NDK extraction succeeded but android-ndk-r8b/ not found at %s'
-            % real_ndk)
+            '  X downloaded file at %s is not a recognized archive.\n'
+            '    First 6 bytes: %r\n'
+            '    URL was: %s'
+            % (archive_path, magic, chosen_url))
 
-    log.info('  ✓ NDK r8b extracted to %s', real_ndk)
+    os.remove(archive_path)
+
+    # The extracted dir name varies by NDK version: android-ndk-r10e/,
+    # android-ndk-r12b/, etc.  Find whichever one landed.
+    candidates = [
+        d for d in os.listdir(dest_parent_dir)
+        if d.startswith('android-ndk-')
+        and os.path.isdir(os.path.join(dest_parent_dir, d))
+    ]
+    if not candidates:
+        raise SystemExit(
+            '  X extraction finished but no android-ndk-*/ dir at %s.\n'
+            '    Contents: %s' % (dest_parent_dir, os.listdir(dest_parent_dir)))
+
+    real_ndk = os.path.join(dest_parent_dir, candidates[0])
+    log.info('  ✓ NDK extracted to %s', real_ndk)
     return real_ndk
 
 
 def _ensure_working_ndk(args):
     """
     Verify the Necessitas NDK has all the bits we need (toolchain, STL,
-    platform headers).  If anything's missing, download NDK r8b from
-    Google's archive and use that instead.
+    platform headers).  If anything's missing, download a replacement
+    NDK from the still-hosted Google CDN URLs.
 
     Updates args.sdk.ndk to point at the working NDK.  Returns the
     probed-paths dict from _probe_ndk().
@@ -775,28 +881,41 @@ def _ensure_working_ndk(args):
         log.info('    Platform dir   : %s', info['platform_dir'])
         return info
     except SystemExit as e:
-        log.warning('  ! Necessitas NDK is incomplete: %s',
-                    str(e).strip().replace('\n', ' '))
+        # Squash the nested SystemExit into a single-line warning so
+        # the log stays readable.
+        msg = str(e).strip().replace('\n', ' ')
+        # Trim the multi-space gaps left by stripped newlines
+        msg = re.sub(r'\s{2,}', ' ', msg)
+        log.warning('  ! Necessitas NDK is incomplete: %s', msg)
 
     # Necessitas's NDK didn't work — download a fresh one.
-    log.info('  downloading replacement NDK r8b from Google archive')
+    log.info('  downloading replacement NDK from Google CDN')
     new_ndk_parent = os.path.join(args.cache_dir, 'extra-ndk')
     _makedirs(new_ndk_parent)
 
-    # Skip download if cached
-    cached = os.path.join(new_ndk_parent, 'android-ndk-r8b')
-    if os.path.isdir(cached) and os.path.isfile(os.path.join(
-            cached, 'sources', 'cxx-stl', 'gnu-libstdc++', '4.4.3', 'include',
-            'cstddef')):
-        log.info('  ✓ NDK r8b already cached at %s', cached)
-        new_ndk = cached
-    else:
-        new_ndk = _download_ndk_r8b(new_ndk_parent, dry_run=args.dry_run)
+    # Skip download if a working NDK is already cached.  We look for any
+    # android-ndk-*/ subdirectory that probes successfully.
+    cached_ndk = None
+    if os.path.isdir(new_ndk_parent):
+        for name in os.listdir(new_ndk_parent):
+            candidate = os.path.join(new_ndk_parent, name)
+            if name.startswith('android-ndk-') and os.path.isdir(candidate):
+                try:
+                    _probe_ndk(candidate)
+                    cached_ndk = candidate
+                    log.info('  ✓ NDK already cached at %s', cached_ndk)
+                    break
+                except SystemExit:
+                    # Partial / corrupted cache — fall through and re-download
+                    continue
+
+    if cached_ndk is None:
+        cached_ndk = _download_ndk(new_ndk_parent, dry_run=args.dry_run)
 
     # Override the SDK's ndk path with the new one
-    args.sdk.ndk = new_ndk
-    log.info('  ✓ using downloaded NDK at %s', new_ndk)
-    return _probe_ndk(new_ndk)
+    args.sdk.ndk = cached_ndk
+    log.info('  ✓ using NDK at %s', cached_ndk)
+    return _probe_ndk(cached_ndk)
 
 
 # ----------------------------------------------------------------------------
