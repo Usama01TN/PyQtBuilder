@@ -115,27 +115,30 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 3   # 2026-05: patch Qt 4.8 headers DIRECTLY rather
-                             # than relying on env.sh CXXFLAGS (v2 approach).
+BUILDER_SCRIPT_VERSION = 4   # 2026-05: complete NDK rework + shiboken source
+                             # compatibility flags.
                              #
-                             # v2 added -include new etc. to env.sh CXXFLAGS,
-                             # but those flags never reached the actual
-                             # compile because:
-                             #   * build_shiboken.sh's cmake reads
-                             #     CMAKE_CXX_FLAGS, not env $CXXFLAGS
-                             #   * stale CMakeCache.txt from the v2 failure
-                             #     held the old (empty) CXXFLAGS configured
-                             #     value, short-circuiting re-config
+                             # Discovered that:
+                             #   1. env.sh hardcodes NDK r6b paths (STL 4.4.3,
+                             #      linux-x86 prebuilt) that don't exist on
+                             #      most installs.
+                             #   2. Necessitas's online installer often fails
+                             #      to actually download the NDK (component
+                             #      server is dead since ~2014).
+                             #   3. shiboken-android source files miss
+                             #      `#include <list>` / `<string>` /
+                             #      `<utility>` etc.  Patching Qt headers
+                             #      alone is insufficient.
                              #
-                             # v3 instead prepends `#include <new>` + other
-                             # STL headers to the Qt 4.8 container headers
-                             # themselves (qmap.h, qhash.h, qlist.h, etc.)
-                             # ANY compile that pulls in these headers gets
-                             # the missing includes — bypasses every "did
-                             # the flag actually reach the compiler?" issue.
-                             # v3 also wipes shiboken-build/ and pyside-build/
-                             # before invoking the bash scripts so a stale
-                             # CMakeCache.txt can't sabotage the rebuild.
+                             # v4 fixes by:
+                             #   - probing the actual NDK contents and
+                             #     substituting discovered paths into env.sh
+                             #   - downloading NDK r8b from Google's archive
+                             #     if Necessitas's NDK is incomplete
+                             #   - expanding -include flags to include all
+                             #     C++ STL headers shiboken's source uses
+                             #     (list, vector, map, set, string, utility,
+                             #     algorithm, sstream)
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -552,72 +555,353 @@ def setup_workspace(args):
 
 
 # ----------------------------------------------------------------------------
+# NDK acquisition + path probing
+# ----------------------------------------------------------------------------
+#
+# Necessitas's offline NDK ship was version r6b from 2011.  Two problems
+# with relying on it in 2026:
+#
+#   1. Necessitas's online installer often fails to actually download
+#      the NDK component (its component server has been unmaintained
+#      since ~2014).  necessitas-install.log shows many "Could not delete
+#      ...android-ndk-r6b-linux-x86.7z" errors that mean the file was
+#      never present to begin with.
+#
+#   2. NDK r6b was Linux-x86 (32-bit host) only.  Modern Ubuntu runners
+#      are x86_64; running 32-bit binaries needs multilib (we have it)
+#      but the NDK was never tested on 2020s glibc.
+#
+# We sidestep both by downloading NDK r8b from Google's archive (still
+# hosted as of late 2025) which has 64-bit host binaries AND ships
+# multiple GCC versions (4.4.3, 4.6, 4.7).  4.4.3 matches what env.sh
+# expects.
+
+GOOGLE_NDK_URL = (
+    'https://dl.google.com/android/ndk/'
+    'android-ndk-r8b-linux-x86_64.tar.bz2')
+
+# Mirror of the same NDK on archive.org in case Google's CDN moves.
+GOOGLE_NDK_URL_MIRROR = (
+    'https://archive.org/download/android-ndk-r8b-linux-x86_64/'
+    'android-ndk-r8b-linux-x86_64.tar.bz2')
+
+
+def _probe_ndk(ndk_dir):
+    """
+    Inspect the NDK at *ndk_dir* and return a dict with the actual paths
+    the build needs.  These are HARDCODED in upstream env.sh to versions
+    that don't exist on most installs:
+
+        gnu-libstdc++/4.4.3/include
+        toolchains/arm-linux-androideabi-4.4.3/prebuilt/linux-x86/bin/
+        platforms/android-8/arch-arm
+
+    We probe what's actually there and substitute correct paths.
+
+    Returns dict with keys: stl_version, stl_include, stl_libs,
+    toolchain_dir, toolchain_bin, platform_dir, host_prebuilt.
+
+    Raises SystemExit with a clear diagnostic if the NDK is empty or
+    has none of the expected subdirectories.
+    """
+    if not os.path.isdir(ndk_dir):
+        raise SystemExit('  X NDK directory does not exist: %s' % ndk_dir)
+
+    info = {}
+
+    # 1. Find STL version.  NDK r6b ships 4.4.3 only; r7+ adds 4.6;
+    # r8+ adds 4.7 and 4.8.  Prefer the lowest (4.4.3) because that's
+    # what env.sh and the shiboken code were written for.
+    stl_root = os.path.join(ndk_dir, 'sources', 'cxx-stl', 'gnu-libstdc++')
+    if not os.path.isdir(stl_root):
+        raise SystemExit(
+            '  X No gnu-libstdc++ STL in NDK at %s\n'
+            '    Expected: %s/sources/cxx-stl/gnu-libstdc++/\n'
+            '    This NDK install is incomplete.  Pass --download-ndk to\n'
+            '    fetch a working NDK r8b from Google\'s archive.'
+            % (ndk_dir, ndk_dir))
+    stl_versions = sorted([
+        d for d in os.listdir(stl_root)
+        if os.path.isdir(os.path.join(stl_root, d, 'include'))
+    ])
+    if not stl_versions:
+        raise SystemExit(
+            '  X No usable STL versions found under %s\n'
+            '    Expected one or more of: 4.4.3, 4.6, 4.7, 4.8' % stl_root)
+    info['stl_version'] = stl_versions[0]   # prefer lowest = oldest = matches env.sh
+    info['stl_include'] = os.path.join(stl_root, info['stl_version'], 'include')
+    info['stl_libs'] = os.path.join(stl_root, info['stl_version'],
+                                    'libs', 'armeabi')
+    if not os.path.isfile(os.path.join(info['stl_include'], 'cstddef')):
+        raise SystemExit(
+            '  X STL include path %s missing cstddef.\n'
+            '    The NDK install is corrupted.' % info['stl_include'])
+
+    # 2. Find toolchain.  NDK r6b: arm-linux-androideabi-4.4.3 only.
+    #    NDK r8b: 4.4.3 + 4.6 + 4.7.  Prefer 4.4.3 to match shiboken's
+    #    expectations and the env.sh defaults.
+    tc_root = os.path.join(ndk_dir, 'toolchains')
+    if not os.path.isdir(tc_root):
+        raise SystemExit('  X No toolchains/ dir in NDK at %s' % ndk_dir)
+    candidates = sorted([
+        d for d in os.listdir(tc_root)
+        if d.startswith('arm-linux-androideabi-')
+    ])
+    if not candidates:
+        raise SystemExit(
+            '  X No arm-linux-androideabi-* toolchain in %s' % tc_root)
+    # Match STL version to toolchain version when possible (avoid ABI mismatch).
+    matched = [c for c in candidates if c.endswith('-' + info['stl_version'])]
+    info['toolchain_dir'] = os.path.join(
+        tc_root, matched[0] if matched else candidates[0])
+
+    # 3. Find host prebuilt arch.  NDK r6b: linux-x86 only.
+    #    NDK r8b: linux-x86 + linux-x86_64.  Prefer x86_64 on 64-bit hosts.
+    prebuilt_root = os.path.join(info['toolchain_dir'], 'prebuilt')
+    if not os.path.isdir(prebuilt_root):
+        raise SystemExit('  X No prebuilt/ in %s' % info['toolchain_dir'])
+    host_dirs = sorted(os.listdir(prebuilt_root))
+    # Prefer x86_64, fall back to x86
+    if 'linux-x86_64' in host_dirs:
+        info['host_prebuilt'] = 'linux-x86_64'
+    elif 'linux-x86' in host_dirs:
+        info['host_prebuilt'] = 'linux-x86'
+    elif host_dirs:
+        info['host_prebuilt'] = host_dirs[0]   # whatever's there
+    else:
+        raise SystemExit('  X No host prebuilt dirs in %s' % prebuilt_root)
+    info['toolchain_bin'] = os.path.join(prebuilt_root, info['host_prebuilt'], 'bin')
+
+    # Sanity-check the compiler binary exists
+    gxx = os.path.join(info['toolchain_bin'], 'arm-linux-androideabi-g++')
+    if not os.path.isfile(gxx):
+        raise SystemExit(
+            '  X arm-linux-androideabi-g++ not found at %s\n'
+            '    Toolchain install is incomplete.' % gxx)
+
+    # 4. Find Android platform dir.  env.sh defaults to api 8.
+    plats_root = os.path.join(ndk_dir, 'platforms')
+    if not os.path.isdir(plats_root):
+        raise SystemExit('  X No platforms/ in NDK at %s' % ndk_dir)
+    plats = sorted([
+        d for d in os.listdir(plats_root)
+        if d.startswith('android-')
+        and os.path.isdir(os.path.join(plats_root, d, 'arch-arm', 'usr', 'include'))
+    ])
+    if not plats:
+        raise SystemExit(
+            '  X No android-* platform dirs in %s' % plats_root)
+    # Prefer android-9 if available (works for most things), else android-8
+    # (env.sh default), else lowest available.
+    preferred = ['android-9', 'android-8', 'android-14']
+    chosen = next((p for p in preferred if p in plats), plats[0])
+    info['platform_dir'] = os.path.join(plats_root, chosen, 'arch-arm')
+
+    return info
+
+
+def _download_ndk_r8b(dest_dir, dry_run=False):
+    """
+    Download NDK r8b from Google's archive and extract to *dest_dir*.
+
+    Returns the path to the extracted android-ndk-r8b/ subdir.
+    """
+    log.info('  downloading NDK r8b from Google archive (this is large, ~120 MB)')
+    parent = os.path.dirname(os.path.realpath(dest_dir))
+    _makedirs(parent)
+
+    archive = os.path.join(parent, 'android-ndk-r8b-linux-x86_64.tar.bz2')
+
+    # Try Google first, then mirror.  curl handles bz2 streaming better
+    # than urllib2 for big files.
+    for url in (GOOGLE_NDK_URL, GOOGLE_NDK_URL_MIRROR):
+        log.info('  trying %s', url)
+        if dry_run:
+            open(archive, 'w').close()
+            break
+        # Use curl via subprocess — more reliable than urllib2 for ~120MB
+        rc = run(['curl', '-L', '--fail', '--retry', '3',
+                  '--retry-delay', '5', '--max-time', '600',
+                  '-A', 'Mozilla/5.0',
+                  '-o', archive, url],
+                 check=False, dry_run=False)
+        if rc == 0 and os.path.getsize(archive) > 100 * 1024 * 1024:
+            log.info('  ✓ downloaded %d bytes', os.path.getsize(archive))
+            break
+        log.warning('  ! download from this URL failed, trying next')
+        try:
+            os.remove(archive)
+        except OSError:
+            pass
+    else:
+        raise SystemExit(
+            '  X could not download NDK r8b from either Google or archive.org.\n'
+            '    Network may be restricted, or both mirrors may be down.')
+
+    if dry_run:
+        log.info('  [dry-run] would extract %s -> %s', archive, dest_dir)
+        return os.path.join(parent, 'android-ndk-r8b')
+
+    log.info('  extracting NDK (slow — ~120 MB of small files)')
+    run(['tar', '-xjf', archive, '-C', parent], dry_run=False)
+    os.remove(archive)
+
+    real_ndk = os.path.join(parent, 'android-ndk-r8b')
+    if not os.path.isdir(real_ndk):
+        raise SystemExit(
+            '  X NDK extraction succeeded but android-ndk-r8b/ not found at %s'
+            % real_ndk)
+
+    log.info('  ✓ NDK r8b extracted to %s', real_ndk)
+    return real_ndk
+
+
+def _ensure_working_ndk(args):
+    """
+    Verify the Necessitas NDK has all the bits we need (toolchain, STL,
+    platform headers).  If anything's missing, download NDK r8b from
+    Google's archive and use that instead.
+
+    Updates args.sdk.ndk to point at the working NDK.  Returns the
+    probed-paths dict from _probe_ndk().
+    """
+    log.info('  validating NDK at %s', args.sdk.ndk)
+    try:
+        info = _probe_ndk(args.sdk.ndk)
+        log.info('  ✓ existing NDK is usable')
+        log.info('    STL version    : %s', info['stl_version'])
+        log.info('    Host prebuilt  : %s', info['host_prebuilt'])
+        log.info('    Toolchain bin  : %s', info['toolchain_bin'])
+        log.info('    Platform dir   : %s', info['platform_dir'])
+        return info
+    except SystemExit as e:
+        log.warning('  ! Necessitas NDK is incomplete: %s',
+                    str(e).strip().replace('\n', ' '))
+
+    # Necessitas's NDK didn't work — download a fresh one.
+    log.info('  downloading replacement NDK r8b from Google archive')
+    new_ndk_parent = os.path.join(args.cache_dir, 'extra-ndk')
+    _makedirs(new_ndk_parent)
+
+    # Skip download if cached
+    cached = os.path.join(new_ndk_parent, 'android-ndk-r8b')
+    if os.path.isdir(cached) and os.path.isfile(os.path.join(
+            cached, 'sources', 'cxx-stl', 'gnu-libstdc++', '4.4.3', 'include',
+            'cstddef')):
+        log.info('  ✓ NDK r8b already cached at %s', cached)
+        new_ndk = cached
+    else:
+        new_ndk = _download_ndk_r8b(new_ndk_parent, dry_run=args.dry_run)
+
+    # Override the SDK's ndk path with the new one
+    args.sdk.ndk = new_ndk
+    log.info('  ✓ using downloaded NDK at %s', new_ndk)
+    return _probe_ndk(new_ndk)
+
+
+# ----------------------------------------------------------------------------
 # Step 3 -- Configure env.sh and de-promptify the bash scripts
 # ----------------------------------------------------------------------------
 
 def configure_env(args):
     """
     Write a customised env.sh into the build-scripts directory with the
-    right NECESSITAS_DIR, NDK path, Qt path, and build-thread count.
-    Also patch out the `read -p "press any key"` calls in build_shiboken.sh
-    and build_pyside.sh so the build runs unattended.
+    right NECESSITAS_DIR, NDK path, Qt path, build-thread count, AND
+    correctly-discovered NDK toolchain/STL versions.
+
+    The upstream env.sh hardcodes paths to NDK r6b:
+
+        STL_INCLUDES="-I${STL_PATH}/4.4.3/include -I${STL_PATH}/4.4.3/libs/armeabi/include"
+        ANDROID_BIN="${ANDROID_NDK}/toolchains/arm-linux-androideabi-4.4.3/prebuilt/linux-x86/bin/"
+
+    Those paths are wrong for any NDK other than the original r6b 32-bit
+    host build.  Modern runners are x86_64 and the bundled Necessitas
+    NDK install often fails (its component server is dead).  This
+    function probes the actual NDK on disk via _probe_ndk() and
+    substitutes the discovered paths.
+
+    Also patches out the `read -p "press any key"` calls in
+    build_shiboken.sh and build_pyside.sh so the build runs unattended.
     """
     log.info('Step 3/12 -- Configure env.sh + de-prompt build scripts')
+
+    # FIRST: validate the NDK and download a working one if necessary.
+    # This may update args.sdk.ndk to point at a fresh r8b install.
+    ndk_info = _ensure_working_ndk(args)
 
     bs = args.build_scripts_dir
     env_path = os.path.join(bs, 'env.sh')
 
-    # Read the upstream env.sh, replace the NECESSITAS_DIR placeholder
-    # AND the BUILD_THREAD_COUNT, then write back.  We don't try to be
-    # clever — just sed-style string substitution.
     with open(env_path, 'rb') as f:
         env_text = f.read().decode('utf-8')
 
-    # The placeholder is literally: <path to the Necessitas SDK folder>
+    # NECESSITAS_DIR placeholder.
     env_text = env_text.replace(
         '<path to the Necessitas SDK folder>',
         args.sdk.root)
 
-    # The repo also hard-codes ANDROID_NDK to ${NECESSITAS_DIR}/android-ndk,
-    # but Necessitas sometimes installs as android-ndk-r8b.  Replace the
-    # whole ANDROID_NDK line with our detected path.
+    # ANDROID_NDK — point at the working NDK (Necessitas's or downloaded).
     env_text = re.sub(
         r'^export\s+ANDROID_NDK=.*$',
         'export ANDROID_NDK="%s"' % args.sdk.ndk,
         env_text, count=1, flags=re.MULTILINE)
 
-    # Similarly for QT_DIR — repo's path differs from the script's earlier
-    # default.  Use whatever NecessitasSDK detected.
+    # QT_DIR — Necessitas's Qt 4.8 install.
     env_text = re.sub(
         r'^export\s+QT_DIR=.*$',
         'export QT_DIR="%s"' % args.sdk.qt_dir,
         env_text, count=1, flags=re.MULTILINE)
 
-    # Build threads.
+    # BUILD_THREAD_COUNT.
     env_text = re.sub(
         r'^export\s+BUILD_THREAD_COUNT=.*$',
         'export BUILD_THREAD_COUNT=%d' % args.build_threads,
         env_text, count=1, flags=re.MULTILINE)
 
-    # Modern-GCC compatibility flags for Qt 4.8 headers.
+    # NDK STL version — upstream hardcodes 4.4.3 in two places.
+    # Replace with the version we actually found in the NDK.
+    log.info('  substituting STL version 4.4.3 -> %s in env.sh',
+             ndk_info['stl_version'])
+    env_text = env_text.replace('/4.4.3/', '/%s/' % ndk_info['stl_version'])
+
+    # NDK toolchain version — same hardcoded 4.4.3.
+    env_text = env_text.replace(
+        'arm-linux-androideabi-4.4.3',
+        os.path.basename(ndk_info['toolchain_dir']))
+
+    # Host prebuilt — upstream hardcodes linux-x86.  Modern runners need
+    # linux-x86_64 for the cross-compiler to even run (NDK r8b has
+    # 64-bit prebuilts but r6b doesn't).
+    if ndk_info['host_prebuilt'] != 'linux-x86':
+        log.info('  substituting prebuilt linux-x86 -> %s in env.sh',
+                 ndk_info['host_prebuilt'])
+        env_text = env_text.replace(
+            'prebuilt/linux-x86/',
+            'prebuilt/%s/' % ndk_info['host_prebuilt'])
+
+    # ANDROID_API_LEVEL — make sure the platform we discovered is used.
+    discovered_api = re.search(r'android-(\d+)',
+                               os.path.basename(os.path.dirname(
+                                   ndk_info['platform_dir'])))
+    if discovered_api:
+        env_text = re.sub(
+            r'^export\s+ANDROID_API_LEVEL=.*$',
+            'export ANDROID_API_LEVEL="%s"' % discovered_api.group(1),
+            env_text, count=1, flags=re.MULTILINE)
+
+    # Modern-GCC compatibility flags for Qt 4.8 headers AND shiboken
+    # source files (which also miss `#include <list>` etc.).
     #
-    # Qt 4.8.0 was released in 2011 against GCC 4.x.  Its headers
-    # (qmap.h, qlist.h, qvector.h, ...) use placement new and other
-    # constructs that historically relied on STL headers being
-    # auto-included via include-chain pollution.  Modern GCC (11+)
-    # tightened up include hygiene, so qmap.h fails with:
+    # The expanded -include list covers everything we've seen the
+    # 2011-era code reference without an explicit include:
     #
-    #     qmap.h:456: error: no matching function for call to
-    #         'operator new(unsigned int, int*)'
+    #   * Containers   : list, vector, map, set, string, utility
+    #   * Algorithms   : algorithm  (std::max, std::min)
+    #   * C compat     : cstddef, cstring, cstdlib, cstdio, cstdint, climits
+    #   * Memory       : new  (placement new)
     #
-    # The fix is `-include <header>` flags which prepend the listed
-    # headers to every translation unit — the equivalent of adding
-    # an `#include` at the top of every .cpp file.
-    #
-    # We also add `-fpermissive` because Qt 4.8 uses several
-    # constructs that modern GCC considers errors but older GCC
-    # considered warnings (e.g. converting string literals to char*,
-    # implicit declarations, narrowing conversions in initialiser lists).
+    # We also add `-fpermissive` to downgrade C++11-strictness errors
+    # to warnings (string-literal-to-char*, narrowing in initializers).
     compat_flags = (
         '-include cstddef '       # <cstddef> for std::size_t, NULL
         '-include cstring '       # <cstring> for memcpy, memset, strlen
@@ -626,6 +910,16 @@ def configure_env(args):
         '-include cstdio '        # <cstdio> for FILE, fprintf
         '-include cstdint '       # <cstdint> for int32_t etc.
         '-include climits '       # <climits> for INT_MAX etc.
+        # C++ STL containers/algos that shiboken's source uses without
+        # `#include` directives (basewrapper.cpp, conversions.h, etc.):
+        '-include list '          # std::list
+        '-include vector '        # std::vector
+        '-include map '           # std::map
+        '-include set '           # std::set
+        '-include string '        # std::string
+        '-include utility '       # std::pair, std::make_pair
+        '-include algorithm '     # std::max, std::min, std::find
+        '-include sstream '       # std::stringstream
         '-fpermissive'            # downgrade many C++11+ errors to warnings
     )
 
