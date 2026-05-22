@@ -77,6 +77,12 @@ env:
         installer.installationFinished.connect(function() {
             try { gui.clickButton(buttons.NextButton); } catch (e) {}
         });
+        // Online installers can briefly show a "fetching server list"
+        // dialog before the first page.  Auto-accept it.
+        installer.setMessageBoxAutomaticAnswer("OverwriteTargetDirectory", QMessageBox.Yes);
+        installer.setMessageBoxAutomaticAnswer("installationErrorWithRetry", QMessageBox.Ignore);
+        installer.setMessageBoxAutomaticAnswer("DownloadError", QMessageBox.Ignore);
+        installer.setMessageBoxAutomaticAnswer("archiveDownloadError", QMessageBox.Ignore);
     }
     Controller.prototype.WelcomePageCallback = function() {
         gui.clickButton(buttons.NextButton, 3000);
@@ -85,6 +91,19 @@ env:
         gui.clickButton(buttons.NextButton);
     };
     Controller.prototype.IntroductionPageCallback = function() {
+        gui.clickButton(buttons.NextButton);
+    };
+    // Online-installer extra pages — they appear before TargetDirectory
+    // depending on QIF version.  Each just clicks Next; we don't change
+    // the repo/server because the installer's defaults point at the
+    // Necessitas component servers which is what we want.
+    Controller.prototype.RepositoryCategoryPageCallback = function() {
+        gui.clickButton(buttons.NextButton);
+    };
+    Controller.prototype.FetchSetupConfigurationPageCallback = function() {
+        gui.clickButton(buttons.NextButton);
+    };
+    Controller.prototype.ServerSelectionPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
     Controller.prototype.TargetDirectoryPageCallback = function() {
@@ -199,13 +218,26 @@ jobs:
 
       - name: Install host build dependencies + xvfb (for unattended Qt installer)
         run: |
+          # Necessitas's online installer binaries from 2012-2013 are
+          # typically 32-bit ELF.  Enable multilib so the runner can exec
+          # them.  Cheap insurance — if the binary is 64-bit, the i386
+          # packages just sit unused.
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
               build-essential cmake git ant unzip wget curl xz-utils file \
               libssl-dev zlib1g-dev libffi-dev ca-certificates \
               xvfb libxext6 libxrender1 libxtst6 libxi6 libfontconfig1 \
-              libdbus-1-3 libxkbcommon0 libegl1
+              libdbus-1-3 libxkbcommon0 libegl1 \
+              libc6:i386 libstdc++6:i386 zlib1g:i386 \
+              libxext6:i386 libxrender1:i386 libfontconfig1:i386 \
+              libsm6:i386 libgl1:i386
           cmake --version
           ant -version
+          # Diagnostic: report which 32-bit runtime libs are visible.
+          echo "i386 libs status:"
+          dpkg -l libc6:i386 libstdc++6:i386 2>/dev/null | tail -2 || true
 
       - name: Cache builder workspace
         id: builder-cache
@@ -239,21 +271,43 @@ jobs:
           # 100 MB to detect HTML error pages masquerading as the file.
           #
           # If the user passed a custom URL via necessitas_sdk_url, we use
-          # only that one and don't iterate through the SourceForge list.
+          # only that one and don't iterate through the default mirror list.
           if [ -n "$NECESSITAS_SDK_URL" ]; then
               URLS=( "$NECESSITAS_SDK_URL" )
           else
-              REL_PATH="Necessitas%20Final/Final%20Beta/0.3.71/necessitas-NecessitasQt-final-installer-linux-x86_64-0.3.71-experimental.run"
+              # The Necessitas SDK installer mirrors below host the
+              # ONLINE installer (~5-10 MB binary), not the offline one.
+              # An online installer fetches Qt/NDK/SDK components from
+              # Necessitas's component repository at install time.
+              #
+              # Mirror priority (most reliable → least):
+              #   1. Zenodo        — academic permanent-archive CDN
+              #   2. Internet Archive  — also permanent
+              #   3. catbox.moe    — file-sharing host, stable while live
+              #   4. Dropbox       — last resort, uses temporary tokens
+              #                      (rlkey + st) which may expire
+              #
+              # File `necessitas-0.3-online-sdk-installer-linux` matches
+              # the 0.3.71 Final Beta series that the M4rtinK PySide
+              # build scripts target.  We tried SourceForge first but
+              # all its individual mirrors started 403'ing in mid-2026.
               URLS=(
-                "https://sourceforge.net/projects/necessitas/files/${REL_PATH}/download"
-                "https://downloads.sourceforge.net/project/necessitas/${REL_PATH}"
-                "https://altushost-swe.dl.sourceforge.net/project/necessitas/${REL_PATH}"
-                "https://netcologne.dl.sourceforge.net/project/necessitas/${REL_PATH}"
-                "https://master.dl.sourceforge.net/project/necessitas/${REL_PATH}"
+                "https://zenodo.org/records/20335718/files/necessitas-0.3-online-sdk-installer-linux?download=1"
+                "https://archive.org/download/necessitassdk/necessitas-0.3-online-sdk-installer-linux"
+                "https://zenodo.org/records/20335718/files/linux-online-necessitas-alpha4.1-sdk-installer?download=1"
+                "https://archive.org/download/necessitassdk/linux-online-necessitas-alpha4.1-sdk-installer"
+                "https://files.catbox.moe/tos2dz.1-sdk-installer"
+                "https://www.dropbox.com/scl/fi/6slw6md6olhar0i9rorz8/necessitas-0.3-online-sdk-installer-linux?rlkey=own25fuz6zr8l32yj457y6f9o&st=4x2gowy6&dl=1"
               )
           fi
 
-          MIN_INSTALLER_SIZE=104857600   # 100 MB — installer is ~650 MB
+          # These are ONLINE installers — small files (~5-10 MB) that pull
+          # actual SDK components from Necessitas's component server at
+          # install time.  Anything under 1 MB is almost certainly an
+          # HTML error page; anything from 1 MB to 100 MB is a plausible
+          # online installer; over 100 MB is the offline installer (if
+          # the user supplied one).  Either is fine for our purposes.
+          MIN_INSTALLER_SIZE=1048576     # 1 MB — accepts both online & offline
           MIN_ARCHIVE_SIZE=1048576       # 1 MB — minimum for a tar/zip
           DOWNLOAD_OK=0
 
@@ -261,22 +315,15 @@ jobs:
               echo "::group::Trying $URL"
               rm -f necessitas.dl
 
-              # curl flags chosen for SourceForge's quirks:
-              #   -L           follow mirror-selection redirects
+              # curl flags:
+              #   -L           follow redirects (Zenodo redirects to S3-like CDN)
               #   --fail       treat HTTP 4xx/5xx as curl error
               #   --retry 3    retry on transient network errors
-              #   -A           SourceForge serves HTML landing pages to
-              #                 generic User-Agents
-              #   --referer    some mirrors check Referer for hotlink prevention
-              #   --insecure   tolerate legacy mirror TLS certs
-              #
-              # We DON'T use `--fail-with-body` because some mirrors close
-              # the connection mid-download on rate-limit (curl exit 18).
+              #   --max-time   safety against indefinite hangs
+              #   -A           cosmetic — some mirrors gate on User-Agent
               if curl -L --fail --retry 3 --retry-delay 5 \
                       --max-time 600 \
-                      --insecure \
                       -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                      --referer "https://sourceforge.net/" \
                       -o necessitas.dl \
                       "$URL"; then
                   SIZE=$(stat -c %s necessitas.dl 2>/dev/null || echo 0)
@@ -360,10 +407,15 @@ jobs:
             # sizes have been observed to trigger layout-overflow bugs in
             # older QIF versions.
             #
-            # Time budget: install takes 3-8 minutes (mostly extracting the
-            # appended payload).  25-min timeout is generous.
+            # Time budget:
+            #   * Offline installer: install takes 3-8 min (mostly
+            #     extracting the appended payload).
+            #   * Online installer:  install takes 20-50 min depending
+            #     on the Necessitas component server's response time
+            #     (it downloads Qt + NDK + SDK at install time, ~2 GB).
+            # 60 min covers both.
             set +e
-            timeout 25m xvfb-run -a \
+            timeout 60m xvfb-run -a \
                 --server-args="-screen 0 1280x1024x24" \
                 ./necessitas-installer.run \
                 --script /tmp/qif-auto.qs \
