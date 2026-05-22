@@ -115,15 +115,27 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 2   # 2026-05: appended `-include new -include cstddef
-                             # -include cstring -include cstdlib -include cstdio
-                             # -include cstdint -include climits -fpermissive`
-                             # to env.sh's CXXFLAGS to compensate for modern
-                             # GCC's stricter include hygiene.  Qt 4.8.0
-                             # headers from 2011 used placement new and other
-                             # constructs that historically relied on STL
-                             # headers being auto-included via the old GCC
-                             # implicit-include chain.
+BUILDER_SCRIPT_VERSION = 3   # 2026-05: patch Qt 4.8 headers DIRECTLY rather
+                             # than relying on env.sh CXXFLAGS (v2 approach).
+                             #
+                             # v2 added -include new etc. to env.sh CXXFLAGS,
+                             # but those flags never reached the actual
+                             # compile because:
+                             #   * build_shiboken.sh's cmake reads
+                             #     CMAKE_CXX_FLAGS, not env $CXXFLAGS
+                             #   * stale CMakeCache.txt from the v2 failure
+                             #     held the old (empty) CXXFLAGS configured
+                             #     value, short-circuiting re-config
+                             #
+                             # v3 instead prepends `#include <new>` + other
+                             # STL headers to the Qt 4.8 container headers
+                             # themselves (qmap.h, qhash.h, qlist.h, etc.)
+                             # ANY compile that pulls in these headers gets
+                             # the missing includes — bypasses every "did
+                             # the flag actually reach the compiler?" issue.
+                             # v3 also wipes shiboken-build/ and pyside-build/
+                             # before invoking the bash scripts so a stale
+                             # CMakeCache.txt can't sabotage the rebuild.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -685,6 +697,158 @@ def configure_env(args):
 
 
 # ----------------------------------------------------------------------------
+# Qt 4.8 header patcher — bypasses every "the flag didn't reach the compile"
+# failure mode by patching the headers directly on disk.
+# ----------------------------------------------------------------------------
+
+# Marker we prepend to patched files so re-runs are idempotent.  Stays
+# valid as a C++ comment + a unique-enough string to grep for.
+QT48_PATCH_MARKER = '// PATCHED_BY_BUILD_PYSIDE_ANDROID -- DO NOT REMOVE'
+
+# Headers known to use placement new and other 2010-era C++ constructs
+# that modern GCC won't accept without explicit STL header inclusion.
+# This list comes from cataloguing every compile error in the failed
+# build.log + a sweep of every other Qt 4.8 container header that uses
+# the same patterns (so we patch once, not multiple times in a loop of
+# build-fail-patch-rebuild iterations).
+QT48_HEADERS_TO_PATCH = (
+    'qmap.h',                  # placement new at line 456-458 (qmap.h)
+    'qhash.h',                 # placement new at line 530-532
+    'qlist.h',                 # placement new at line 412
+    'qvector.h',               # placement new in node_construct
+    'qpair.h',                 # uses std::pair internally
+    'qcache.h',                # placement new in Node
+    'qcontiguouscache.h',      # placement new in append
+    'qbytearray.h',            # uses memcpy/memset without <cstring>
+    'qstring.h',               # uses memcpy/memset, references std::size_t
+    'qglobal.h',               # foundation header used by EVERY Qt include
+)
+
+
+def _patch_qt48_headers(qt_dir, dry_run=False):
+    """
+    Prepend `#include <new>` and other STL headers to Qt 4.8 container
+    headers so they build cleanly under modern GCC.
+
+    This is the only reliable workaround.  Adding CXXFLAGS in env.sh
+    doesn't work because:
+
+      * build_shiboken.sh's cmake invocation reads CMAKE_CXX_FLAGS,
+        not the environment $CXXFLAGS variable.
+      * CMakeCache.txt from a previous (failed) configure caches the
+        empty CXXFLAGS and short-circuits re-config on subsequent
+        cmake runs.
+      * Passing -DCMAKE_CXX_FLAGS=... at the cmake invocation would
+        require sed-patching build_shiboken.sh, which keeps the fix
+        couplied to upstream's exact script layout.
+
+    Patching the headers directly bypasses all of that.  ANY compile
+    that pulls in qmap.h sees `#include <new>` first and resolves
+    placement new correctly.
+
+    Idempotent — looks for QT48_PATCH_MARKER at the top of each file
+    and skips files that already have it.
+
+    Arguments
+    ---------
+    qt_dir   : path to the Qt-for-Android root (the dir containing
+               bin/qmake, include/, lib/, etc.)
+    dry_run  : if True, log what WOULD be patched but don't write.
+
+    Returns
+    -------
+    int: count of headers actually modified this call.
+    """
+    log.info('  patching Qt 4.8 headers for modern-GCC compatibility')
+
+    include_root = os.path.join(qt_dir, 'include', 'QtCore')
+    if not os.path.isdir(include_root):
+        log.warning(
+            '  ! QtCore include dir not found at %s — skipping header patch.\n'
+            '    If the cross-compile fails with placement-new errors,\n'
+            '    your Qt-for-Android install layout differs from expected.',
+            include_root)
+        return 0
+
+    # The block we prepend.  We include a generous set of STL headers
+    # rather than a minimal one because:
+    #   * <new> alone fixes the immediate qmap.h:456 error
+    #   * <cstddef> covers std::size_t / NULL references
+    #   * <cstring> covers memcpy/memset (qbytearray.h, qstring.h)
+    #   * <cstdlib>/<cstdint> cover qmalloc and the int-type aliases
+    # The marker comes first so our grep-for-marker check sees it.
+    PREPEND = (
+        QT48_PATCH_MARKER + '\n'
+        '#include <new>\n'
+        '#include <cstddef>\n'
+        '#include <cstring>\n'
+        '#include <cstdlib>\n'
+        '#include <cstdint>\n'
+        '#include <climits>\n'
+        '\n'
+    )
+
+    patched_count = 0
+    skipped_count = 0
+    not_found = []
+
+    for header_name in QT48_HEADERS_TO_PATCH:
+        path = os.path.join(include_root, header_name)
+        if not os.path.isfile(path):
+            not_found.append(header_name)
+            continue
+
+        with open(path, 'rb') as f:
+            content = f.read()
+
+        # Idempotency check — skip if marker already in the first 1 KB.
+        # We bound the check so we don't scan multi-MB files (some Qt
+        # headers are large).
+        if QT48_PATCH_MARKER.encode('utf-8') in content[:1024]:
+            skipped_count += 1
+            log.info('    skip  %s  (already patched)', header_name)
+            continue
+
+        if dry_run:
+            log.info('    DRY   %s  (would prepend %d-byte block)',
+                     header_name, len(PREPEND))
+            patched_count += 1
+            continue
+
+        new_content = PREPEND.encode('utf-8') + content
+        try:
+            with open(path, 'wb') as f:
+                f.write(new_content)
+        except (IOError, OSError) as e:
+            # Header files in some Necessitas installs are read-only.
+            # Chmod and retry.
+            try:
+                os.chmod(path, 0o644)
+                with open(path, 'wb') as f:
+                    f.write(new_content)
+            except (IOError, OSError) as e2:
+                raise SystemExit(
+                    '  X could not patch %s: %s\n'
+                    '    chmod retry also failed: %s\n'
+                    '    Check filesystem permissions on the Necessitas SDK install.'
+                    % (path, e, e2))
+
+        log.info('    patched  %s  (added <new>, <cstddef>, <cstring>, ...)',
+                 header_name)
+        patched_count += 1
+
+    # Summary
+    log.info('  ✓ Qt 4.8 header patch: %d patched, %d already done, %d not present',
+             patched_count - (patched_count if dry_run else 0)
+                 if dry_run else patched_count,
+             skipped_count, len(not_found))
+    if not_found:
+        log.info('    (not-present headers — fine, just not in this Qt build: %s)',
+                 ', '.join(not_found))
+    return patched_count
+
+
+# ----------------------------------------------------------------------------
 # Step 4 -- Cross-compile Shiboken + PySide
 # ----------------------------------------------------------------------------
 
@@ -692,8 +856,32 @@ def cross_compile(args):
     """
     Run the canonical build_shiboken.sh and build_pyside.sh.
 
-    Skipped entirely if --skip-build is passed AND --pyside-stage points
-    to a pre-built stage tree.
+    Before invoking either, this step does two prep things:
+
+      1. Patches Qt 4.8 headers to add `#include <new>` and other
+         modern-GCC-required STL includes at the top.  Qt 4.8.0's
+         headers (qmap.h, qhash.h, qlist.h, qvector.h) use placement
+         new without including <new> — relying on the old GCC 4.x
+         transitive include chain.  Modern GCC 11+ tightened include
+         hygiene, so without the patch you get:
+
+             qmap.h:456: error: no matching function for call to
+                 'operator new(unsigned int, int*)'
+
+         The previous attempt to fix this via env.sh CXXFLAGS didn't
+         reach the cmake-driven compile because build_shiboken.sh
+         doesn't propagate $CXXFLAGS to its cmake invocation, and the
+         build directory's CMakeCache.txt held the old (no flags)
+         configuration.  Patching the headers directly bypasses
+         both problems.
+
+      2. Removes shiboken-build/ and pyside-build/ from any previous
+         failed run so cmake re-runs from scratch with the patched
+         headers.  Without this, cmake's cache short-circuits the
+         re-config and the patched headers don't take effect.
+
+    Skipped entirely if --skip-build is passed AND --pyside-stage
+    points to a pre-built stage tree.
     """
     log.info('Step 4/12 -- Cross-compile Shiboken + PySide')
 
@@ -717,6 +905,20 @@ def cross_compile(args):
         return
 
     bs = args.build_scripts_dir
+
+    # (1) Patch Qt 4.8 headers — see docstring above.
+    _patch_qt48_headers(args.sdk.qt_dir, dry_run=args.dry_run)
+
+    # (2) Wipe any stale build dirs from previous failed runs.  cmake
+    # caches CXXFLAGS in CMakeCache.txt and will NOT pick up
+    # newly-patched headers unless we force a fresh configure.
+    for stale in ('shiboken-build', 'pyside-build'):
+        d = os.path.join(bs, stale)
+        if os.path.isdir(d) and any(os.listdir(d)):
+            log.info('  removing stale build dir: %s', d)
+            if not args.dry_run:
+                shutil.rmtree(d)
+            _makedirs(d)
 
     # The bash scripts use `source env.sh` then run cmake+make from
     # subdirectories.  Invoke through `bash -c` so `source` works.
