@@ -1,192 +1,106 @@
-name: build-pyside-android-py27
+name: build-pyside-android-py27-docker
 
-# PySide 1 (Qt 4.8) -> Android APK via build_pyside_android.py.
+# PySide 1 (Qt 4.8) -> Android APK — Docker / Ubuntu 14.04 edition.
 #
-# Building a 2013-era Python 2.7 + Necessitas SDK stack on modern Ubuntu
-# runners involves several compatibility hoops, all handled below:
+# Why Docker / Ubuntu 14.04?
+# --------------------------
+# After 8 rounds of fighting incompatibilities between M4rtinK's 2013-era
+# build code and modern Ubuntu 22.04 (missing shiboken package, modern
+# GCC strictness, dead URLs, ABI mismatches), we accept the obvious:
+# this code was designed to build on Ubuntu 14.04 with GCC 4.8, and
+# we should just BUILD IT ON Ubuntu 14.04.
 #
-#   - Python 2.7 was dropped from Ubuntu 22.04 main repos.  Installed
-#     from the deadsnakes PPA.
-#   - Necessitas's Android SDK platform 14 needs Java 8 (newer JDKs break
-#     the build.xml).  actions/setup-java pinned to version 8.
-#   - **Necessitas SDK is downloaded and installed automatically** from
-#     SourceForge using the official `.run` installer in unattended mode
-#     (Qt Installer Framework JavaScript controller + xvfb).  No need to
-#     pre-host the SDK.
-#   - Host shiboken is no longer in main Ubuntu repos.  The builder uses
-#     a self-contained cross-compile that doesn't strictly require it.
-#
-# Total runtime (cold cache):          ~75-95 min
-# Total runtime (warm cache + stage):  ~10 min
+# Total runtime (cold):  ~60-90 min
+# Total runtime (warm):  ~10 min
 
 on:
   workflow_dispatch:
     inputs:
       project_url:
-        description: "Public URL to PySide/Qt4 project zip (must contain main.py at root or one level deep)."
+        description: "Public URL to PySide/Qt4 project zip."
         required: true
         default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt4.zip"
       necessitas_sdk_url:
-        description: "OPTIONAL: URL to a Necessitas SDK archive (.tar.gz/.tar.xz/.zip) OR a custom .run installer.  If empty, the default SourceForge .run installer is downloaded and run in unattended mode."
+        description: "OPTIONAL Necessitas installer URL.  Empty = use default mirrors."
         required: false
         default: ""
       app_name:
-        description: "Application display name."
+        description: "APK display name."
         required: false
         default: "TestApp"
       unique_name:
-        description: "Android package name (com.example.X)."
+        description: "Android package (com.example.X)."
         required: false
         default: "com.example.TestApp"
       pyside_stage_url:
-        description: "OPTIONAL: URL to a pre-built PySide stage tarball.  Skips the ~60-min Shiboken/PySide cross-compile."
+        description: "OPTIONAL pre-built stage tarball URL.  Skips cross-compile."
         required: false
         default: ""
       build_threads:
-        description: "Parallel make jobs.  Set to 1 if you hit 'cc1plus: Internal error: Killed'."
+        description: "Parallel make jobs."
         required: false
         default: "2"
-      build_id:
-        description: "Optional build ID suffix for the APK artifact name."
-        required: false
-        default: ""
 
 env:
-  # Default Necessitas SDK installer URL — the official "Final Beta 0.3.71"
-  # 64-bit Linux offline installer from SourceForge.  Contains everything
-  # bundled: Qt 4.8.2 for Android, NDK r8b, Android SDK with platform 14,
-  # Qt Creator.  Stable since 2013.
-  #
-  # We do not pin a single URL — `master.dl.sourceforge.net` started
-  # returning 403 from individual mirrors in May 2026.  The acquisition
-  # step below iterates through a list of SourceForge URL patterns
-  # (project/files/download → CDN selector, downloads.sourceforge.net →
-  # explicit CDN, plus individual fallback mirrors) and uses whichever
-  # one returns a sufficiently large file first.
-
-  # Qt Installer Framework "controller" script — JavaScript that answers
-  # every page of the installer wizard automatically.
-  #
-  # IMPORTANT: this script targets QIF 1.0 (October 2011 build, as found
-  # in the Necessitas online installer).  QIF 1.0's JavaScript API is
-  # MUCH smaller than later versions.  Things that DO NOT work in 1.0:
-  #
-  #   * installer.setMessageBoxAutomaticAnswer()  — added in 1.3
-  #   * installer.autoRejectMessageBoxes()        — added in 1.2
-  #   * installer.installationFinished.connect()  — signal binding
-  #     from JS came in 1.2+
-  #   * QMessageBox.Yes / .Ignore enums           — not exposed in 1.0
-  #
-  # Calling any of those at script load time triggers a JS TypeError,
-  # which becomes `qFatal("This seems to be broken, check this!!!!")`
-  # and the installer aborts with SIGABRT (we hit this exact path
-  # before this rewrite).
-  #
-  # The safe API surface in QIF 1.0 is small but sufficient:
-  #
-  #   * Controller constructor (must exist, can be empty)
-  #   * Controller.prototype.<PageName>Callback methods
-  #   * gui.clickButton(buttons.NextButton | FinishButton | ...)
-  #   * gui.currentPageWidget()  — for setting line-edit text, etc.
-  #   * installer.environmentVariable("X")
+  # QIF 1.0-compatible auto-answer script (October 2011 Installerbase).
+  # Stored at workflow level to avoid the heredoc-vs-YAML conflict that
+  # bites when you try to use `cat > ... << EOF` inside a `run: |` block.
+  # We materialise this to disk with a single-line `printf` later.
   QIF_AUTO_SCRIPT: |
-    // Empty constructor — DO NOT call any installer.* methods here.
-    // QIF 1.0 will load this script at startup, and any TypeError
-    // raised during construction aborts the installer with SIGABRT.
     function Controller() {
     }
-
     Controller.prototype.WelcomePageCallback = function() {
-        // Welcome page sometimes has a brief delay before NextButton
-        // becomes enabled.  Pass a small delay to clickButton.
         gui.clickButton(buttons.NextButton, 3000);
     };
-
     Controller.prototype.CredentialsPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.IntroductionPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
-    // Online-installer extra pages.  In QIF 1.0 the names may differ;
-    // we just provide callbacks for each known name and let the others
-    // sit unused.  If a page has no callback, QIF defaults to the
-    // current page's own behavior, which usually means "wait for user".
-    // We accept that risk — if a page hangs, the timeout catches it.
     Controller.prototype.RepositoryCategoryPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.FetchSetupConfigurationPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.ServerSelectionPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.TargetDirectoryPageCallback = function() {
-        var widget = gui.currentPageWidget();
-        var target = installer.environmentVariable("NECESSITAS_TARGET");
-        // QIF 1.0 used the camelCase property name targetDirectoryLineEdit.
-        // QIF 1.4+ used TargetDirectoryLineEdit (capital).  Try both.
+        var w = gui.currentPageWidget();
+        var t = installer.environmentVariable("NECESSITAS_TARGET");
         try {
-            if (widget.targetDirectoryLineEdit !== undefined) {
-                widget.targetDirectoryLineEdit.setText(target);
-            } else if (widget.TargetDirectoryLineEdit !== undefined) {
-                widget.TargetDirectoryLineEdit.setText(target);
+            if (w.targetDirectoryLineEdit !== undefined) {
+                w.targetDirectoryLineEdit.setText(t);
+            } else if (w.TargetDirectoryLineEdit !== undefined) {
+                w.TargetDirectoryLineEdit.setText(t);
             }
-        } catch (e) {
-            // Don't abort if we can't set the target — the default may
-            // already be acceptable.
-        }
+        } catch (e) {}
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.ComponentSelectionPageCallback = function() {
-        var widget = gui.currentPageWidget();
-        try {
-            if (widget.selectAll !== undefined) {
-                widget.selectAll();
-            }
-        } catch (e) {}
+        var w = gui.currentPageWidget();
+        try { if (w.selectAll !== undefined) w.selectAll(); } catch (e) {}
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.LicenseAgreementPageCallback = function() {
-        var widget = gui.currentPageWidget();
+        var w = gui.currentPageWidget();
         try {
-            // QIF 1.0 used `acceptLicense` (camelCase, no underscores).
-            // QIF 1.4+ exposed an AcceptLicenseRadioButton property.
-            if (widget.acceptLicense !== undefined) {
-                widget.acceptLicense.setChecked(true);
-            } else if (widget.AcceptLicenseRadioButton !== undefined) {
-                widget.AcceptLicenseRadioButton.setChecked(true);
-            }
+            if (w.acceptLicense !== undefined) w.acceptLicense.setChecked(true);
+            else if (w.AcceptLicenseRadioButton !== undefined)
+                w.AcceptLicenseRadioButton.setChecked(true);
         } catch (e) {}
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.StartMenuDirectoryPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
     Controller.prototype.ReadyForInstallationPageCallback = function() {
         gui.clickButton(buttons.NextButton);
     };
-
-    Controller.prototype.PerformInstallationPageCallback = function() {
-        // No-op — wait for the install to complete.  QIF 1.0 advances
-        // this page automatically when the install finishes.
-    };
-
+    Controller.prototype.PerformInstallationPageCallback = function() {};
     Controller.prototype.FinishedPageCallback = function() {
-        // Click Finish to close the wizard.  We deliberately don't
-        // touch the "Launch Qt Creator" checkbox state because the
-        // form property names vary across QIF versions and a bad
-        // dotted-property lookup throws TypeError here too.
         gui.clickButton(buttons.FinishButton);
     };
 
@@ -196,33 +110,27 @@ jobs:
     timeout-minutes: 180
 
     env:
-      PROJECT_URL:            ${{ github.event.inputs.project_url }}
-      NECESSITAS_SDK_URL:     ${{ github.event.inputs.necessitas_sdk_url }}
-      APP_NAME:               ${{ github.event.inputs.app_name }}
-      UNIQUE_NAME:            ${{ github.event.inputs.unique_name }}
-      PYSIDE_STAGE_URL:       ${{ github.event.inputs.pyside_stage_url }}
-      BUILD_THREADS:          ${{ github.event.inputs.build_threads }}
-      BUILD_ID:               ${{ github.event.inputs.build_id }}
-      PYSIDE_BUILDER_CACHE:   /home/runner/pyside-cache
-      NECESSITAS_INSTALL_DIR: /home/runner/necessitas
+      PROJECT_URL:        ${{ github.event.inputs.project_url }}
+      NECESSITAS_SDK_URL: ${{ github.event.inputs.necessitas_sdk_url }}
+      APP_NAME:           ${{ github.event.inputs.app_name }}
+      UNIQUE_NAME:        ${{ github.event.inputs.unique_name }}
+      PYSIDE_STAGE_URL:   ${{ github.event.inputs.pyside_stage_url }}
+      BUILD_THREADS:      ${{ github.event.inputs.build_threads }}
 
     steps:
-      - name: Checkout repository (contains build_pyside_android.py)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Sanity-check inputs
+      - name: Verify needed files are in the repo
         run: |
-          if [ ! -f build_pyside_android.py ]; then
-            echo "::error::build_pyside_android.py not found at repo root."
-            exit 1
-          fi
-          echo "  project_url    : $PROJECT_URL"
-          echo "  necessitas_url : ${NECESSITAS_SDK_URL:-(default SourceForge installer)}"
-          echo "  app_name       : $APP_NAME"
-          echo "  unique_name    : $UNIQUE_NAME"
-          echo "  build_threads  : $BUILD_THREADS"
+          for f in build_pyside_android.py Dockerfile.pyside-builder; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f missing from repo root."
+              exit 1
+            fi
+          done
 
-      - name: Free disk space (cross-compile needs ~10 GB, Necessitas SDK adds ~3 GB)
+      - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
                       /usr/local/lib/android/sdk/ndk \
@@ -234,368 +142,105 @@ jobs:
           docker system prune -af || true
           df -h /
 
-      - name: Install Python 2.7 from deadsnakes PPA
-        run: |
-          sudo add-apt-repository -y ppa:deadsnakes/ppa
-          sudo apt-get update
-          sudo apt-get install -y python2.7 python2.7-dev
-          python2.7 --version
-          sudo ln -sf /usr/bin/python2.7 /usr/local/bin/python2 || true
+      # ════════ Build the Docker image (or reuse cached layers) ════════
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Set up JDK 8 (required by Necessitas's ant build)
-        uses: actions/setup-java@v4
+      - name: Build pyside-builder Docker image (with layer caching)
+        uses: docker/build-push-action@v5
         with:
-          distribution: temurin
-          java-version: "8"
+          context: .
+          file: ./Dockerfile.pyside-builder
+          tags: pyside-builder:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Install host build dependencies + xvfb (for unattended Qt installer)
-        run: |
-          # Necessitas's online installer binaries from 2012-2013 are
-          # 32-bit ELF.  Enable multilib so the runner can exec them.
-          # We install a generous set of i386 runtime libs upfront so we
-          # don't play whack-a-mole with the installer's dynamic linker.
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
+      - name: Show what the Docker image contains
+        run: docker run --rm pyside-builder
 
-          sudo apt-get install -y --no-install-recommends \
-              build-essential cmake git ant unzip wget curl xz-utils file \
-              libssl-dev zlib1g-dev libffi-dev ca-certificates \
-              xvfb libxext6 libxrender1 libxtst6 libxi6 libfontconfig1 \
-              libdbus-1-3 libxkbcommon0 libegl1
-
-          # 32-bit runtime libs the Necessitas installer (Qt Installer
-          # Framework 1.4, statically linked Qt + dynamically linked
-          # system libs) depends on.  Confirmed via `ldd` against the
-          # actual installer binary:
-          #   libgobject-2.0.so.0   ← libglib2.0-0:i386
-          #   libgio-2.0.so.0       ← libglib2.0-0:i386
-          #   libdbus-1.so.3        ← libdbus-1-3:i386
-          #   libfreetype.so.6      ← libfreetype6:i386
-          #   libpng.so             ← libpng16-16:i386
-          #   libXcursor.so.1       ← libxcursor1:i386
-          #   libXrandr.so.2        ← libxrandr2:i386
-          #   libXfixes.so.3        ← libxfixes3:i386
-          #   libXinerama.so.1      ← libxinerama1:i386
-          sudo apt-get install -y --no-install-recommends \
-              libc6:i386 libstdc++6:i386 zlib1g:i386 \
-              libxext6:i386 libxrender1:i386 libfontconfig1:i386 \
-              libsm6:i386 libgl1:i386 \
-              libglib2.0-0:i386 libdbus-1-3:i386 \
-              libfreetype6:i386 libpng16-16:i386 \
-              libxcursor1:i386 libxrandr2:i386 libxfixes3:i386 \
-              libxinerama1:i386 libxi6:i386 libnss3:i386
-
-          cmake --version
-          ant -version
-          # Diagnostic: report which 32-bit runtime libs are visible.
-          echo "i386 libs status:"
-          dpkg -l libc6:i386 libstdc++6:i386 libglib2.0-0:i386 2>/dev/null | tail -4 || true
-
-      - name: Cache builder workspace
-        id: builder-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.PYSIDE_BUILDER_CACHE }}
-          key: pyside-builder-${{ hashFiles('build_pyside_android.py') }}-v1
-          restore-keys: |
-            pyside-builder-
-
+      # ════════ Acquire Necessitas SDK ════════
       - name: Cache Necessitas SDK
         id: necessitas-cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.NECESSITAS_INSTALL_DIR }}
-          key: necessitas-sdk-${{ hashFiles('.github/workflows/build-pyside-android-py27.yml') }}-v2
+          path: /home/runner/necessitas
+          key: necessitas-sdk-${{ hashFiles('Dockerfile.pyside-builder') }}-v1
 
-      # ════════ Acquire Necessitas SDK (AUTOMATIC) ════════
-      - name: Acquire Necessitas SDK
+      - name: Write QIF auto-answer script to disk
         if: steps.necessitas-cache.outputs.cache-hit != 'true'
         run: |
-          set -e
-          NECESSITAS="$NECESSITAS_INSTALL_DIR"
-          mkdir -p "$NECESSITAS"
-          cd /tmp
+          # Materialise QIF_AUTO_SCRIPT env var to a real file on the host.
+          # We'll mount this file into the container at /tmp/qif-auto.qs.
+          mkdir -p /home/runner/qif
+          printf '%s\n' "$QIF_AUTO_SCRIPT" > /home/runner/qif/qif-auto.qs
+          echo "Wrote $(wc -l < /home/runner/qif/qif-auto.qs) lines"
 
-          # Try several URLs.  SourceForge's individual mirrors started
-          # 403'ing in mid-2026, so we lead with the canonical /download
-          # endpoint that lets SF pick a working mirror at request time.
-          # The download is ~650 MB; we sanity-check the result is at least
-          # 100 MB to detect HTML error pages masquerading as the file.
-          #
-          # If the user passed a custom URL via necessitas_sdk_url, we use
-          # only that one and don't iterate through the default mirror list.
-          if [ -n "$NECESSITAS_SDK_URL" ]; then
-              URLS=( "$NECESSITAS_SDK_URL" )
-          else
-              # The Necessitas SDK installer mirrors below host the
-              # ONLINE installer (~5-10 MB binary), not the offline one.
-              # An online installer fetches Qt/NDK/SDK components from
-              # Necessitas's component repository at install time.
-              #
-              # Mirror priority (most reliable → least):
-              #   1. Zenodo        — academic permanent-archive CDN
-              #   2. Internet Archive  — also permanent
-              #   3. catbox.moe    — file-sharing host, stable while live
-              #   4. Dropbox       — last resort, uses temporary tokens
-              #                      (rlkey + st) which may expire
-              #
-              # File `necessitas-0.3-online-sdk-installer-linux` matches
-              # the 0.3.71 Final Beta series that the M4rtinK PySide
-              # build scripts target.  We tried SourceForge first but
-              # all its individual mirrors started 403'ing in mid-2026.
+      - name: Download + install Necessitas SDK (inside Docker container)
+        if: steps.necessitas-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /home/runner/necessitas
+          # Run the installer INSIDE the Ubuntu 14.04 container.  The QS
+          # script and installer log are exchanged via /tmp bind mounts
+          # so we don't need any heredocs inside this YAML.
+          docker run --rm \
+            -v /home/runner/necessitas:/necessitas \
+            -v /home/runner/qif:/qif:ro \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -e NECESSITAS_TARGET=/necessitas \
+            -e USER_URL="$NECESSITAS_SDK_URL" \
+            pyside-builder \
+            bash -ec '
+              cd /tmp
+
               URLS=(
+                "${USER_URL}"
                 "https://zenodo.org/records/20335718/files/necessitas-0.3-online-sdk-installer-linux?download=1"
                 "https://archive.org/download/necessitassdk/necessitas-0.3-online-sdk-installer-linux"
                 "https://zenodo.org/records/20335718/files/linux-online-necessitas-alpha4.1-sdk-installer?download=1"
-                "https://archive.org/download/necessitassdk/linux-online-necessitas-alpha4.1-sdk-installer"
-                "https://files.catbox.moe/tos2dz.1-sdk-installer"
-                "https://www.dropbox.com/scl/fi/6slw6md6olhar0i9rorz8/necessitas-0.3-online-sdk-installer-linux?rlkey=own25fuz6zr8l32yj457y6f9o&st=4x2gowy6&dl=1"
               )
-          fi
 
-          # These are ONLINE installers — small files (~5-10 MB) that pull
-          # actual SDK components from Necessitas's component server at
-          # install time.  Anything under 1 MB is almost certainly an
-          # HTML error page; anything from 1 MB to 100 MB is a plausible
-          # online installer; over 100 MB is the offline installer (if
-          # the user supplied one).  Either is fine for our purposes.
-          MIN_INSTALLER_SIZE=1048576     # 1 MB — accepts both online & offline
-          MIN_ARCHIVE_SIZE=1048576       # 1 MB — minimum for a tar/zip
-          DOWNLOAD_OK=0
-
-          for URL in "${URLS[@]}"; do
-              echo "::group::Trying $URL"
-              rm -f necessitas.dl
-
-              # curl flags:
-              #   -L           follow redirects (Zenodo redirects to S3-like CDN)
-              #   --fail       treat HTTP 4xx/5xx as curl error
-              #   --retry 3    retry on transient network errors
-              #   --max-time   safety against indefinite hangs
-              #   -A           cosmetic — some mirrors gate on User-Agent
-              if curl -L --fail --retry 3 --retry-delay 5 \
-                      --max-time 600 \
-                      -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                      -o necessitas.dl \
-                      "$URL"; then
-                  SIZE=$(stat -c %s necessitas.dl 2>/dev/null || echo 0)
-                  echo "downloaded $SIZE bytes"
-
-                  # Decide minimum acceptable size based on URL pattern.
-                  # User-provided URLs may point to a tarball (smaller) or
-                  # to a `.run` file (large).  Default URLs are all `.run`.
-                  MIN_SIZE=$MIN_INSTALLER_SIZE
-                  case "$URL" in
-                    *.tar.gz|*.tar.xz|*.tgz|*.zip|*.tar) MIN_SIZE=$MIN_ARCHIVE_SIZE ;;
-                  esac
-
-                  if [ "$SIZE" -ge "$MIN_SIZE" ]; then
-                      echo "✓ accepted ($SIZE bytes >= $MIN_SIZE)"
-                      DOWNLOAD_OK=1
-                      echo "::endgroup::"
-                      break
-                  else
-                      echo "rejected: $SIZE bytes < $MIN_SIZE (probably an HTML error page)"
-                      head -c 500 necessitas.dl || true
-                      echo
+              for URL in "${URLS[@]}"; do
+                [ -z "$URL" ] && continue
+                echo "Trying: $URL"
+                if curl -L --fail --retry 3 --retry-delay 5 --max-time 600 \
+                       -A "Mozilla/5.0" -o necessitas.run "$URL"; then
+                  SIZE=$(stat -c %s necessitas.run 2>/dev/null || echo 0)
+                  if [ "$SIZE" -gt 1048576 ]; then
+                    echo "✓ downloaded $SIZE bytes"
+                    break
                   fi
-              else
-                  echo "curl failed for this URL"
-              fi
-              echo "::endgroup::"
-          done
-
-          if [ "$DOWNLOAD_OK" != "1" ]; then
-              echo "::error::All download URLs failed or returned undersized responses."
-              echo "::error::Tried URLs:"
-              for U in "${URLS[@]}"; do echo "::error::  $U"; done
-              echo ""
-              echo "::error::Workarounds:"
-              echo "::error::  1) Re-run later — SourceForge mirrors are flaky."
-              echo "::error::  2) Mirror the installer yourself (e.g. as a GitHub"
-              echo "::error::     Release asset) and pass its URL via the"
-              echo "::error::     necessitas_sdk_url workflow input."
-              exit 22
-          fi
-
-          ls -lh necessitas.dl
-
-          MIME="$(file --mime-type -b necessitas.dl)"
-          MAGIC="$(file -b necessitas.dl | head -c 200)"
-          echo "MIME : $MIME"
-          echo "FILE : $MAGIC"
-
-          # Detect what we got — installer or archive.
-          IS_RUN_INSTALLER=0
-          case "$MIME" in
-            application/x-executable|application/x-pie-executable|application/x-sharedlib)
-              IS_RUN_INSTALLER=1 ;;
-            application/x-shellscript|text/x-shellscript)
-              IS_RUN_INSTALLER=1 ;;
-          esac
-          # Also accept the .run extension as a strong hint (some mirrors
-          # serve the file with octet-stream MIME).
-          case "${URLS[0]}" in
-            *.run|*.run/download) IS_RUN_INSTALLER=1 ;;
-          esac
-
-          if [ "$IS_RUN_INSTALLER" = "1" ]; then
-            echo "::group::Running Necessitas installer in unattended mode"
-            chmod +x necessitas.dl
-            mv necessitas.dl necessitas-installer.run
-
-            # Diagnostic: list the installer's dynamic-library deps and
-            # flag any that are still missing.  When the installer is
-            # a 32-bit ELF and our multilib install missed a lib, this
-            # is where it shows up.  We DON'T fail the step on missing
-            # libs — the installer might still work if the missing one
-            # is only used by an unreachable code path.  But we log
-            # them prominently so the failure mode is obvious.
-            echo "Checking installer's runtime dependencies..."
-            if ldd ./necessitas-installer.run 2>&1 | tee /tmp/ldd.out | grep -q "not found"; then
-                echo "::warning::Some shared libraries are NOT FOUND for the installer:"
-                grep "not found" /tmp/ldd.out | while read -r line; do
-                    echo "::warning::    $line"
-                done
-                echo "::warning::If installation fails with 'cannot open shared object'"
-                echo "::warning::add the missing library's i386 package to the workflow."
-            else
-                echo "✓ all runtime libraries resolved"
-            fi
-
-            # Materialise the QIF auto-answer script from the workflow env var.
-            # Using `printf '%s' "$QIF_AUTO_SCRIPT"` instead of `echo` because
-            # echo interprets backslash escapes inconsistently across shells,
-            # and the QIF script contains literal backslashes in some strings.
-            printf '%s\n' "$QIF_AUTO_SCRIPT" > /tmp/qif-auto.qs
-            echo "QIF controller script written ($(wc -l < /tmp/qif-auto.qs) lines)"
-
-            export NECESSITAS_TARGET="$NECESSITAS"
-            echo "Installing to: $NECESSITAS_TARGET"
-
-            # Run the installer under xvfb-run (headless X server).  The
-            # 1280x1024 screen is large enough for any QIF page; smaller
-            # sizes have been observed to trigger layout-overflow bugs in
-            # older QIF versions.
-            #
-            # Time budget:
-            #   * Offline installer: install takes 3-8 min (mostly
-            #     extracting the appended payload).
-            #   * Online installer:  install takes 20-50 min depending
-            #     on the Necessitas component server's response time
-            #     (it downloads Qt + NDK + SDK at install time, ~2 GB).
-            # 60 min covers both.
-            set +e
-            timeout 60m xvfb-run -a \
-                --server-args="-screen 0 1280x1024x24" \
-                ./necessitas-installer.run \
-                --script /tmp/qif-auto.qs \
-                --verbose \
-                2>&1 | tee /tmp/necessitas-install.log
-            INSTALL_RC=$?
-            set -e
-
-            echo "::endgroup::"
-            echo "installer exit code: $INSTALL_RC"
-
-            # Some QIF versions return non-zero even on successful install
-            # (e.g. when a checkbox state at FinishedPage couldn't be set).
-            # Validate by checking the install dir contents.
-            if [ ! -d "$NECESSITAS/android-ndk-r8b" ] && \
-               [ ! -d "$NECESSITAS/android-ndk" ] && \
-               ! ls -d "$NECESSITAS"/android-ndk-* >/dev/null 2>&1; then
-                echo "::error::Necessitas installer did not produce an android-ndk-* dir."
-                echo "::error::Last 200 lines of installer log:"
-                tail -200 /tmp/necessitas-install.log || true
-                echo ""
-                echo "::error::Workaround: host a pre-extracted Necessitas SDK"
-                echo "::error::tarball yourself and pass its URL via necessitas_sdk_url."
-                exit 1
-            fi
-            echo "✓ Necessitas SDK installed successfully"
-            rm -f necessitas-installer.run /tmp/qif-auto.qs
-          else
-            ###################################################################
-            # FALLBACK PATH: extract a tarball/zip the user supplied
-            ###################################################################
-            echo "Detected archive (not .run installer) — extracting"
-            case "$MIME" in
-              application/gzip|application/x-gzip)
-                tar -xzf necessitas.dl -C "$NECESSITAS" --strip-components=1 2>/dev/null \
-                  || tar -xzf necessitas.dl -C "$NECESSITAS" ;;
-              application/x-xz)
-                tar -xJf necessitas.dl -C "$NECESSITAS" --strip-components=1 2>/dev/null \
-                  || tar -xJf necessitas.dl -C "$NECESSITAS" ;;
-              application/zip)
-                unzip -q necessitas.dl -d "$NECESSITAS" ;;
-              application/x-tar)
-                tar -xf necessitas.dl -C "$NECESSITAS" --strip-components=1 2>/dev/null \
-                  || tar -xf necessitas.dl -C "$NECESSITAS" ;;
-              *)
-                echo "::error::Unsupported archive type: $MIME"
-                file necessitas.dl
-                exit 1 ;;
-            esac
-            rm -f necessitas.dl
-
-            # Flatten a wrapper dir if the archive had one.
-            if [ ! -d "$NECESSITAS/NecessitasQt" ] && \
-               ! ls -d "$NECESSITAS"/android-ndk-* >/dev/null 2>&1; then
-              for d in "$NECESSITAS"/*/; do
-                if [ -d "$d/NecessitasQt" ] || ls -d "$d"/android-ndk-* >/dev/null 2>&1; then
-                  echo "Flattening wrapper dir: $d"
-                  shopt -s dotglob
-                  mv "$d"/* "$NECESSITAS"/
-                  rmdir "$d"
-                  shopt -u dotglob
-                  break
                 fi
+                rm -f necessitas.run
               done
-            fi
-          fi
 
-          echo "::group::Necessitas SDK layout"
-          ls -la "$NECESSITAS" | head -25
-          echo ""
-          echo "NDK candidates:"
-          ls -d "$NECESSITAS"/android-ndk* 2>/dev/null || true
-          echo ""
-          echo "Qt candidates:"
-          find "$NECESSITAS" -maxdepth 5 -type d -name 'armeabi' 2>/dev/null || true
-          echo "::endgroup::"
+              if [ ! -f necessitas.run ]; then
+                echo "::error::All Necessitas URLs failed"
+                exit 1
+              fi
 
-      - name: Export NECESSITAS_DIR
-        run: echo "NECESSITAS_DIR=$NECESSITAS_INSTALL_DIR" >> "$GITHUB_ENV"
+              chmod +x necessitas.run
+              cp /qif/qif-auto.qs /tmp/qif-auto.qs
 
-      - name: Download + extract pre-built PySide stage (if URL provided)
-        if: env.PYSIDE_STAGE_URL != ''
-        run: |
-          STAGE=/home/runner/pyside-stage
-          if [ -d "$STAGE" ] && [ -n "$(ls -A "$STAGE" 2>/dev/null)" ]; then
-            echo "✓ Stage already populated"
-            echo "PYSIDE_STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          mkdir -p "$STAGE"
-          cd /tmp
-          curl -L --fail --retry 5 -o pyside-stage.archive "$PYSIDE_STAGE_URL"
-          MIME="$(file --mime-type -b pyside-stage.archive)"
-          case "$MIME" in
-            application/gzip|application/x-gzip)
-              tar -xzf pyside-stage.archive -C "$STAGE" --strip-components=1 2>/dev/null \
-                || tar -xzf pyside-stage.archive -C "$STAGE" ;;
-            application/x-xz)
-              tar -xJf pyside-stage.archive -C "$STAGE" --strip-components=1 2>/dev/null \
-                || tar -xJf pyside-stage.archive -C "$STAGE" ;;
-            application/zip)
-              unzip -q pyside-stage.archive -d "$STAGE" ;;
-            *)
-              echo "::error::Unknown stage archive type: $MIME"; exit 1 ;;
-          esac
-          rm -f pyside-stage.archive
-          echo "PYSIDE_STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
-          ls -la "$STAGE" | head
+              # 60-min ceiling for online installer (downloads ~2 GB)
+              timeout 60m xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+                  ./necessitas.run --script /tmp/qif-auto.qs --verbose \
+                  2>&1 | tee /tmp/installer.log || true
 
+              # Soft-validate: at minimum we need Qt installed.  NDK may
+              # not be present (Necessitas component server is often dead)
+              # — that path is handled by build_pyside_android.py which
+              # auto-downloads NDK r10e as fallback.
+              if [ ! -d /necessitas/Android/Qt ] && [ ! -d /necessitas/NecessitasQt ]; then
+                  echo "::error::No Qt directory after install — fatal."
+                  tail -50 /tmp/installer.log
+                  exit 1
+              fi
+              echo "✓ Necessitas SDK installed (Qt present at least)"
+              cp /tmp/installer.log /work/necessitas-install.log 2>/dev/null || true
+            '
+
+      # ════════ Acquire user project (on host) ════════
       - name: Download project
         run: |
           mkdir -p workspace
@@ -603,44 +248,68 @@ jobs:
           unzip -q project.zip -d workspace
           MAIN_PY="$(find workspace -name main.py -maxdepth 4 -type f | head -1)"
           if [ -z "$MAIN_PY" ]; then
-            echo "::error::Project has no main.py within 4 directory levels."
+            echo "::error::No main.py in project"
             exit 1
           fi
-          PROJ_DIR="$(dirname "$MAIN_PY")"
-          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
-          ls -la "$PROJ_DIR"
-          echo "--- main.py ---"
-          cat "$MAIN_PY"
+          echo "PROJ_DIR=$(dirname "$MAIN_PY")" >> "$GITHUB_ENV"
 
-      - name: Run the builder
+      # ════════ Cache builder workspace ════════
+      - name: Cache builder workspace
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/pyside-cache
+          key: pyside-cache-${{ hashFiles('build_pyside_android.py') }}-v1
+          restore-keys: |
+            pyside-cache-
+
+      - name: Optional — download pre-built PySide stage
+        if: env.PYSIDE_STAGE_URL != ''
+        run: |
+          mkdir -p /home/runner/pyside-stage
+          curl -L --fail --retry 5 -o /tmp/stage.tar.gz "$PYSIDE_STAGE_URL"
+          tar -xzf /tmp/stage.tar.gz -C /home/runner/pyside-stage --strip-components=1 \
+            || tar -xzf /tmp/stage.tar.gz -C /home/runner/pyside-stage
+          echo "PYSIDE_STAGE_DIR=/home/runner/pyside-stage" >> "$GITHUB_ENV"
+
+      # ════════ The actual build — INSIDE the Ubuntu 14.04 container ════════
+      - name: Run build_pyside_android.py inside Ubuntu 14.04 container
         run: |
           set -o pipefail
           STAGE_ARGS=""
           if [ -n "$PYSIDE_STAGE_DIR" ]; then
-            STAGE_ARGS="--pyside-stage $PYSIDE_STAGE_DIR --skip-build"
+              STAGE_ARGS="--pyside-stage /pyside-stage --skip-build"
           fi
-          python2.7 build_pyside_android.py \
-              --project-dir    "$PROJ_DIR" \
-              --necessitas-sdk "$NECESSITAS_DIR" \
-              --cache-dir      "$PYSIDE_BUILDER_CACHE" \
-              --app-name       "$APP_NAME" \
-              --unique-name    "$UNIQUE_NAME" \
-              --build-threads  "$BUILD_THREADS" \
-              $STAGE_ARGS \
-              --verbose \
-              2>&1 | tee build.log
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -v "/home/runner/necessitas:/necessitas" \
+            -v "/home/runner/pyside-cache:/cache" \
+            ${PYSIDE_STAGE_DIR:+-v "/home/runner/pyside-stage:/pyside-stage"} \
+            -w /work \
+            -e BUILD_THREADS="$BUILD_THREADS" \
+            pyside-builder \
+            python2.7 build_pyside_android.py \
+                --project-dir    "/work/${PROJ_DIR#workspace/}" \
+                --necessitas-sdk /necessitas \
+                --cache-dir      /cache \
+                --app-name       "$APP_NAME" \
+                --unique-name    "$UNIQUE_NAME" \
+                --build-threads  "$BUILD_THREADS" \
+                $STAGE_ARGS \
+                --verbose \
+                2>&1 | tee build.log
 
       - name: Locate APK
         id: locate
         if: success()
         run: |
-          APK="$(find "$PYSIDE_BUILDER_CACHE/artifacts" -name '*.apk' -type f 2>/dev/null | head -1)"
+          APK="$(find /home/runner/pyside-cache/artifacts -name '*.apk' -type f 2>/dev/null | head -1)"
           if [ -z "$APK" ]; then
-            APK="$(find "$PYSIDE_BUILDER_CACHE/example-project" -name '*.apk' -type f 2>/dev/null | head -1)"
+              APK="$(find /home/runner/pyside-cache/example-project -name '*.apk' -type f 2>/dev/null | head -1)"
           fi
           if [ -z "$APK" ]; then
-            echo "::error::No APK produced — check build-log artifact"
-            exit 1
+              echo "::error::No APK produced"
+              exit 1
           fi
           echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
           ls -la "$APK"
@@ -649,40 +318,31 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: apk-pyside-qt4${{ env.BUILD_ID && format('-{0}', env.BUILD_ID) || '' }}
+          name: apk-pyside-qt4-docker
           path: ${{ steps.locate.outputs.apk_path }}
           retention-days: 7
 
-      - name: Upload build log
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-pyside-qt4${{ env.BUILD_ID && format('-{0}', env.BUILD_ID) || '' }}
-          path: build.log
+          name: logs-pyside-docker
+          path: |
+            build.log
+            necessitas-install.log
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Upload Necessitas installer log (only if installer was run)
-        if: always() && steps.necessitas-cache.outputs.cache-hit != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: necessitas-install-log${{ env.BUILD_ID && format('-{0}', env.BUILD_ID) || '' }}
-          path: /tmp/necessitas-install.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Tar PySide stage as artifact (cold-cache runs only)
+      - name: Tar PySide stage for future runs (cold-cache only)
         if: success() && env.PYSIDE_STAGE_URL == ''
         run: |
-          STAGE_DIR="$PYSIDE_BUILDER_CACHE/build-scripts/stage"
+          STAGE_DIR="/home/runner/pyside-cache/build-scripts/stage"
           if [ -d "$STAGE_DIR" ] && [ -n "$(ls -A "$STAGE_DIR" 2>/dev/null)" ]; then
-            tar -czf pyside-stage.tar.gz -C "$STAGE_DIR" .
-            ls -lh pyside-stage.tar.gz
-          else
-            echo "Stage dir empty or missing — not creating artifact."
+              tar -czf pyside-stage.tar.gz -C "$STAGE_DIR" .
+              ls -lh pyside-stage.tar.gz
           fi
 
-      - name: Upload PySide stage tarball
+      - name: Upload stage tarball
         if: success() && env.PYSIDE_STAGE_URL == ''
         uses: actions/upload-artifact@v4
         with:
