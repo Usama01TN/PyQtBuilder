@@ -146,6 +146,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Verify Dockerfile in repo is up to date (shows content + hash)
+        run: |
+          echo "================================================================"
+          echo "  Dockerfile.pyside-builder content (the one actually being used)"
+          echo "================================================================"
+          cat -n Dockerfile.pyside-builder
+          echo "================================================================"
+          echo "  Dockerfile SHA256:"
+          sha256sum Dockerfile.pyside-builder
+          echo "  Looking for required packages (should print line numbers):"
+          grep -nE "xauth|xvfb|x11-xkb-utils|openjdk-7" Dockerfile.pyside-builder | head -10
+          echo "================================================================"
+
       - name: Build pyside-builder Docker image (with layer caching)
         uses: docker/build-push-action@v5
         with:
