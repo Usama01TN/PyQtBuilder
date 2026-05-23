@@ -115,27 +115,21 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 6   # 2026-05: one-line fix for the C++11 issue.
+BUILDER_SCRIPT_VERSION = 7   # 2026-05: linker fix for ARM shared library
+                             # build.  v6 got the build through the COMPILE
+                             # phase but failed at LINK with:
+                             #   "ld: error: requires unsupported dynamic
+                             #    reloc R_ARM_REL32; recompile with -fPIC"
+                             #   "ld: error: hidden symbol '__dso_handle'
+                             #    is not defined locally"
                              #
-                             # v5 worked great EXCEPT for `-include cstdint`
-                             # which triggers a `#error This file requires
-                             # C++11` from libstdc++ 4.8 (the version in
-                             # NDK r10e).  cstdint is wrapped in
-                             # `__cplusplus >= 201103L` guards.
-                             #
-                             # Shiboken-android is C++98 code; switching the
-                             # whole build to -std=c++11 would risk new
-                             # errors elsewhere.  Better fix: use <stdint.h>
-                             # (C99, no C++11 needed) instead of <cstdint>.
-                             # Provides the same int32_t/uint64_t types,
-                             # just in global namespace rather than std::.
-                             #
-                             # Also bumps QT48_PATCH_MARKER to "v6" so the
-                             # Qt 4.8 header patcher re-patches files that
-                             # v5 left with the bad `#include <cstdint>`
-                             # at the top.  The patcher now detects old
-                             # marker variants and strips the stale prepend
-                             # block before applying the new one.
+                             # Added -fPIC (position-independent code,
+                             # required for .so on ARM — CMake's normal
+                             # rules don't reach here because shiboken's
+                             # CMakeLists.txt uses CMAKE_FORCE_CXX_COMPILER)
+                             # and -fno-use-cxa-atexit (NDK r10e's libgcc
+                             # doesn't export __dso_handle; this flag
+                             # makes GCC use plain atexit() instead).
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -1050,7 +1044,26 @@ def configure_env(args):
         '-include utility '       # std::pair, std::make_pair
         '-include algorithm '     # std::max, std::min, std::find
         '-include sstream '       # std::stringstream
-        '-fpermissive'            # downgrade many C++11+ errors to warnings
+        # ── Code-generation flags for ARM shared-library link ──
+        # Without -fPIC, the linker rejects the .o files with:
+        #   "ld: error: requires unsupported dynamic reloc
+        #    R_ARM_REL32; recompile with -fPIC"
+        # CMake's standard "build .so" rules SHOULD imply -fPIC, but
+        # M4rtinK's shiboken CMakeLists.txt uses CMAKE_FORCE_CXX_COMPILER
+        # which bypasses CMake's normal compiler-flag plumbing.  Adding
+        # -fPIC to CXXFLAGS reaches the compile unconditionally.
+        '-fPIC '
+        # NDK r10e's libgcc doesn't export __dso_handle as a public
+        # symbol — only the runtime does, but we're statically linking
+        # libgcc.  -fno-use-cxa-atexit tells GCC not to generate calls
+        # to __cxa_atexit() (which need __dso_handle), and to fall back
+        # to old-style atexit() instead.  This is the standard fix for:
+        #   "ld: error: hidden symbol '__dso_handle' is not defined
+        #    locally"
+        '-fno-use-cxa-atexit '
+        # -fpermissive downgrades many C++11-strictness errors to
+        # warnings (string-literal-to-char*, narrowing in initializers).
+        '-fpermissive'
     )
 
     # Append the flags to whichever line(s) of env.sh export CXXFLAGS or
@@ -1071,7 +1084,10 @@ def configure_env(args):
         return pattern.sub(repl, text)
 
     env_text = _patch_flag_line('CXXFLAGS', compat_flags, env_text)
-    env_text = _patch_flag_line('CFLAGS', '-include cstddef -include cstring', env_text)
+    env_text = _patch_flag_line(
+        'CFLAGS',
+        '-include cstddef -include cstring -fPIC -fno-use-cxa-atexit',
+        env_text)
 
     # If env.sh DOESN'T set CXXFLAGS itself (some forks rely on cmake's
     # default), append an explicit export so our flags reach the compile.
