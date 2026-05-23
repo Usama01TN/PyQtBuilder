@@ -50,6 +50,33 @@ RUN apt-get install -y --force-yes --no-install-recommends \
         ca-certificates \
     && update-ca-certificates
 
+# ────────────────── openjdk-7-jdk — needs special handling ──────────────────
+# openjdk-7's post-install in debian:jessie-slim fails because the slim
+# image strips /usr/share/man/man1, and the JDK's post-install script
+# assumes that directory exists.  This is Debian bug #863199 (closed
+# WONTFIX because jessie is EOL).
+#
+#   Errors were encountered while processing:
+#    openjdk-7-jre-headless:amd64
+#    openjdk-7-jre:amd64
+#    openjdk-7-jdk:amd64
+#   E: Sub-process /usr/bin/dpkg returned an error code (1)
+#
+# Pre-creating /usr/share/man/man1 makes the post-install succeed.
+# We also install ca-certificates-java SEPARATELY first to break a
+# chicken-and-egg where ca-certificates-java needs Java to bootstrap
+# but is also a transitive dep of openjdk-7-jdk.  Finally we run
+# `dpkg --configure -a` after to recover any half-configured packages.
+RUN mkdir -p /usr/share/man/man1 \
+    && apt-get install -y --force-yes --no-install-recommends \
+           ca-certificates-java || true
+RUN mkdir -p /usr/share/man/man1 \
+    && apt-get install -y --force-yes --no-install-recommends \
+           openjdk-7-jdk \
+       || dpkg --configure -a \
+    && dpkg --configure -a \
+    && java -version 2>&1 | head -1
+
 # ────────────────── Core toolchain ──────────────────
 # NOTE: package names below are DEBIAN names, not Ubuntu names.
 # Specifically:
@@ -65,7 +92,6 @@ RUN apt-get install -y --force-yes --no-install-recommends \
         cmake \
         git \
         ant \
-        openjdk-7-jdk \
         python2.7 \
         python2.7-dev \
         shiboken \
