@@ -115,24 +115,27 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 5   # 2026-05: NDK r8b is gone from Google's CDN
-                             # (Google removed it ~2017 when restructuring
-                             # /android/ndk/ → /android/repository/).
+BUILDER_SCRIPT_VERSION = 6   # 2026-05: one-line fix for the C++11 issue.
                              #
-                             # v5 switches the default NDK to r10e (the
-                             # oldest still hosted by Google) and tries a
-                             # list of currently-working URLs:
-                             #   - dl.google.com/android/repository/
-                             #     android-ndk-{r10e, r12b, r13b, r17c}-
-                             #     linux-x86_64.zip
+                             # v5 worked great EXCEPT for `-include cstdint`
+                             # which triggers a `#error This file requires
+                             # C++11` from libstdc++ 4.8 (the version in
+                             # NDK r10e).  cstdint is wrapped in
+                             # `__cplusplus >= 201103L` guards.
                              #
-                             # User can override with NDK_DOWNLOAD_URL env
-                             # var to point at a self-hosted mirror (e.g.
-                             # GitHub Release asset).
+                             # Shiboken-android is C++98 code; switching the
+                             # whole build to -std=c++11 would risk new
+                             # errors elsewhere.  Better fix: use <stdint.h>
+                             # (C99, no C++11 needed) instead of <cstdint>.
+                             # Provides the same int32_t/uint64_t types,
+                             # just in global namespace rather than std::.
                              #
-                             # The .zip vs .tar.bz2 detection now sniffs
-                             # the file's magic bytes rather than trusting
-                             # the URL extension.
+                             # Also bumps QT48_PATCH_MARKER to "v6" so the
+                             # Qt 4.8 header patcher re-patches files that
+                             # v5 left with the bad `#include <cstdint>`
+                             # at the top.  The patcher now detects old
+                             # marker variants and strips the stale prepend
+                             # block before applying the new one.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -1027,8 +1030,16 @@ def configure_env(args):
         '-include new '           # <new> for placement new (qmap.h:456)
         '-include cstdlib '       # <cstdlib> for malloc, free, exit
         '-include cstdio '        # <cstdio> for FILE, fprintf
-        '-include cstdint '       # <cstdint> for int32_t etc.
-        '-include climits '       # <climits> for INT_MAX etc.
+        # NOTE: we deliberately use the C-style header <stdint.h>
+        # rather than the C++ one <cstdint>.  NDK r10e's libstdc++
+        # 4.8 guards <cstdint> behind `__cplusplus >= 201103L` and
+        # #errors with "this file requires C++11" if it's pulled in
+        # without -std=c++11.  M4rtinK's shiboken-android code is
+        # C++98, so we must keep the compiler in default mode.
+        # <stdint.h> is the C99 form, available since GCC 3.x in any
+        # mode, and provides the same int32_t / uint64_t etc.
+        '-include stdint.h '      # int32_t, uint64_t — C99-style
+        '-include climits '       # <climits> for INT_MAX etc. (C++98)
         # C++ STL containers/algos that shiboken's source uses without
         # `#include` directives (basewrapper.cpp, conversions.h, etc.):
         '-include list '          # std::list
@@ -1116,7 +1127,7 @@ def configure_env(args):
 
 # Marker we prepend to patched files so re-runs are idempotent.  Stays
 # valid as a C++ comment + a unique-enough string to grep for.
-QT48_PATCH_MARKER = '// PATCHED_BY_BUILD_PYSIDE_ANDROID -- DO NOT REMOVE'
+QT48_PATCH_MARKER = '// PATCHED_BY_BUILD_PYSIDE_ANDROID v6 -- DO NOT REMOVE'
 
 # Headers known to use placement new and other 2010-era C++ constructs
 # that modern GCC won't accept without explicit STL header inclusion.
@@ -1188,15 +1199,20 @@ def _patch_qt48_headers(qt_dir, dry_run=False):
     #   * <new> alone fixes the immediate qmap.h:456 error
     #   * <cstddef> covers std::size_t / NULL references
     #   * <cstring> covers memcpy/memset (qbytearray.h, qstring.h)
-    #   * <cstdlib>/<cstdint> cover qmalloc and the int-type aliases
+    #   * <cstdlib> covers malloc/free/qmalloc
     # The marker comes first so our grep-for-marker check sees it.
+    #
+    # NOTE: we deliberately do NOT prepend <cstdint> here.  That header
+    # requires C++11 in libstdc++ 4.8 and triggers a `#error` if
+    # __cplusplus < 201103L.  Qt 4.8 code (C++98) and shiboken-android
+    # (C++98) don't actually need cstdint — the int32_t/uint64_t types
+    # they reference come from <stdint.h> via our CXXFLAGS instead.
     PREPEND = (
         QT48_PATCH_MARKER + '\n'
         '#include <new>\n'
         '#include <cstddef>\n'
         '#include <cstring>\n'
         '#include <cstdlib>\n'
-        '#include <cstdint>\n'
         '#include <climits>\n'
         '\n'
     )
@@ -1214,13 +1230,38 @@ def _patch_qt48_headers(qt_dir, dry_run=False):
         with open(path, 'rb') as f:
             content = f.read()
 
-        # Idempotency check — skip if marker already in the first 1 KB.
-        # We bound the check so we don't scan multi-MB files (some Qt
-        # headers are large).
+        # Idempotency check — skip if THIS version's marker is present.
         if QT48_PATCH_MARKER.encode('utf-8') in content[:1024]:
             skipped_count += 1
             log.info('    skip  %s  (already patched)', header_name)
             continue
+
+        # Old-version-marker detection: a previous version of this
+        # script may have patched this file with a DIFFERENT (older)
+        # prepend block — e.g. v5 prepended `#include <cstdint>` which
+        # triggers C++11 errors in libstdc++ 4.8.  Strip the old block
+        # before applying the new one.
+        OLD_MARKER_PREFIX = b'// PATCHED_BY_BUILD_PYSIDE_ANDROID'
+        if OLD_MARKER_PREFIX in content[:1024]:
+            log.info('    stripping old patch block from %s', header_name)
+            # The old block runs from the marker through the blank line
+            # after the includes.  Find the first non-#include line
+            # after the marker.
+            lines = content.split(b'\n')
+            strip_until = 0
+            saw_marker = False
+            for i, line in enumerate(lines):
+                if not saw_marker:
+                    if OLD_MARKER_PREFIX in line:
+                        saw_marker = True
+                    continue
+                # After marker — keep stripping #include lines and blanks
+                stripped = line.strip()
+                if stripped.startswith(b'#include') or stripped == b'':
+                    strip_until = i + 1
+                else:
+                    break
+            content = b'\n'.join(lines[strip_until:])
 
         if dry_run:
             log.info('    DRY   %s  (would prepend %d-byte block)',
