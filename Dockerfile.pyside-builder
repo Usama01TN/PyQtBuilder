@@ -1,52 +1,55 @@
 # Dockerfile.pyside-builder
 #
-# Recreates the Ubuntu 14.04 (Trusty) environment that M4rtinK's PySide-
-# for-Android build scripts were originally designed against, ca. 2013.
+# After Ubuntu 14.04's archive layout broke on old-releases.ubuntu.com
+# (every Packages file returns 404 as of mid-2026), we switch to
+# Debian 8 "jessie" — same toolchain era, but Debian's archive policy
+# keeps every release at archive.debian.org permanently.
 #
-# Building this in Ubuntu 14.04 means:
-#   * gcc 4.8 default — no modern C++11/14 strictness
-#   * libstdc++ 6.0.19 — no #error in <cstdint>, no missing transitive STL includes
-#   * `shiboken` apt package available — the HOST generator binary
-#   * binutils ld accepts ARM ABI quirks that newer ld rejects
-#   * java 7 — Necessitas's ant build.xml works without quirks
+# Jessie ships:
+#   * gcc / g++ 4.9 — matches NDK r10e's toolchain version
+#   * libstdc++ 6.0.20 — no modern C++11 enforcement
+#   * Python 2.7 from main repos
+#   * python-shiboken + libshiboken-dev — THE host generator binary
+#     M4rtinK assumes is preinstalled
+#   * openjdk-7-jdk — what Necessitas's ant build.xml needs
+#   * 32-bit multilib (for the Necessitas installer's i386 binary)
 #
-# Ubuntu 14.04 has been EOL since April 2019, so its repos moved from
-# archive.ubuntu.com to old-releases.ubuntu.com.  We patch /etc/apt/sources.list
-# accordingly.  These archives are still maintained by Canonical.
-#
-# Use:
-#   docker build -t pyside-builder -f Dockerfile.pyside-builder .
-#   docker run --rm -v /your/project:/work pyside-builder /work/build.sh
+# Notes on Jessie at archive.debian.org:
+#   * No https on this archive — http only.
+#   * Release files have EXPIRED dates, so we set
+#     Acquire::Check-Valid-Until=false.
+#   * Repos are at archive.debian.org/debian (not deb.debian.org).
+#   * security.debian.org has its own archive path.
 
-FROM ubuntu:14.04
+FROM debian:jessie-slim
 
-# Tell apt to talk to the EOL archive instead of the (now-removed) main repos.
-RUN set -eux; \
-    sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list; \
-    sed -i 's|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list; \
-    sed -i 's|http://|http://|g' /etc/apt/sources.list
-
-# apt-get update on Trusty's archived repos.  Disable the broken HTTPS
-# transport — old-releases.ubuntu.com over HTTP is fine and faster.
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-RUN apt-get update -y || (sleep 5 && apt-get update -y) || (sleep 10 && apt-get update -y)
+# Replace the now-broken jessie sources with archive.debian.org.
+# disable expiry check (Release files are years past their valid-until).
+RUN set -eux; \
+    printf '%s\n' \
+        'deb http://archive.debian.org/debian jessie main contrib non-free' \
+        'deb http://archive.debian.org/debian jessie-backports main contrib non-free' \
+        'deb http://archive.debian.org/debian-security jessie/updates main contrib non-free' \
+        > /etc/apt/sources.list; \
+    printf 'Acquire::Check-Valid-Until "false";\nAcquire::AllowInsecureRepositories "true";\nAPT::Get::AllowUnauthenticated "true";\n' \
+        > /etc/apt/apt.conf.d/99-allow-insecure; \
+    cat /etc/apt/sources.list
 
-# Modern CA root certs — the ones shipped in 14.04 are too old to validate
-# many current TLS endpoints (GitHub, Google CDN).  This bundle is what
-# every Trusty docker setup needs first.
-RUN apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Check-Valid-Until=false update -y \
+    || apt-get -o Acquire::Check-Valid-Until=false update -y
+
+# Modern CA root certs — jessie's are too old for many current TLS
+# endpoints (GitHub clones, Google CDN downloads).
+RUN apt-get install -y --force-yes --no-install-recommends \
         ca-certificates \
     && update-ca-certificates
 
 # ────────────────── Core toolchain ──────────────────
-# Python 2.7 — ALREADY ships in 14.04 as `python2.7`, no PPAs needed.
-# cmake, git, ant — all available in main repos.
-# shiboken + libshiboken-dev — THE PACKAGE that disappeared from 18.04+.
-# openjdk-7-jdk — what Necessitas's android/build.xml expects.
-RUN apt-get install -y --no-install-recommends \
+RUN apt-get install -y --force-yes --no-install-recommends \
         build-essential \
         cmake \
         git \
@@ -54,20 +57,19 @@ RUN apt-get install -y --no-install-recommends \
         openjdk-7-jdk \
         python2.7 \
         python2.7-dev \
-        shiboken \
+        python-shiboken \
         libshiboken-dev \
+        shiboken \
         wget curl unzip xz-utils file bzip2 \
         libxml2-utils \
         libssl-dev zlib1g-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ────────────────── X11 + 32-bit runtime libs (Necessitas installer) ──────────────────
-# Necessitas's Qt Installer Framework binary is 32-bit ELF and needs a
-# headful Qt 4 runtime to actually run, even with our auto-answer script.
-# Most of these are needed by the QIF Qt-based UI even under xvfb.
+# ────────────────── X11 + i386 runtime libs (Necessitas installer) ──────────────────
+# Necessitas's Qt Installer Framework binary is 32-bit ELF.
 RUN dpkg --add-architecture i386 \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::Check-Valid-Until=false update -y \
+    && apt-get install -y --force-yes --no-install-recommends \
         xvfb \
         libc6:i386 libstdc++6:i386 zlib1g:i386 \
         libxext6:i386 libxrender1:i386 libfontconfig1:i386 \
@@ -80,13 +82,10 @@ RUN dpkg --add-architecture i386 \
         libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin JAVA_HOME for ant's ahead-of-time tasks
+# Pin JAVA_HOME for ant's tasks
 ENV JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# Working directory the workflow will mount into.
 WORKDIR /work
 
-# Sanity-print the toolchain versions on container start so the user
-# can see what they're actually using.
-CMD ["bash", "-c", "echo '=== Ubuntu 14.04 PySide build environment ==='; lsb_release -a 2>/dev/null; gcc --version | head -1; g++ --version | head -1; python2.7 --version 2>&1; java -version 2>&1 | head -1; cmake --version | head -1; ant -version 2>&1 | head -1; which shiboken; echo '==='; echo 'Run your build inside this container, e.g.:'; echo '  docker run --rm -v $PWD:/work pyside-builder python2.7 /work/build_pyside_android.py --project-dir /work/testapp --necessitas-sdk /work/necessitas'"]
+CMD ["bash", "-c", "echo '=== Debian Jessie PySide build environment ==='; cat /etc/debian_version 2>/dev/null; gcc --version | head -1; g++ --version | head -1; python2.7 --version 2>&1; java -version 2>&1 | head -1; cmake --version | head -1; ant -version 2>&1 | head -1; echo -n 'shiboken: '; which shiboken || echo NOT FOUND; echo -n 'libshiboken: '; dpkg -l libshiboken-dev 2>/dev/null | tail -1 || echo NOT FOUND; echo '==='; echo 'Run your build inside this container, e.g.:'; echo '  docker run --rm -v $PWD:/work pyside-builder python2.7 /work/build_pyside_android.py --project-dir /work/testapp --necessitas-sdk /work/necessitas'"]
