@@ -9,8 +9,10 @@
 #   * gcc / g++ 4.9 — matches NDK r10e's toolchain version
 #   * libstdc++ 6.0.20 — no modern C++11 enforcement
 #   * Python 2.7 from main repos
-#   * python-shiboken + libshiboken-dev — THE host generator binary
-#     M4rtinK assumes is preinstalled
+#   * shiboken + libshiboken-dev + libshiboken1.2 — THE host generator
+#     binary M4rtinK assumes is preinstalled (Debian package names;
+#     Ubuntu calls one of these `python-shiboken` which Jessie does NOT
+#     have — handled in the apt install step below)
 #   * openjdk-7-jdk — what Necessitas's ant build.xml needs
 #   * 32-bit multilib (for the Necessitas installer's i386 binary)
 #
@@ -49,6 +51,15 @@ RUN apt-get install -y --force-yes --no-install-recommends \
     && update-ca-certificates
 
 # ────────────────── Core toolchain ──────────────────
+# NOTE: package names below are DEBIAN names, not Ubuntu names.
+# Specifically:
+#   * `shiboken` provides /usr/bin/shiboken (the host generator).
+#   * `libshiboken-dev` provides the C++ headers.
+#   * `libshiboken1.2` provides the runtime library.
+#   * There is NO `python-shiboken` package in Debian Jessie — that
+#     was an Ubuntu-only name.  The Python bindings live in
+#     `python-pyside.shiboken` if needed (we don't need it for this
+#     build — M4rtinK's scripts use shiboken as a C++ build tool).
 RUN apt-get install -y --force-yes --no-install-recommends \
         build-essential \
         cmake \
@@ -57,13 +68,36 @@ RUN apt-get install -y --force-yes --no-install-recommends \
         openjdk-7-jdk \
         python2.7 \
         python2.7-dev \
-        python-shiboken \
-        libshiboken-dev \
         shiboken \
+        libshiboken-dev \
+        libshiboken1.2 \
         wget curl unzip xz-utils file bzip2 \
         libxml2-utils \
         libssl-dev zlib1g-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail-fast verification: confirm everything we'll later depend on is
+# actually present and runnable.  If anything's missing, abort the
+# image build NOW with a clear error rather than letting the actual
+# project build fail 60 minutes later with a confusing message.
+RUN set -e; \
+    echo "=== Verifying installed toolchain ==="; \
+    for cmd in gcc g++ cmake git ant make python2.7 java javac shiboken; do \
+        if ! command -v "$cmd" >/dev/null 2>&1; then \
+            echo "FATAL: required command '$cmd' is not in PATH after install"; \
+            exit 1; \
+        fi; \
+        printf '  %-12s : %s\n' "$cmd" "$(command -v "$cmd")"; \
+    done; \
+    echo "  shiboken --version : $(shiboken --version 2>&1 | head -1)"; \
+    for header in /usr/include/shiboken/sbkpython.h /usr/include/shiboken/basewrapper.h; do \
+        if [ ! -f "$header" ]; then \
+            echo "FATAL: required header $header is missing"; \
+            exit 1; \
+        fi; \
+    done; \
+    echo "  ✓ libshiboken-dev headers present"; \
+    echo "=== Toolchain OK ==="
 
 # ────────────────── X11 + i386 runtime libs (Necessitas installer) ──────────────────
 # Necessitas's Qt Installer Framework binary is 32-bit ELF.
