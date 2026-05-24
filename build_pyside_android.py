@@ -457,8 +457,8 @@ def preflight(args):
         src = f.read()
 
     forbidden_re = re.compile(
-        rb'^\s*(?:from\s+(?P<from_mod>PySide2|PySide6|PyQt5|PyQt6)\b'
-        rb'|import\s+(?P<imp_mod>PySide2|PySide6|PyQt5|PyQt6)\b)',
+        br'^\s*(?:from\s+(?P<from_mod>PySide2|PySide6|PyQt5|PyQt6)\b'
+        br'|import\s+(?P<imp_mod>PySide2|PySide6|PyQt5|PyQt6)\b)',
         re.MULTILINE)
 
     matches = list(forbidden_re.finditer(src))
@@ -488,7 +488,7 @@ def preflight(args):
     # is just `PySide` (no version).  Match `from PySide ` or `import PySide `
     # NOT followed by a digit (so PySide2/PySide6 don't satisfy this).
     pyside1_re = re.compile(
-        rb'^\s*(?:from|import)\s+PySide(?!\d)\b',
+        br'^\s*(?:from|import)\s+PySide(?!\d)\b',
         re.MULTILINE)
     if not pyside1_re.search(src):
         log.warning(
