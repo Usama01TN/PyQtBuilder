@@ -115,21 +115,20 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 7   # 2026-05: linker fix for ARM shared library
-                             # build.  v6 got the build through the COMPILE
-                             # phase but failed at LINK with:
-                             #   "ld: error: requires unsupported dynamic
-                             #    reloc R_ARM_REL32; recompile with -fPIC"
-                             #   "ld: error: hidden symbol '__dso_handle'
-                             #    is not defined locally"
+BUILDER_SCRIPT_VERSION = 8   # 2026-05: fixed false-positive preflight check
+                             # that rejected legitimate PySide 1 main.py
+                             # files because the substring "PySide6" or
+                             # "PyQt5" appeared in a comment / docstring /
+                             # string literal.  Now uses regex matching
+                             # ACTUAL import statements only.
                              #
-                             # Added -fPIC (position-independent code,
-                             # required for .so on ARM — CMake's normal
-                             # rules don't reach here because shiboken's
-                             # CMakeLists.txt uses CMAKE_FORCE_CXX_COMPILER)
-                             # and -fno-use-cxa-atexit (NDK r10e's libgcc
-                             # doesn't export __dso_handle; this flag
-                             # makes GCC use plain atexit() instead).
+                             # Also enriches the rejection message with the
+                             # offending line numbers + source text, so the
+                             # user can immediately see what's wrong.
+                             #
+                             # On the positive side: if PySide 1 IS being
+                             # imported, log the import line so the user
+                             # can confirm we detected the right thing.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -438,18 +437,75 @@ def preflight(args):
     log.info('  ✓ project_dir : %s', args.project_dir)
     log.info('  ✓ main.py     : %s', main_py)
 
-    # Quick sanity-check: main.py should use PySide (Qt4), not PyQt5/PySide6
+    # Sanity-check main.py imports.
+    #
+    # The OLD check was `if b'PySide6' in src` — a substring match — which
+    # had false positives for any file containing the string "PySide6" in
+    # a comment, docstring, or non-import line.  This new check uses a
+    # regex that matches actual import STATEMENTS only:
+    #
+    #   from PySide2 import ...       → REJECTED
+    #   from PySide6 import ...       → REJECTED
+    #   from PyQt5 import ...         → REJECTED
+    #   from PyQt6 import ...         → REJECTED
+    #   import PySide2                → REJECTED
+    #   import PySide6                → REJECTED
+    #   from PySide import ...        → ACCEPTED (this is PySide 1)
+    #   # TODO: port to PySide6        → ACCEPTED (comment, not import)
+    #   "documentation about PySide6"  → ACCEPTED (string, not import)
     with open(main_py, 'rb') as f:
         src = f.read()
-    if b'PySide6' in src or b'PyQt5' in src or b'PyQt6' in src:
+
+    forbidden_re = re.compile(
+        rb'^\s*(?:from\s+(?P<from_mod>PySide2|PySide6|PyQt5|PyQt6)\b'
+        rb'|import\s+(?P<imp_mod>PySide2|PySide6|PyQt5|PyQt6)\b)',
+        re.MULTILINE)
+
+    matches = list(forbidden_re.finditer(src))
+    if matches:
+        offending_lines = []
+        for m in matches:
+            # Figure out which line number the match is on
+            line_num = src[:m.start()].count(b'\n') + 1
+            # Extract the full source line for display
+            line_start = src.rfind(b'\n', 0, m.start()) + 1
+            line_end = src.find(b'\n', m.start())
+            if line_end == -1:
+                line_end = len(src)
+            line_text = src[line_start:line_end].decode('utf-8', 'replace').rstrip()
+            offending_lines.append('      line %d: %s' % (line_num, line_text))
         raise SystemExit(
-            '  X main.py uses PySide6 / PyQt5 / PyQt6 imports.\n'
+            '  X main.py imports from PySide2/PySide6/PyQt5/PyQt6.\n'
             '    This builder targets PySide 1 (Qt 4.8) on Python 2.7.\n'
-            '    For modern stacks use build_pyqt5_android.py.')
-    if b'PySide' not in src:
+            '    Offending import line(s):\n'
+            + '\n'.join(offending_lines) + '\n'
+            '    For modern stacks use build_pyqt5_android.py.\n'
+            '    For PySide 1, replace these imports with:\n'
+            '      from PySide import QtGui      (instead of PyQt5/PySide6 QtWidgets)\n'
+            '      from PySide import QtCore     (instead of PyQt5/PySide6 QtCore)')
+
+    # Positive check: confirm PySide 1 imports are present.  PySide 1
+    # is just `PySide` (no version).  Match `from PySide ` or `import PySide `
+    # NOT followed by a digit (so PySide2/PySide6 don't satisfy this).
+    pyside1_re = re.compile(
+        rb'^\s*(?:from|import)\s+PySide(?!\d)\b',
+        re.MULTILINE)
+    if not pyside1_re.search(src):
         log.warning(
-            '  ! main.py does not import PySide — make sure your app\n'
-            '    actually uses the PySide 1 bindings.')
+            '  ! main.py does not appear to import PySide (Qt 4) — your app\n'
+            '    may not actually use the PySide 1 bindings.  Continuing anyway,\n'
+            '    but the resulting APK may not work as expected.')
+    else:
+        # Log the first PySide 1 import line so the user can confirm we
+        # detected the right import.
+        m = pyside1_re.search(src)
+        line_num = src[:m.start()].count(b'\n') + 1
+        line_start = src.rfind(b'\n', 0, m.start()) + 1
+        line_end = src.find(b'\n', m.start())
+        if line_end == -1:
+            line_end = len(src)
+        line_text = src[line_start:line_end].decode('utf-8', 'replace').rstrip()
+        log.info('  ✓ PySide 1 import found at line %d: %s', line_num, line_text)
 
     # Host tools
     required_tools = ['cmake', 'git', 'ant', 'make', 'g++', 'tar', 'unzip']
