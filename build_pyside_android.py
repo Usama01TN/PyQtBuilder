@@ -115,27 +115,30 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 10  # 2026-05: fix v9 crash in _patch_libpyside_source.
+BUILDER_SCRIPT_VERSION = 11  # 2026-05: fix v10's libpyside patch causing
+                             # double-definition errors in shiboken-generated
+                             # qtcore_module_wrapper.cpp (which includes
+                             # pyside.h via two different paths in the same
+                             # translation unit).
                              #
-                             # v9 added a libpyside patcher whose snippet
-                             # contained one em-dash character (`—`, byte
-                             # E2 80 94 in UTF-8) in a C++ comment.  At
-                             # runtime under Python 2.7, the snippet was a
-                             # `str` (bytes), and calling .encode('utf-8')
-                             # on it triggered Python 2's implicit DECODE-
-                             # via-ASCII step first.  That fails on 0xE2
-                             # bytes:
+                             # Root cause: v9/v10 appended the new function
+                             # AFTER pyside.h's own `#endif` include guard,
+                             # leaving the function unprotected.  When the
+                             # header is included twice in one TU, the
+                             # original (guarded) code is suppressed but
+                             # our patch runs twice -> redefinition error.
+                             # C++ `inline` only relaxes ODR across
+                             # different TUs, not within one.
                              #
-                             #   UnicodeDecodeError: 'ascii' codec can't
-                             #   decode byte 0xe2 in position 73:
-                             #   ordinal not in range(128)
-                             #
-                             # v10 fixes by (a) removing all non-ASCII
-                             # chars from the snippet, (b) replacing
-                             # `.encode('utf-8')` calls with a small
-                             # `_as_bytes()` helper that returns the
-                             # input unchanged if it's already bytes
-                             # (Py2 case) or encodes it otherwise (Py3).
+                             # v11 fixes by:
+                             #   (a) wrapping the patch snippet in its own
+                             #       include guard
+                             #       (LIBPYSIDE_BACKPORT_GETWRAPPERFORQOBJECT)
+                             #   (b) detecting older patch markers and
+                             #       TRUNCATING the file at the start of
+                             #       the old block before appending the
+                             #       new one, so the patcher self-heals
+                             #       caches that v9/v10 polluted.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -1403,7 +1406,15 @@ def _patch_qt48_headers(qt_dir, dry_run=False):
 # libpyside source patcher — adds functions missing in M4rtinK's 1.1-era fork
 # ----------------------------------------------------------------------------
 
-LIBPYSIDE_PATCH_MARKER = '// LIBPYSIDE_PATCH_v9 -- DO NOT REMOVE'
+LIBPYSIDE_PATCH_MARKER = '// LIBPYSIDE_PATCH_v11 -- DO NOT REMOVE'
+
+# Old-version marker prefix.  When _patch_libpyside_source runs, it
+# detects any line containing this prefix and TRUNCATES the file
+# at that point before appending the new snippet.  This handles the
+# case where a previous (broken) version of this patcher already
+# wrote a now-incompatible snippet to disk, which would otherwise
+# stay there and cause double-definition errors.
+LIBPYSIDE_PATCH_MARKER_PREFIX = '// LIBPYSIDE_PATCH_'
 
 # The chunk we inject into libpyside/pyside.h.  This is a back-port of
 # PySide 1.2's `getWrapperForQObject()` helper.  Shiboken's generator
@@ -1414,16 +1425,26 @@ LIBPYSIDE_PATCH_MARKER = '// LIBPYSIDE_PATCH_v9 -- DO NOT REMOVE'
 #     qabstracteventdispatcher_wrapper.cpp:1476:12: error:
 #     'getWrapperForQObject' is not a member of 'PySide'
 #
-# The implementation below mirrors the upstream PySide 1.2.4 source:
-# look up an existing Python wrapper for the QObject in Shiboken's
-# binding manager; if found return it (with incref); otherwise create
-# a new wrapper through the standard Object::newObject path.
+# IMPORTANT: this snippet appears AFTER pyside.h's own `#endif` of the
+# PYSIDE_H include guard.  Without ITS OWN include guard, the function
+# would be re-declared every time pyside.h is included.  Some shiboken-
+# generated translation units include pyside.h more than once via
+# different paths (e.g. qtcore_module_wrapper.cpp includes it at lines
+# 28 and 210), and even an `inline` function cannot be defined twice
+# in the SAME translation unit -- the C++ standard's "inline" relaxation
+# only covers DIFFERENT translation units.  So we add our own guard.
 LIBPYSIDE_PATCH_SNIPPET = r'''
-%s
+
+// ============================================================
+// %s
+// ============================================================
 // Back-ported from PySide 1.2.4 -- required by newer shiboken
 // generators which emit `PySide::getWrapperForQObject(...)` calls
 // in the QObject CppToPython converter blocks.  M4rtinK's PySide
 // 1.1.x-era fork didn't include this helper.
+
+#ifndef LIBPYSIDE_BACKPORT_GETWRAPPERFORQOBJECT
+#define LIBPYSIDE_BACKPORT_GETWRAPPERFORQOBJECT
 
 #include <shiboken.h>
 
@@ -1447,6 +1468,8 @@ namespace PySide
         return pyOut;
     }
 }
+
+#endif // LIBPYSIDE_BACKPORT_GETWRAPPERFORQOBJECT
 ''' % LIBPYSIDE_PATCH_MARKER
 
 
@@ -1505,12 +1528,46 @@ def _patch_libpyside_source(build_scripts_dir, dry_run=False):
     def _as_bytes(s):
         if isinstance(s, bytes):
             return s                # Py2 str == bytes, no conversion
-        return s.encode('utf-8')    # Py3 str → bytes
+        return s.encode('utf-8')    # Py3 str -> bytes
 
-    # Idempotency: skip if marker already present
-    if _as_bytes(LIBPYSIDE_PATCH_MARKER) in content:
-        log.info('    skip pyside.h (already patched)')
+    # Idempotency + old-version cleanup.
+    #
+    # If the file already has THIS version's marker, leave alone.
+    # If it has any OLDER version's marker (e.g. v9 or v10), TRUNCATE
+    # the file at the start of the old patch block, then append the
+    # new one.  Without this, repeat runs would either skip (leaving
+    # the broken old patch in place) OR stack the new patch on top
+    # of the old one, which would multiply the double-definition
+    # error rather than fix it.
+    marker_bytes = _as_bytes(LIBPYSIDE_PATCH_MARKER)
+    if marker_bytes in content:
+        log.info('    skip pyside.h (already patched at current version)')
         return 0
+
+    old_marker_prefix = _as_bytes(LIBPYSIDE_PATCH_MARKER_PREFIX)
+    if old_marker_prefix in content:
+        # Find the position of the FIRST line containing the old marker
+        # and truncate everything from there onward.  We also strip any
+        # preceding blank lines for a clean append.
+        marker_pos = content.find(old_marker_prefix)
+        # Walk back to the start of the line containing the marker
+        line_start = content.rfind(b'\n', 0, marker_pos) + 1
+        # Also strip any preceding lines that look like our patch
+        # decorations (the `// ====` separator we put above the marker).
+        # We do a simple loop: while the previous line is a `// ====`
+        # divider or blank, eat it too.
+        cut = line_start
+        while cut > 0:
+            prev_end = cut - 1   # the \n we just crossed
+            prev_start = content.rfind(b'\n', 0, prev_end) + 1
+            prev_line = content[prev_start:prev_end].strip()
+            if prev_line == b'' or prev_line.startswith(b'// ====='):
+                cut = prev_start
+            else:
+                break
+        log.info('    stripping old patch block (saw %r at offset %d)',
+                 old_marker_prefix, marker_pos)
+        content = content[:cut]
 
     if dry_run:
         log.info('    [dry-run] would append %d bytes to %s',
@@ -1520,6 +1577,8 @@ def _patch_libpyside_source(build_scripts_dir, dry_run=False):
     # Append our patch block.  Going at the END of the file (after
     # the existing #endif) is safest -- we don't risk messing up
     # namespace nesting or include order in the original code.
+    # The snippet has its OWN include guard so multi-inclusion of
+    # pyside.h within one translation unit doesn't redefine the function.
     new_content = content + _as_bytes(LIBPYSIDE_PATCH_SNIPPET)
 
     try:
