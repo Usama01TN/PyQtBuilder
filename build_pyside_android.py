@@ -115,29 +115,27 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 9   # 2026-05: TWO fixes from the v8 run log:
+BUILDER_SCRIPT_VERSION = 10  # 2026-05: fix v9 crash in _patch_libpyside_source.
                              #
-                             # (1) Backport `PySide::getWrapperForQObject`
-                             #     into M4rtinK's libpyside/pyside.h.
-                             #     Shiboken's generated wrappers call this
-                             #     function but M4rtinK's 1.1.x-era fork
-                             #     doesn't declare it (added in PySide 1.2):
-                             #       qabstracteventdispatcher_wrapper.cpp:1476:
-                             #       error: 'getWrapperForQObject' is not
-                             #       a member of 'PySide'
-                             #     Implementation taken from PySide 1.2.4
-                             #     upstream — looks up an existing wrapper
-                             #     via BindingManager, or creates a new one.
+                             # v9 added a libpyside patcher whose snippet
+                             # contained one em-dash character (`—`, byte
+                             # E2 80 94 in UTF-8) in a C++ comment.  At
+                             # runtime under Python 2.7, the snippet was a
+                             # `str` (bytes), and calling .encode('utf-8')
+                             # on it triggered Python 2's implicit DECODE-
+                             # via-ASCII step first.  That fails on 0xE2
+                             # bytes:
                              #
-                             # (2) Fix UnicodeDecodeError in the v8 preflight
-                             #     logging.  Python 2.7's logging breaks when
-                             #     mixing UTF-8 byte-literal format strings
-                             #     (containing '✓' = E2 9C 93) with `unicode`
-                             #     arguments (from .decode()).  Solution:
-                             #     remove the unnecessary .decode() — bytes
-                             #     ARE str in Py2 and need no conversion.
-                             #     Also dropped the '✓' from the offending
-                             #     log line to make the fix robust.
+                             #   UnicodeDecodeError: 'ascii' codec can't
+                             #   decode byte 0xe2 in position 73:
+                             #   ordinal not in range(128)
+                             #
+                             # v10 fixes by (a) removing all non-ASCII
+                             # chars from the snippet, (b) replacing
+                             # `.encode('utf-8')` calls with a small
+                             # `_as_bytes()` helper that returns the
+                             # input unchanged if it's already bytes
+                             # (Py2 case) or encodes it otherwise (Py3).
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -1422,7 +1420,7 @@ LIBPYSIDE_PATCH_MARKER = '// LIBPYSIDE_PATCH_v9 -- DO NOT REMOVE'
 # a new wrapper through the standard Object::newObject path.
 LIBPYSIDE_PATCH_SNIPPET = r'''
 %s
-// Back-ported from PySide 1.2.4 — required by newer shiboken
+// Back-ported from PySide 1.2.4 -- required by newer shiboken
 // generators which emit `PySide::getWrapperForQObject(...)` calls
 // in the QObject CppToPython converter blocks.  M4rtinK's PySide
 // 1.1.x-era fork didn't include this helper.
@@ -1496,8 +1494,21 @@ def _patch_libpyside_source(build_scripts_dir, dry_run=False):
     with open(pyside_h, 'rb') as f:
         content = f.read()
 
+    # Helper: convert a string constant to bytes, safely under both
+    # Python 2 and 3.  The trick is that Python 2's str.encode('utf-8')
+    # actually does an IMPLICIT decode-via-ASCII FIRST (str -> unicode)
+    # before re-encoding, and breaks on any 0x80-0xFF byte.  In Python 2,
+    # str IS bytes, so we just return it as-is.  In Python 3, str is
+    # text, so encode it.  This way the snippet/marker stay defined as
+    # plain string literals (works in both py2 and py3 source) but the
+    # runtime conversion to bytes never tries an ASCII decode.
+    def _as_bytes(s):
+        if isinstance(s, bytes):
+            return s                # Py2 str == bytes, no conversion
+        return s.encode('utf-8')    # Py3 str → bytes
+
     # Idempotency: skip if marker already present
-    if LIBPYSIDE_PATCH_MARKER.encode('utf-8') in content:
+    if _as_bytes(LIBPYSIDE_PATCH_MARKER) in content:
         log.info('    skip pyside.h (already patched)')
         return 0
 
@@ -1507,9 +1518,9 @@ def _patch_libpyside_source(build_scripts_dir, dry_run=False):
         return 1
 
     # Append our patch block.  Going at the END of the file (after
-    # the existing #endif) is safest — we don't risk messing up
+    # the existing #endif) is safest -- we don't risk messing up
     # namespace nesting or include order in the original code.
-    new_content = content + LIBPYSIDE_PATCH_SNIPPET.encode('utf-8')
+    new_content = content + _as_bytes(LIBPYSIDE_PATCH_SNIPPET)
 
     try:
         with open(pyside_h, 'wb') as f:
