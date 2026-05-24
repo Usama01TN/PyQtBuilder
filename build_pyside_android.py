@@ -115,20 +115,29 @@ except ImportError:                          # graceful for syntax-checkers on p
 # canonical android-pyside-build-scripts repo.
 # ----------------------------------------------------------------------------
 
-BUILDER_SCRIPT_VERSION = 8   # 2026-05: fixed false-positive preflight check
-                             # that rejected legitimate PySide 1 main.py
-                             # files because the substring "PySide6" or
-                             # "PyQt5" appeared in a comment / docstring /
-                             # string literal.  Now uses regex matching
-                             # ACTUAL import statements only.
+BUILDER_SCRIPT_VERSION = 9   # 2026-05: TWO fixes from the v8 run log:
                              #
-                             # Also enriches the rejection message with the
-                             # offending line numbers + source text, so the
-                             # user can immediately see what's wrong.
+                             # (1) Backport `PySide::getWrapperForQObject`
+                             #     into M4rtinK's libpyside/pyside.h.
+                             #     Shiboken's generated wrappers call this
+                             #     function but M4rtinK's 1.1.x-era fork
+                             #     doesn't declare it (added in PySide 1.2):
+                             #       qabstracteventdispatcher_wrapper.cpp:1476:
+                             #       error: 'getWrapperForQObject' is not
+                             #       a member of 'PySide'
+                             #     Implementation taken from PySide 1.2.4
+                             #     upstream — looks up an existing wrapper
+                             #     via BindingManager, or creates a new one.
                              #
-                             # On the positive side: if PySide 1 IS being
-                             # imported, log the import line so the user
-                             # can confirm we detected the right thing.
+                             # (2) Fix UnicodeDecodeError in the v8 preflight
+                             #     logging.  Python 2.7's logging breaks when
+                             #     mixing UTF-8 byte-literal format strings
+                             #     (containing '✓' = E2 9C 93) with `unicode`
+                             #     arguments (from .decode()).  Solution:
+                             #     remove the unnecessary .decode() — bytes
+                             #     ARE str in Py2 and need no conversion.
+                             #     Also dropped the '✓' from the offending
+                             #     log line to make the fix robust.
 
 # Build-scripts repo — provides env.sh, build_shiboken.sh, build_pyside.sh,
 # fix_pyside_cmake_paths.sh, strip_binaries.sh, and a pre-built android_python/
@@ -498,14 +507,32 @@ def preflight(args):
     else:
         # Log the first PySide 1 import line so the user can confirm we
         # detected the right import.
+        #
+        # IMPORTANT: under Python 2.7 we must NOT mix `unicode` arguments
+        # with the byte-literal format string (which contains the UTF-8
+        # `✓` glyph as 3 raw bytes).  When logging gets unicode + bytes
+        # it tries to upcast the format string via ASCII codec and the
+        # 0xE2 in '✓' breaks with UnicodeDecodeError.
+        #
+        # Fix: keep `line_text` as bytes/str (no .decode()).  In Python 2,
+        # bytes IS str, so the %s substitution is bytes-to-bytes and
+        # everything stays consistent.  Under Python 3 (where bytes != str)
+        # we explicitly decode for the %s slot.
         m = pyside1_re.search(src)
         line_num = src[:m.start()].count(b'\n') + 1
         line_start = src.rfind(b'\n', 0, m.start()) + 1
         line_end = src.find(b'\n', m.start())
         if line_end == -1:
             line_end = len(src)
-        line_text = src[line_start:line_end].decode('utf-8', 'replace').rstrip()
-        log.info('  ✓ PySide 1 import found at line %d: %s', line_num, line_text)
+        line_text_bytes = src[line_start:line_end].rstrip()
+        # In Py3 bytes != str so we need to decode for the %s slot.
+        # In Py2 str == bytes and decoding to unicode breaks the format
+        # mix described above, so we stay as bytes.
+        if str is bytes:
+            line_text = line_text_bytes
+        else:
+            line_text = line_text_bytes.decode('utf-8', 'replace')
+        log.info('  PySide 1 import found at line %d: %s', line_num, line_text)
 
     # Host tools
     required_tools = ['cmake', 'git', 'ant', 'make', 'g++', 'tar', 'unzip']
@@ -1375,6 +1402,134 @@ def _patch_qt48_headers(qt_dir, dry_run=False):
 
 
 # ----------------------------------------------------------------------------
+# libpyside source patcher — adds functions missing in M4rtinK's 1.1-era fork
+# ----------------------------------------------------------------------------
+
+LIBPYSIDE_PATCH_MARKER = '// LIBPYSIDE_PATCH_v9 -- DO NOT REMOVE'
+
+# The chunk we inject into libpyside/pyside.h.  This is a back-port of
+# PySide 1.2's `getWrapperForQObject()` helper.  Shiboken's generator
+# emits calls to this function in the QObject CppToPython converters
+# it generates.  M4rtinK's pyside-android fork (PySide 1.1.x era) is
+# missing the function entirely, causing:
+#
+#     qabstracteventdispatcher_wrapper.cpp:1476:12: error:
+#     'getWrapperForQObject' is not a member of 'PySide'
+#
+# The implementation below mirrors the upstream PySide 1.2.4 source:
+# look up an existing Python wrapper for the QObject in Shiboken's
+# binding manager; if found return it (with incref); otherwise create
+# a new wrapper through the standard Object::newObject path.
+LIBPYSIDE_PATCH_SNIPPET = r'''
+%s
+// Back-ported from PySide 1.2.4 — required by newer shiboken
+// generators which emit `PySide::getWrapperForQObject(...)` calls
+// in the QObject CppToPython converter blocks.  M4rtinK's PySide
+// 1.1.x-era fork didn't include this helper.
+
+#include <shiboken.h>
+
+namespace PySide
+{
+    inline PyObject* getWrapperForQObject(QObject* cppSelf, SbkObjectType* sbk_type)
+    {
+        PyObject* pyOut = (PyObject*) Shiboken::BindingManager::instance().retrieveWrapper(cppSelf);
+        if (pyOut) {
+            Py_INCREF(pyOut);
+            return pyOut;
+        }
+        // Create a new Python wrapper for this QObject.  We pass
+        // hasOwnership=false because Qt owns the QObject's lifetime,
+        // and isExactType=false to allow shiboken's type-resolution
+        // machinery to find subclass wrappers if appropriate.
+        pyOut = Shiboken::Object::newObject(sbk_type,
+                                            cppSelf,
+                                            /* hasOwnership */ false,
+                                            /* isExactType  */ false);
+        return pyOut;
+    }
+}
+''' % LIBPYSIDE_PATCH_MARKER
+
+
+def _patch_libpyside_source(build_scripts_dir, dry_run=False):
+    """
+    Inject `PySide::getWrapperForQObject` into M4rtinK's libpyside/pyside.h.
+
+    Shiboken's generator (a 1.2-era shiboken) emits wrapper code that
+    references `PySide::getWrapperForQObject(QObject*, SbkObjectType*)`.
+    M4rtinK's pyside-android fork is based on PySide 1.1.x and doesn't
+    declare this function — every generated QObject wrapper fails to
+    compile with:
+
+        'getWrapperForQObject' is not a member of 'PySide'
+
+    We patch it in by appending the function (inside the PySide
+    namespace) to libpyside/pyside.h.  The append goes AFTER the
+    existing header's `#endif` guard so we don't disturb its include
+    structure; we add our own include for shiboken.h.
+
+    Idempotent — looks for LIBPYSIDE_PATCH_MARKER and skips if present.
+
+    Args:
+      build_scripts_dir : the dir containing pyside-android/ (cloned
+                          by prepare.sh in Step 2).
+      dry_run           : if True, log but don't write.
+
+    Returns:
+      int: 1 if patched, 0 if already-patched, raises SystemExit if
+      the expected file isn't present.
+    """
+    log.info('  patching M4rtinK libpyside for shiboken-generated calls')
+
+    pyside_h = os.path.join(build_scripts_dir, 'pyside-android',
+                            'libpyside', 'pyside.h')
+    if not os.path.isfile(pyside_h):
+        # Be tolerant: maybe the file moved or the user's tree is
+        # different.  Log a warning and continue — the compile will
+        # fail later with a clear error if the symbol's still missing.
+        log.warning('  ! libpyside/pyside.h not at expected path: %s', pyside_h)
+        log.warning('    (skipping libpyside patch; build may fail with')
+        log.warning('    "PySide::getWrapperForQObject is not a member")')
+        return 0
+
+    with open(pyside_h, 'rb') as f:
+        content = f.read()
+
+    # Idempotency: skip if marker already present
+    if LIBPYSIDE_PATCH_MARKER.encode('utf-8') in content:
+        log.info('    skip pyside.h (already patched)')
+        return 0
+
+    if dry_run:
+        log.info('    [dry-run] would append %d bytes to %s',
+                 len(LIBPYSIDE_PATCH_SNIPPET), pyside_h)
+        return 1
+
+    # Append our patch block.  Going at the END of the file (after
+    # the existing #endif) is safest — we don't risk messing up
+    # namespace nesting or include order in the original code.
+    new_content = content + LIBPYSIDE_PATCH_SNIPPET.encode('utf-8')
+
+    try:
+        with open(pyside_h, 'wb') as f:
+            f.write(new_content)
+    except (IOError, OSError) as e:
+        # Retry with chmod in case the file is read-only
+        try:
+            os.chmod(pyside_h, 0o644)
+            with open(pyside_h, 'wb') as f:
+                f.write(new_content)
+        except (IOError, OSError) as e2:
+            raise SystemExit(
+                '  X could not patch %s: %s (chmod retry: %s)'
+                % (pyside_h, e, e2))
+
+    log.info('    patched %s (added PySide::getWrapperForQObject)', pyside_h)
+    return 1
+
+
+# ----------------------------------------------------------------------------
 # Step 4 -- Cross-compile Shiboken + PySide
 # ----------------------------------------------------------------------------
 
@@ -1434,6 +1589,12 @@ def cross_compile(args):
 
     # (1) Patch Qt 4.8 headers — see docstring above.
     _patch_qt48_headers(args.sdk.qt_dir, dry_run=args.dry_run)
+
+    # (1b) Patch M4rtinK's pyside-android source to add missing functions
+    # that newer Shiboken generators reference.  Specifically:
+    # `PySide::getWrapperForQObject` — present in PySide 1.2.x, missing
+    # in M4rtinK's 1.1.x-era fork.  See _patch_libpyside_source docstring.
+    _patch_libpyside_source(bs, dry_run=args.dry_run)
 
     # (2) Wipe any stale build dirs from previous failed runs.  cmake
     # caches CXXFLAGS in CMakeCache.txt and will NOT pick up
