@@ -266,6 +266,25 @@ jobs:
           fi
           echo "PROJ_DIR=$(dirname "$MAIN_PY")" >> "$GITHUB_ENV"
 
+          # Show what we actually downloaded — makes any "the repo has
+          # a different file than I thought" case immediately visible.
+          echo "================================================================"
+          echo "  main.py content downloaded from: $PROJECT_URL"
+          echo "  Path: $MAIN_PY"
+          echo "  Size: $(stat -c %s "$MAIN_PY") bytes"
+          echo "  SHA256: $(sha256sum "$MAIN_PY" | awk '{print $1}')"
+          echo "================================================================"
+          cat -n "$MAIN_PY"
+          echo "================================================================"
+          echo "  Import-statement scan (regex, like the builder uses):"
+          echo "  All Python import lines:"
+          grep -nE "^\s*(from|import)\s+\w+" "$MAIN_PY" || echo "  (none found)"
+          echo "  Forbidden imports (PySide2/PySide6/PyQt5/PyQt6 as actual imports):"
+          grep -nE "^\s*(from|import)\s+(PySide[26]|PyQt[56])\b" "$MAIN_PY" \
+              && echo "  ::warning::Forbidden imports detected above; preflight will reject." \
+              || echo "  ✓ no forbidden imports"
+          echo "================================================================"
+
       # ════════ Cache builder workspace ════════
       - name: Cache builder workspace
         uses: actions/cache@v4
