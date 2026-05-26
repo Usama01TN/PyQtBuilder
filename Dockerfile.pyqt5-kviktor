@@ -147,6 +147,8 @@ RUN cd /tmp && \
     && cd / && rm -rf /tmp/Python-3.7.7 /tmp/Python-3.7.7.tgz \
     && ldconfig \
     && python3.7 --version \
+    && python3.7 -m pip --version \
+    && python3.7 -m pip install --no-cache-dir --upgrade 'pip==24.0' 'setuptools>=68,<70' 'wheel>=0.42' \
     && python3.7 -m pip --version
 
 # Pin JAVA_HOME to JDK 8 (kviktor's Gradle templates require it).
@@ -250,12 +252,23 @@ RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools \
 ENV QT_DIR=/root/Qt
 ENV PATH=${QT_DIR}/5.13.2/android_arm64_v8a/bin:${PATH}
 
-RUN python3.7 -m pip install --no-cache-dir 'aqtinstall>=3.1.0' && \
-    mkdir -p ${QT_DIR} && \
-    python3.7 -m aqt install-qt \
+# IMPORTANT: Python 3.7.7's bundled pip 19.2.3 has broken PEP 517
+# support and fails to build modern packages like pyzstd (a transitive
+# dep of aqtinstall) with:
+#
+#     pip._vendor.pep517.wrappers.BackendUnavailable
+#
+# That pip was already upgraded to 24.0 in the Python build step
+# above (the last pip release supporting Python 3.7).  Here we just
+# install aqtinstall and use it to fetch Qt.
+RUN set -ex \
+ && python3.7 -m pip --version \
+ && python3.7 -m pip install --no-cache-dir 'aqtinstall>=3.1.0' \
+ && mkdir -p ${QT_DIR} \
+ && python3.7 -m aqt install-qt \
         linux android 5.13.2 android_arm64_v8a \
         -O ${QT_DIR} \
-    && ls ${QT_DIR}/5.13.2/android_arm64_v8a/bin/qmake > /dev/null
+ && ls ${QT_DIR}/5.13.2/android_arm64_v8a/bin/qmake > /dev/null
 
 # ---------------------------------------------------------------- pyqtdeploy 2.5.1
 # We install in a venv at /root/build-venv to mirror what kviktor's script does.
@@ -272,14 +285,25 @@ RUN python3.7 -m pip install --no-cache-dir 'aqtinstall>=3.1.0' && \
 #   setuptools<60      -- newer setuptools removes APIs that pyqtdeploy 2.5.1
 #                         still uses (e.g. easy_install).
 #   wheel              -- for source distributions that build with PEP 517.
+#
+# The venv inherits the same broken pip 19.2.3 as the parent Python 3.7.
+# We upgrade it inside the venv before installing pyqtdeploy.  We use a
+# slightly different setuptools constraint than the aqtinstall step
+# (here: <60 because pyqtdeploy 2.5.1 internally calls APIs that
+# setuptools 60+ removed; the aqtinstall step needed newer setuptools
+# for modern PEP 517 builds).
 ENV BUILD_VENV=/root/build-venv
-RUN python3.7 -m venv ${BUILD_VENV} && \
-    ${BUILD_VENV}/bin/pip install --no-cache-dir \
+RUN set -ex \
+ && python3.7 -m venv ${BUILD_VENV} \
+ && ${BUILD_VENV}/bin/pip install --no-cache-dir --upgrade 'pip==24.0' \
+ && ${BUILD_VENV}/bin/pip --version \
+ && ${BUILD_VENV}/bin/pip install --no-cache-dir \
         'pyqtdeploy==2.5.1' \
         'cmake' \
         'setuptools<60' \
         'wheel' \
-    && ${BUILD_VENV}/bin/python -c "import cmake; print('cmake pkg OK:', cmake.CMAKE_BIN_DIR)"
+ && ${BUILD_VENV}/bin/python -c "import cmake; print('cmake pkg OK:', cmake.CMAKE_BIN_DIR)" \
+ && ${BUILD_VENV}/bin/python -c "import pyqtdeploy; print('pyqtdeploy OK:', pyqtdeploy.__version__)"
 
 # ---------------------------------------------------------------- final sanity checks
 # Make all the version info easy to inspect by running the image:
