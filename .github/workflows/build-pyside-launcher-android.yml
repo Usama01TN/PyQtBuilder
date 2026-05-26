@@ -1,0 +1,182 @@
+name: build-pyside-launcher-android
+
+# PySide 1 / Python 2.6 -> Android APK — launcher edition.
+#
+# This workflow uses the PREBUILT PySide-for-Android artifacts:
+#
+#   * PySideLauncher-debug.apk  (the generic PySide loader APK)
+#   * data_python.tgz           (Python 2.6 runtime + PySide bindings, ARM)
+#   * data_data_eu.licentia.necessitas.ministro_files_qt.tgz  (Qt 4 libs, ARM)
+#
+# The builder injects your project's main.py + supporting Python files
+# into the launcher APK as `assets/python_project.zip`, then re-signs.
+# No cross-compile, no Necessitas SDK, no NDK — typically 2-5 minutes
+# end-to-end, vs. 60-90 minutes for the from-source pipeline.
+#
+# Trigger this workflow manually with the inputs below.  The APK is
+# uploaded as an artifact named `apk-pyside-launcher`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: "Public URL to a zip of your PySide/Qt4 project (must contain main.py)."
+        required: true
+        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt4.zip"
+      app_name:
+        description: "App display name (shown under icon on device)."
+        required: false
+        default: "PySide App"
+      unique_name:
+        description: "Android package id (e.g. com.example.myapp).  Empty = keep launcher default (only ONE such app can be installed at a time)."
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    env:
+      PROJECT_URL: ${{ github.event.inputs.project_url }}
+      APP_NAME:    ${{ github.event.inputs.app_name }}
+      UNIQUE_NAME: ${{ github.event.inputs.unique_name }}
+
+    steps:
+      - name: Checkout repo (for build_pyside_launcher_android.py)
+        uses: actions/checkout@v4
+
+      - name: Verify builder file is in repo
+        run: |
+          if [ ! -f build_pyside_launcher_android.py ]; then
+            echo "::error::build_pyside_launcher_android.py missing from repo root."
+            echo "::error::Place it next to your workflow YAML and commit."
+            exit 1
+          fi
+          BUILDER_HASH=$(sha256sum build_pyside_launcher_android.py | awk '{print $1}')
+          echo "Builder script SHA256: $BUILDER_HASH"
+          echo "BUILDER_HASH=$BUILDER_HASH" >> "$GITHUB_ENV"
+
+      - name: Setup JDK 17 (apktool + jarsigner + keytool)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install zipalign + apksigner (Android SDK build-tools)
+        run: |
+          # The ubuntu-22.04 runner has Android SDK preinstalled at
+          # /usr/local/lib/android/sdk.  Just expose its tools on PATH.
+          if [ -d /usr/local/lib/android/sdk/build-tools ]; then
+            LATEST_BT=$(ls -1 /usr/local/lib/android/sdk/build-tools | sort -V | tail -1)
+            echo "/usr/local/lib/android/sdk/build-tools/$LATEST_BT" >> "$GITHUB_PATH"
+            echo "Using Android build-tools: $LATEST_BT"
+          else
+            echo "::warning::Android SDK build-tools not found; jarsigner fallback will be used"
+          fi
+
+      - name: Verify host tools
+        run: |
+          echo "=== java ==="
+          java -version 2>&1
+          echo
+          echo "=== keytool ==="
+          which keytool && keytool -help 2>&1 | head -1 || echo "MISSING"
+          echo
+          echo "=== apksigner ==="
+          which apksigner && apksigner --version 2>&1 | head -1 || echo "missing (jarsigner fallback OK)"
+          echo
+          echo "=== jarsigner ==="
+          which jarsigner && jarsigner 2>&1 | head -1 || echo "MISSING"
+          echo
+          echo "=== zipalign ==="
+          which zipalign && zipalign 2>&1 | head -1 || echo "missing (will skip)"
+          echo
+          echo "=== curl ==="
+          curl --version 2>&1 | head -1
+          echo
+          echo "=== python3 ==="
+          python3 --version
+
+      - name: Cache downloaded artifacts (apktool + tarballs + launcher APK)
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/pyside-launcher-cache
+          key: pyside-launcher-${{ env.BUILDER_HASH }}-v1
+          restore-keys: |
+            pyside-launcher-
+
+      - name: Download user project
+        run: |
+          mkdir -p workspace
+          curl -L --fail --retry 3 "$PROJECT_URL" -o project.zip
+          echo "Downloaded $(stat -c %s project.zip) bytes"
+          unzip -q -o project.zip -d workspace
+
+          # Find main.py (1 level deep search — projects are usually
+          # extracted into a single top-level dir).
+          MAIN_PY=$(find workspace -maxdepth 4 -name main.py -type f | head -1)
+          if [ -z "$MAIN_PY" ]; then
+            echo "::error::No main.py found in project zip"
+            exit 1
+          fi
+          PROJ_DIR=$(dirname "$MAIN_PY")
+          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
+
+          echo "================================================================"
+          echo "  Project content (downloaded from: $PROJECT_URL)"
+          echo "  main.py    : $MAIN_PY  ($(stat -c %s "$MAIN_PY") bytes)"
+          echo "  proj dir   : $PROJ_DIR"
+          echo "  total files: $(find "$PROJ_DIR" -type f | wc -l)"
+          echo "================================================================"
+          cat -n "$MAIN_PY"
+          echo "================================================================"
+
+      - name: Run builder
+        id: build
+        run: |
+          set -o pipefail
+          mkdir -p /home/runner/pyside-launcher-cache
+
+          # Build the args list.  --unique-name and --app-name are
+          # optional (passed only if non-empty).
+          ARGS=(
+              --project-dir "$PROJ_DIR"
+              --output-path "./output.apk"
+              --workspace   "/home/runner/pyside-launcher-cache"
+              --verbose
+          )
+          if [ -n "$APP_NAME" ];    then ARGS+=( --app-name    "$APP_NAME"    ); fi
+          if [ -n "$UNIQUE_NAME" ]; then ARGS+=( --unique-name "$UNIQUE_NAME" ); fi
+
+          python3 build_pyside_launcher_android.py "${ARGS[@]}" \
+              2>&1 | tee build.log
+
+      - name: Verify APK output
+        if: success()
+        run: |
+          if [ ! -f ./output.apk ]; then
+            echo "::error::Builder reported success but ./output.apk is missing"
+            exit 1
+          fi
+          ls -lh ./output.apk
+          file ./output.apk
+          # Quick sanity-check: APK should be a valid zip with AndroidManifest.xml
+          unzip -l ./output.apk | grep -E "AndroidManifest.xml|assets/python_project.zip|META-INF" | head
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-pyside-launcher
+          path: ./output.apk
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
