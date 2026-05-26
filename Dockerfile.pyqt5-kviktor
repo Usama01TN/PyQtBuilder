@@ -35,67 +35,83 @@ ENV LC_ALL=C.UTF-8
 # dependencies (libffi-dev, libreadline-dev, etc.) so we can compile
 # CPython 3.7.7 from source in the next layer.  Python 3.7.7 from source
 # is the canonical approach the kviktor guide takes; we don't use a PPA.
-# Pre-create directories that openjdk post-install scripts expect but
-# which Ubuntu base images strip for size.  Without these:
+# Pre-create /usr/share/man/man1 (openjdk-8-jdk's post-install needs it).
+# We no longer need /usr/share/binfmts because we don't install
+# openjdk-11-jre-headless via apt -- see Temurin JDK 11 step below.
 #
-#   * /usr/share/binfmts/ missing  ->  openjdk-11-jre-headless fails:
-#       update-alternatives: error: error creating symbolic link
-#       '/usr/share/binfmts/jar.dpkg-tmp': No such file or directory
-#       dpkg: error processing package openjdk-11-jre-headless
-#
-#   * /usr/share/man/man1/ missing ->  openjdk-8-jdk fails similarly
-#       on its man-page installation step.
-#
-# These are well-known Debian/Ubuntu bugs that have been "won't fix"
-# for years because the workaround is trivial.
-#
-# IMPORTANT: the mkdir runs IN THE SAME RUN INSTRUCTION as the apt
-# install.  Putting it in a separate RUN was unreliable -- BuildKit's
-# layer cache and GHA cache-from can together end up reusing a cached
-# apt-install layer that pre-dates the mkdir layer, recreating the
-# original bug.  Same-RUN guarantees no stale cache reuse.
-#
-# Also installs binfmt-support explicitly: this package owns
-# /usr/share/binfmts/ and provides update-binfmts.  Having it
-# installed BEFORE openjdk-11-jre-headless's post-install would
-# work too, but apt orders installs by dependency graph and we
-# can't easily force order.  The mkdir is the reliable fix.
+# All deps in ONE RUN to avoid any layer-cache ambiguity.
 RUN set -ex \
- && mkdir -p /usr/share/man/man1 /usr/share/binfmts \
- && ls -ld /usr/share/man/man1 /usr/share/binfmts \
+ && mkdir -p /usr/share/man/man1 \
  && apt-get update -y \
  && apt-get install -y --no-install-recommends \
-        binfmt-support \
         ca-certificates curl wget unzip zip git \
         build-essential clang make cmake ninja-build pkg-config \
         zlib1g zlib1g-dev libbz2-dev libssl-dev libffi-dev libreadline-dev \
         libsqlite3-dev libgdbm-dev libncurses5-dev libnss3-dev tk-dev \
         liblzma-dev uuid-dev \
         openjdk-8-jdk \
-        openjdk-11-jre-headless \
         xvfb \
         file \
- && dpkg --configure -a \
  && rm -rf /var/lib/apt/lists/* \
- && test -d /usr/lib/jvm/java-8-openjdk-amd64 \
- && test -d /usr/lib/jvm/java-11-openjdk-amd64
+ && test -d /usr/lib/jvm/java-8-openjdk-amd64
+
+# ---------------------------------------------------------------- JDK 11 (Temurin tarball)
+#
+# WHY NOT openjdk-11-jre-headless from apt?
+# -----------------------------------------
+# We tried installing openjdk-11-jre-headless via apt-get install.
+# Despite multiple workarounds (mkdir /usr/share/binfmts, installing
+# binfmt-support first, dpkg --configure -a recovery, combining
+# everything into one RUN), the Debian post-install hook for
+# openjdk-11-jre-headless on Ubuntu 20.04 base images consistently
+# fails with:
+#
+#     update-alternatives: error: error creating symbolic link
+#     '/usr/share/binfmts/jar.dpkg-tmp': No such file or directory
+#
+# The root cause is a race in dpkg's package-ordering: openjdk-11's
+# post-install runs BEFORE binfmt-support's post-install (even when
+# both are listed in the same apt install), so when openjdk-11 calls
+# update-alternatives for the .jar binfmt, the directory exists only
+# as the empty placeholder we mkdir'd, not the fully-initialized
+# directory that binfmt-support would have set up.
+#
+# Adoptium Temurin JDK 11 distributes Java as a plain tarball.  No
+# dpkg, no post-install hooks, no binfmt registration -- just extract
+# and use.  We only need a JRE (smaller download), not a full JDK.
+# Sdkmanager uses Java to launch, no compilation needed.
+#
+# Pinned to Temurin 11.0.21+9 (LTS, released Oct 2023).  Stable and
+# widely tested.  Distribution: tarball at
+#   https://github.com/adoptium/temurin11-binaries/releases/
+ENV JDK11_HOME=/opt/jdk-11
+RUN set -ex \
+ && mkdir -p /opt \
+ && cd /opt \
+ && curl -L --fail --retry 5 --retry-delay 5 \
+        -o jdk11.tar.gz \
+        "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.21%2B9/OpenJDK11U-jre_x64_linux_hotspot_11.0.21_9.tar.gz" \
+ && tar xzf jdk11.tar.gz \
+ && rm jdk11.tar.gz \
+ && mv jdk-11.* "${JDK11_HOME}" \
+ && "${JDK11_HOME}/bin/java" -version 2>&1 | head -3 \
+ && "${JDK11_HOME}/bin/java" -version 2>&1 | grep -qE '"11\.' \
+ && echo "Temurin JDK 11 installed at ${JDK11_HOME}"
 
 # About the TWO JDKs:
 #
-#   JDK 8  is the build-time/run-time Java for the kviktor pipeline.
+#   JDK 8  is the build-time/run-time Java for the kviktor pipeline,
+#          installed via apt-get install openjdk-8-jdk above.
 #          kviktor pinned Android Gradle Plugin + build-tools 28.0.3
 #          which only work with JDK 8.  This is the DEFAULT (JAVA_HOME
 #          set later).
 #
-#   JDK 11 is only used to invoke sdkmanager during this Dockerfile.
-#          Modern Android command-line tools (build 9477386, mid-2023+)
-#          require JDK 11+ to run, producing this error otherwise:
-#              Error: A JNI error has occurred
-#              ... sun.launcher.LauncherHelper.validateMainClass ...
-#          Once sdkmanager has installed the platforms/build-tools, we
-#          never need JDK 11 again at runtime.  We could uninstall it
-#          to save ~250 MB but keep it for safety (e.g. if a user wants
-#          to install additional SDK packages later).
+#   JDK 11 (Temurin) was installed from a tarball above (NOT via apt)
+#          because the apt openjdk-11-jre-headless package has a
+#          chronic post-install hook failure on minimal Ubuntu base
+#          images.  Used ONLY to invoke sdkmanager during this
+#          Dockerfile (the modern cmdline-tools binary requires JDK
+#          11+ bytecode support).  Lives at ${JDK11_HOME}=/opt/jdk-11.
 
 # ---------------------------------------------------------------- Python 3.7.7 from source
 #
@@ -148,17 +164,17 @@ RUN echo "=== JDK 8 check (default JAVA_HOME) ===" \
  && /usr/lib/jvm/java-8-openjdk-amd64/bin/java -version 2>&1 | head -1 \
  && (/usr/lib/jvm/java-8-openjdk-amd64/bin/java -version 2>&1 | grep -q '1.8' \
         || (echo "FATAL: JDK 8 binary is not 1.8"; exit 1)) \
- && echo "=== JDK 11 check (for sdkmanager only) ===" \
- && test -d /usr/lib/jvm/java-11-openjdk-amd64 \
-        || (echo "FATAL: JDK 11 dir missing"; exit 1) \
- && /usr/lib/jvm/java-11-openjdk-amd64/bin/java -version 2>&1 | head -1 \
- && (/usr/lib/jvm/java-11-openjdk-amd64/bin/java -version 2>&1 | grep -qE '"(11|17)' \
+ && echo "=== JDK 11 check (Temurin, for sdkmanager only) ===" \
+ && test -d "${JDK11_HOME}" \
+        || (echo "FATAL: JDK 11 dir missing at ${JDK11_HOME}"; exit 1) \
+ && "${JDK11_HOME}/bin/java" -version 2>&1 | head -1 \
+ && ("${JDK11_HOME}/bin/java" -version 2>&1 | grep -qE '"11\.' \
         || (echo "FATAL: JDK 11 binary is not version 11"; exit 1)) \
  && echo "=== PATH-resolved java ===" \
  && java -version 2>&1 | head -1 \
  && (java -version 2>&1 | grep -q '1.8' \
         || (echo "FATAL: default 'java' is not JDK 8 -- JAVA_HOME not set correctly"; exit 1)) \
- && echo "OK: JDK 8 default, JDK 11 available at /usr/lib/jvm/java-11-openjdk-amd64"
+ && echo "OK: JDK 8 (apt) default + Temurin JDK 11 available at ${JDK11_HOME}"
 
 # ---------------------------------------------------------------- Android NDK r20b
 # r20b is the LAST NDK with GCC.  r21+ ships only Clang, which breaks
@@ -192,13 +208,13 @@ ENV ANDROID_SDK_ROOT=/root/Android/tools
 ENV ANDROID_HOME=${ANDROID_SDK_ROOT}
 ENV PATH=${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}
 
-# Hardcode JDK 11's install path (Ubuntu 20.04 amd64 installs to this
-# exact directory).  Used only for sdkmanager invocations below.
-ENV JDK11_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+# JDK11_HOME was already set to /opt/jdk-11 (Temurin) much earlier.
+# We reuse it here for sdkmanager invocations -- no override needed.
 
 # Download cmdline-tools, install platform-tools + platforms;android-28 +
-# build-tools 28.0.3.  Uses JDK 11 for sdkmanager (required by
-# commandlinetools-linux-9477386) but never affects the default JDK 8.
+# build-tools 28.0.3.  Uses JDK 11 (Temurin at ${JDK11_HOME}) for
+# sdkmanager (required by commandlinetools-linux-9477386 which is Java 11
+# bytecode), but never affects the default JDK 8 that kviktor uses.
 RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools \
  && cd ${ANDROID_SDK_ROOT}/cmdline-tools \
  && curl -L --fail --retry 5 --retry-delay 5 \
