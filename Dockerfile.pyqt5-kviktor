@@ -1,0 +1,166 @@
+# Dockerfile.pyqt5-kviktor
+#
+# Build environment for pyqt5_android_kviktor.py
+# (https://github.com/kviktor/pyqtdeploy-android-build)
+#
+# Exact versions the KViktor guide specifies:
+#   Ubuntu       20.04 LTS  (the image base)
+#   Python       3.7        (for pyqtdeploy 2.5.1; target Python is 3.7.7 built from source)
+#   Qt           5.13.2     (Android arm64-v8a component)
+#   NDK          r20b       (the LAST NDK with GCC; r21+ is clang-only)
+#   Android SDK  API 28     (build-tools 28.0.3 + platforms;android-28)
+#   JDK          OpenJDK 8  (kviktor's Gradle templates require Java 8)
+#
+# This image is intentionally heavy (~5-6 GB) because it preinstalls
+# every dependency the build needs.  After it's cached by GHA's Docker
+# layer cache, subsequent workflow runs reuse the image in seconds.
+#
+# Layout the kviktor script expects:
+#   /root/Qt/5.13.2/android_arm64_v8a/bin/qmake
+#   /root/Android/android-ndk-r20b/
+#   /root/Android/tools/                (Android SDK root with cmdline-tools)
+
+FROM ubuntu:20.04
+
+# Avoid interactive tzdata / apt prompts during image build
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# ---------------------------------------------------------------- system deps
+# kviktor README specifies:
+#   sudo apt-get install clang make zlib1g zlib1g-dev libbz2-dev libssl-dev openjdk-8-jdk build-essential git
+# We add: curl, wget, unzip, zip, ca-certificates, software-properties-common
+# (for deadsnakes PPA), Python 3.7 from deadsnakes, and a few build helpers.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget unzip zip git \
+        software-properties-common gnupg \
+        build-essential clang make cmake ninja-build pkg-config \
+        zlib1g zlib1g-dev libbz2-dev libssl-dev libffi-dev libreadline-dev \
+        libsqlite3-dev libgdbm-dev libncurses5-dev libnss3-dev tk-dev \
+        liblzma-dev uuid-dev \
+        openjdk-8-jdk \
+        xvfb \
+        file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 3.7 from deadsnakes PPA (Ubuntu 20.04 ships 3.8 by default;
+# pyqtdeploy 2.5.1 needs 3.7).
+RUN add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        python3.7 python3.7-dev python3.7-venv python3.7-distutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin JAVA_HOME to JDK 8 (kviktor's Gradle templates require it)
+ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+ENV PATH=${JAVA_HOME}/bin:${PATH}
+
+# Sanity-check Java version
+RUN java -version 2>&1 | head -1 && \
+    [ "$(java -version 2>&1 | grep -c '1.8')" -gt 0 ] || \
+        (echo "ERROR: Java is not 1.8" && exit 1)
+
+# Quick get-pip for python3.7 (its distutils doesn't ship ensurepip by default
+# on deadsnakes)
+RUN curl -sS https://bootstrap.pypa.io/pip/3.7/get-pip.py -o /tmp/get-pip.py && \
+    python3.7 /tmp/get-pip.py && \
+    rm /tmp/get-pip.py && \
+    python3.7 -m pip --version
+
+# ---------------------------------------------------------------- Android NDK r20b
+# r20b is the LAST NDK with GCC.  r21+ ships only Clang, which breaks
+# the KViktor pipeline's qmake mkspec for android-clang vs android-g++.
+ENV ANDROID_NDK_ROOT=/root/Android/android-ndk-r20b
+ENV ANDROID_NDK=${ANDROID_NDK_ROOT}
+RUN mkdir -p /root/Android && cd /root/Android && \
+    curl -L --fail --retry 5 --retry-delay 5 \
+        -o ndk.zip \
+        "https://dl.google.com/android/repository/android-ndk-r20b-linux-x86_64.zip" && \
+    unzip -q ndk.zip && \
+    rm ndk.zip && \
+    ls -d /root/Android/android-ndk-r20b > /dev/null
+
+# ---------------------------------------------------------------- Android SDK
+# We install: platform-tools, build-tools 28.0.3, platforms;android-28.
+# kviktor uses these specific versions.
+ENV ANDROID_SDK_ROOT=/root/Android/tools
+ENV ANDROID_HOME=${ANDROID_SDK_ROOT}
+ENV PATH=${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}
+
+RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools && cd ${ANDROID_SDK_ROOT}/cmdline-tools && \
+    curl -L --fail --retry 5 --retry-delay 5 \
+        -o cmdline-tools.zip \
+        "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" && \
+    unzip -q cmdline-tools.zip && \
+    rm cmdline-tools.zip && \
+    mv cmdline-tools latest && \
+    yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null 2>&1 || true && \
+    ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager \
+        "platform-tools" \
+        "platforms;android-28" \
+        "build-tools;28.0.3" \
+        >/dev/null && \
+    ls ${ANDROID_SDK_ROOT}/platforms/android-28 > /dev/null
+
+# ---------------------------------------------------------------- Qt 5.13.2 Android arm64
+# Qt 5.13.2 binaries for Android arm64-v8a, installed via `aqtinstall`
+# (a community tool that fetches official Qt installer payloads from
+# download.qt.io without needing a Qt account login).
+#
+# Result layout (kviktor script expects exactly this):
+#   /root/Qt/5.13.2/android_arm64_v8a/bin/qmake
+#   /root/Qt/5.13.2/android_arm64_v8a/bin/androiddeployqt
+#   /root/Qt/5.13.2/android_arm64_v8a/lib/...
+ENV QT_DIR=/root/Qt
+ENV PATH=${QT_DIR}/5.13.2/android_arm64_v8a/bin:${PATH}
+
+RUN python3.7 -m pip install --no-cache-dir 'aqtinstall>=3.1.0' && \
+    mkdir -p ${QT_DIR} && \
+    python3.7 -m aqt install-qt \
+        linux android 5.13.2 android_arm64_v8a \
+        -O ${QT_DIR} \
+    && ls ${QT_DIR}/5.13.2/android_arm64_v8a/bin/qmake > /dev/null
+
+# ---------------------------------------------------------------- pyqtdeploy 2.5.1
+# We install in a venv at /root/build-venv to mirror what kviktor's script does.
+# The kviktor script itself can re-create this venv if missing; we just pre-warm
+# it so the first build is fast.
+#
+# Required pip packages (verified by importing pyqt5_android_kviktor.py with
+# build_utils.py + builders.py and observing the import errors):
+#
+#   pyqtdeploy 2.5.1   -- the actual build orchestrator (kviktor pinned 2.5.1).
+#   cmake              -- the PIP package (not the system tool!) imported
+#                         by builders.py as `from cmake import CMAKE_BIN_DIR`.
+#                         Confusingly shares its name with the system binary.
+#   setuptools<60      -- newer setuptools removes APIs that pyqtdeploy 2.5.1
+#                         still uses (e.g. easy_install).
+#   wheel              -- for source distributions that build with PEP 517.
+ENV BUILD_VENV=/root/build-venv
+RUN python3.7 -m venv ${BUILD_VENV} && \
+    ${BUILD_VENV}/bin/pip install --no-cache-dir \
+        'pyqtdeploy==2.5.1' \
+        'cmake' \
+        'setuptools<60' \
+        'wheel' \
+    && ${BUILD_VENV}/bin/python -c "import cmake; print('cmake pkg OK:', cmake.CMAKE_BIN_DIR)"
+
+# ---------------------------------------------------------------- final sanity checks
+# Make all the version info easy to inspect by running the image:
+#   docker run --rm pyqt5-kviktor-builder
+WORKDIR /work
+CMD ["bash", "-c", "\
+    echo '=== PyQt5 KViktor build environment ==='; \
+    echo 'Host  :' $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY); \
+    echo 'Java  :' $(java -version 2>&1 | head -1); \
+    echo 'Python:' $(python3.7 --version); \
+    echo 'Clang :' $(clang --version | head -1); \
+    echo 'qmake :' $(qmake --version 2>&1 | head -1); \
+    echo 'NDK   :' $(ls $ANDROID_NDK_ROOT | head -1) 'at' $ANDROID_NDK_ROOT; \
+    echo 'SDK   :' $(ls $ANDROID_SDK_ROOT/platforms 2>/dev/null) 'at' $ANDROID_SDK_ROOT; \
+    echo 'pyqtdeploy:' $($BUILD_VENV/bin/python -m pyqtdeploy --version 2>&1 | head -1); \
+    echo '======================================='; \
+    "]
