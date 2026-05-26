@@ -95,6 +95,22 @@ jobs:
       - name: Set up Docker Buildx (for GHA layer cache)
         uses: docker/setup-buildx-action@v3
 
+      - name: Compute Dockerfile hash (cache invalidation key)
+        id: dockerhash
+        run: |
+          HASH=$(sha256sum Dockerfile.pyqt5-kviktor | awk '{print substr($1, 1, 12)}')
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "================================================================"
+          echo "  Dockerfile.pyqt5-kviktor SHA256 (first 12): $HASH"
+          echo "  GHA cache key: pyqt5-kviktor-img-$HASH-v2"
+          echo "  This prevents using a cached image from a previous"
+          echo "  (broken) version of the Dockerfile."
+          echo "================================================================"
+          # Print the relevant lines for sanity
+          echo "  apt install block (first 20 lines):"
+          grep -nB0 -A20 "^RUN set -ex" Dockerfile.pyqt5-kviktor | head -25 || true
+          echo "================================================================"
+
       - name: Build pyqt5-kviktor-builder Docker image
         uses: docker/build-push-action@v5
         with:
@@ -102,8 +118,11 @@ jobs:
           file: ./Dockerfile.pyqt5-kviktor
           tags: pyqt5-kviktor-builder:latest
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The cache key includes the Dockerfile hash so any change
+          # to the file forces a fresh build.  This prevents BuildKit
+          # from reusing a layer cached from a previous broken version.
+          cache-from: type=gha,scope=pyqt5-kviktor-${{ steps.dockerhash.outputs.hash }}-v2
+          cache-to:   type=gha,mode=max,scope=pyqt5-kviktor-${{ steps.dockerhash.outputs.hash }}-v2
 
       - name: Show Docker image contents
         run: docker run --rm pyqt5-kviktor-builder
