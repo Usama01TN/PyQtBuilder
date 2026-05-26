@@ -1,0 +1,235 @@
+name: build-pyqt5-kviktor-android
+
+# PyQt5 5.15.1 / Python 3.7.7 / Qt 5.13.2 -> Android APK builder.
+#
+# Wraps the pyqt5_android_kviktor.py orchestrator from
+# https://github.com/kviktor/pyqtdeploy-android-build inside an
+# Ubuntu 20.04 Docker container that has the EXACT preinstalled
+# toolchain the kviktor guide specifies:
+#
+#     Qt 5.13.2 Android arm64-v8a   (via aqtinstall)
+#     Android NDK r20b
+#     Android SDK API 28 + build-tools 28.0.3
+#     OpenJDK 8
+#     Python 3.7  (from deadsnakes PPA)
+#     pyqtdeploy 2.5.1
+#
+# The Docker image is heavy (~5-6 GB once built) but cached aggressively
+# via GHA's Docker layer cache.  First run: ~25-30 min.  Subsequent
+# runs: ~5-8 min (image cached, source tarballs cached, only the actual
+# build runs).
+#
+# Total APK output: ~30-40 MB for a hello-world PyQt5 app.
+#
+# Inputs:
+#   project_url     Public URL to a zip containing main.py at root
+#   app_name        Application display name
+#   package_name    Android package id (com.example.X format)
+#   install_apk     Set true to run `adb install` (needs adb USB device,
+#                   so really only useful for self-hosted runners)
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: "Public URL to PyQt5 project zip (must contain main.py at root)."
+        required: true
+        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip"
+      app_name:
+        description: "App display name."
+        required: false
+        default: "TestApp"
+      package_name:
+        description: "Android package id."
+        required: false
+        default: "com.example.testapp"
+      jobs:
+        description: "Parallel make jobs (kviktor default: 2)."
+        required: false
+        default: "2"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    env:
+      PROJECT_URL:  ${{ github.event.inputs.project_url }}
+      APP_NAME:     ${{ github.event.inputs.app_name }}
+      PACKAGE_NAME: ${{ github.event.inputs.package_name }}
+      JOBS:         ${{ github.event.inputs.jobs }}
+
+    steps:
+      - name: Checkout repo (for builder script + Dockerfile)
+        uses: actions/checkout@v4
+
+      - name: Verify required files are in repo
+        run: |
+          MISSING=0
+          for f in pyqt5_android_kviktor.py build_utils.py builders.py Dockerfile.pyqt5-kviktor; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f missing from repo root."
+              MISSING=$((MISSING+1))
+            fi
+          done
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error::Place the listed files at the repo root (next to your workflow YAML) and commit."
+            exit 1
+          fi
+          echo "Builder file checksums (for log traceability):"
+          sha256sum pyqt5_android_kviktor.py build_utils.py builders.py Dockerfile.pyqt5-kviktor
+
+      - name: Free disk space (Docker image + Qt + NDK need ~15 GB)
+        run: |
+          echo "BEFORE:"; df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      /usr/local/lib/android/sdk \
+                      /opt/hostedtoolcache/CodeQL \
+                      "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get -y purge --auto-remove \
+              azure-cli google-cloud-cli microsoft-edge-stable \
+              google-chrome-stable firefox powershell 2>/dev/null || true
+          docker system prune -af 2>/dev/null || true
+          echo "AFTER:"; df -h /
+
+      - name: Set up Docker Buildx (for GHA layer cache)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build pyqt5-kviktor-builder Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.pyqt5-kviktor
+          tags: pyqt5-kviktor-builder:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Show Docker image contents
+        run: docker run --rm pyqt5-kviktor-builder
+
+      - name: Cache build artifacts (source tarballs, sysroot, build dirs)
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/kviktor-cache
+          key: pyqt5-kviktor-${{ hashFiles('pyqt5_android_kviktor.py') }}-v1
+          restore-keys: |
+            pyqt5-kviktor-
+
+      - name: Download user project
+        run: |
+          mkdir -p workspace
+          curl -L --fail --retry 3 "$PROJECT_URL" -o project.zip
+          unzip -q -o project.zip -d workspace
+          MAIN_PY=$(find workspace -maxdepth 4 -name main.py -type f | head -1)
+          if [ -z "$MAIN_PY" ]; then
+            echo "::error::No main.py found in project zip"
+            exit 1
+          fi
+          PROJ_DIR=$(dirname "$MAIN_PY")
+          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
+
+          # Print the main.py so we can verify it's actually a PyQt5 app
+          echo "================================================================"
+          echo "  main.py at $MAIN_PY"
+          echo "  ($(stat -c %s "$MAIN_PY") bytes)"
+          echo "================================================================"
+          cat -n "$MAIN_PY"
+          echo "================================================================"
+          echo "  Import scan:"
+          grep -nE "^\s*(from|import)\s+(PyQt5|PySide|PyQt6|PySide2|PySide6)\b" "$MAIN_PY" || \
+              echo "  (no Qt-binding imports found — this app may not be a Qt app)"
+          echo "================================================================"
+
+      - name: Run kviktor builder inside container
+        run: |
+          set -o pipefail
+          mkdir -p /home/runner/kviktor-cache /home/runner/kviktor-output
+
+          # Mount:
+          #   /work          -> the GHA workspace (where our scripts + project live)
+          #   /cache         -> persistent cache (source tarballs, build dirs)
+          #   /output        -> where the APK gets copied at the end
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -v "/home/runner/kviktor-cache:/cache" \
+            -v "/home/runner/kviktor-output:/output" \
+            -w /work \
+            -e JOBS="$JOBS" \
+            pyqt5-kviktor-builder \
+            bash -c '
+              set -e
+              # The kviktor script defaults to ~/Qt and ~/Android which already
+              # exist in our image (installed in the Dockerfile).  We override
+              # nothing; the defaults match the image layout exactly.
+
+              # The kviktor builder writes intermediate state to its own
+              # workspace dir.  Symlink that under /cache so it survives
+              # between runs.
+              KVIKTOR_WORK="/root/.cache/pyqt5-kviktor-build"
+              mkdir -p /cache/kviktor-work
+              rm -rf "$KVIKTOR_WORK"
+              ln -s /cache/kviktor-work "$KVIKTOR_WORK"
+
+              # Activate the prebuilt venv (image has pyqtdeploy 2.5.1 in there)
+              # so the builder finds pyqtdeploy-sysroot + pyqtdeploy-build.
+              . /root/build-venv/bin/activate
+
+              cd /work
+              # The kviktor script auto-deduces app_name and package_name
+              # from project-dir if not supplied; we pass them explicitly.
+              python3.7 pyqt5_android_kviktor.py \
+                  --project-dir   "/work/'"$PROJ_DIR"'" \
+                  --app-name      "'"$APP_NAME"'" \
+                  --package-name  "'"$PACKAGE_NAME"'" \
+                  --qt-dir        "/root/Qt/5.13.2" \
+                  --ndk-path      "/root/Android/android-ndk-r20b" \
+                  --sdk-path      "/root/Android/tools" \
+                  --jobs          "$JOBS" \
+                  --verbose \
+                  2>&1 | tee /work/build.log
+
+              # Find + copy the APK out to /output (which is mounted to host)
+              APK=$(find /root/.cache/pyqt5-kviktor-build -name "*.apk" -type f | head -1)
+              if [ -z "$APK" ]; then
+                  APK=$(find /tmp -name "*.apk" -type f 2>/dev/null | head -1)
+              fi
+              if [ -z "$APK" ]; then
+                  echo "::error::Builder reported success but no APK was found"
+                  exit 1
+              fi
+              cp "$APK" /output/
+              echo "✓ APK at /output/$(basename "$APK")"
+              ls -la /output/
+            '
+
+      - name: Verify APK output
+        if: success()
+        id: locate
+        run: |
+          APK=$(find /home/runner/kviktor-output -name "*.apk" -type f | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK in /home/runner/kviktor-output/"
+            exit 1
+          fi
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
+          file "$APK"
+          unzip -l "$APK" | head -30
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-pyqt5-kviktor
+          path: ${{ steps.locate.outputs.apk_path }}
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
