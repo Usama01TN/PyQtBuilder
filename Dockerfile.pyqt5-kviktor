@@ -279,6 +279,14 @@ RUN set -ex \
 # build_utils.py + builders.py and observing the import errors):
 #
 #   pyqtdeploy 2.5.1   -- the actual build orchestrator (kviktor pinned 2.5.1).
+#   PyQt5      5.15.7  -- REQUIRED because pyqtdeploy itself is built on
+#                         PyQt5 (its build engine is `from PyQt5.QtCore
+#                         import ...` in pyqtdeploy/builder/builder.py).
+#                         5.15.7 is the LAST PyQt5 version with cp37 wheels
+#                         (manylinux1_x86_64.whl, ~7 MB).  This is the
+#                         HOST PyQt5 (running on the GHA runner), NOT the
+#                         target PyQt5 that will be cross-compiled for
+#                         Android.
 #   cmake              -- the PIP package (not the system tool!) imported
 #                         by builders.py as `from cmake import CMAKE_BIN_DIR`.
 #                         Confusingly shares its name with the system binary.
@@ -299,10 +307,12 @@ RUN set -ex \
  && ${BUILD_VENV}/bin/pip --version \
  && ${BUILD_VENV}/bin/pip install --no-cache-dir \
         'pyqtdeploy==2.5.1' \
+        'PyQt5==5.15.7' \
         'cmake' \
         'setuptools<60' \
         'wheel' \
  && ${BUILD_VENV}/bin/python -c "import cmake; print('cmake pkg OK:', cmake.CMAKE_BIN_DIR)" \
+ && ${BUILD_VENV}/bin/python -c "from PyQt5 import QtCore; print('PyQt5 OK:', QtCore.PYQT_VERSION_STR, 'Qt', QtCore.QT_VERSION_STR)" \
  && ${BUILD_VENV}/bin/python -c "import pyqtdeploy; print('pyqtdeploy OK:', pyqtdeploy.__version__)"
 
 # ---------------------------------------------------------------- final sanity checks
