@@ -313,7 +313,12 @@ RUN set -ex \
         'wheel' \
  && ${BUILD_VENV}/bin/python -c "import cmake; print('cmake pkg OK:', cmake.CMAKE_BIN_DIR)" \
  && ${BUILD_VENV}/bin/python -c "from PyQt5 import QtCore; print('PyQt5 OK:', QtCore.PYQT_VERSION_STR, 'Qt', QtCore.QT_VERSION_STR)" \
- && ${BUILD_VENV}/bin/python -c "import pyqtdeploy; print('pyqtdeploy OK:', pyqtdeploy.__version__)"
+ && ${BUILD_VENV}/bin/python -c "import pyqtdeploy; print('pyqtdeploy module OK at:', pyqtdeploy.__file__)" \
+ && test -x ${BUILD_VENV}/bin/pyqtdeploy-sysroot \
+ && test -x ${BUILD_VENV}/bin/pyqtdeploy-build \
+ && echo "pyqtdeploy-sysroot at ${BUILD_VENV}/bin/pyqtdeploy-sysroot" \
+ && echo "pyqtdeploy-build   at ${BUILD_VENV}/bin/pyqtdeploy-build" \
+ && echo "OK: build venv complete (pyqtdeploy + PyQt5 + cmake)"
 
 # ---------------------------------------------------------------- final sanity checks
 # Make all the version info easy to inspect by running the image:
