@@ -1,29 +1,44 @@
 # -*- coding: utf-8 -*-
 import sys
-from PySide import QtGui
+import traceback
 
-class MainWindow(QtGui.QWidget):
-    def __init__(self):
-        super(MainWindow, self).__init__()
+print("=== main.py starting ===", flush=True)
 
-        self.label = QtGui.QLabel("Hello from PySide 1", self)
-        self.button = QtGui.QPushButton("Click me", self)
+try:
+    from PyQt5.QtCore import qVersion, QTimer, Qt
+    from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
-        self.button.clicked.connect(self.on_click)
+    print(f"Qt {qVersion()} / Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+          flush=True)
 
-        layout = QtGui.QVBoxLayout()
-        layout.addWidget(self.label)
-        layout.addWidget(self.button)
-        self.setLayout(layout)
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
 
-        self.setWindowTitle("PySide 1 Example")
-        self.resize(300, 120)
+    # IMPORTANT: keep references at module scope or as attributes,
+    # otherwise Python's GC will reap them before show() takes effect.
+    window = QWidget()
+    window.setWindowTitle("PyQt5 on Android")
+    layout = QVBoxLayout(window)
+    layout.setAlignment(Qt.AlignCenter)
+    layout.addWidget(QLabel("Hello from PyQt5 on Android!"))
+    layout.addWidget(QLabel(f"Qt {qVersion()}"))
+    window.resize(400, 300)
+    window.show()                     # NOT QLabel("..").show() — keep the ref!
 
-    def on_click(self):
-        self.label.setText("Button clicked!")
+    counter = {'n': 0}
+    def tick():
+        counter['n'] += 1
+        print(f"[heartbeat] tick {counter['n']}", flush=True)
+    timer = QTimer()                  # again, keep a reference
+    timer.timeout.connect(tick)
+    timer.start(1000)
 
-if __name__ == '__main__':
-    app = QtGui.QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+    print("Entering event loop...", flush=True)
+    rc = app.exec_()
+    print(f"Event loop exited with rc={rc}", flush=True)
+    sys.exit(rc)
+
+except Exception:
+    print("=== FATAL EXCEPTION ===", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
