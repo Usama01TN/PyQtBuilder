@@ -108,6 +108,93 @@ jobs:
       - name: Show Docker image contents
         run: docker run --rm pyqt5-kviktor-builder
 
+      - name: Extract Qt 5.13.2 Android arm64 as a downloadable tarball
+        # The image bakes Qt 5.13.2 Android arm64-v8a at /root/Qt/5.13.2.
+        # We export it here as a standalone tarball so it can be reused:
+        #
+        #   * As a GHA artifact (downloadable for 90 days)
+        #   * As an attachment to a GitHub Release (permanent mirror)
+        #   * As a manual `--qt-dir` input for future builds that don't
+        #     want to rebuild this entire image (skip the aqtinstall step)
+        #
+        # Tarball is about 1 GB compressed.  We use pigz for parallel
+        # compression if available, otherwise plain gzip.
+        run: |
+          mkdir -p artifacts
+          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
+              bash -c '
+                cd /root/Qt && \
+                if command -v pigz >/dev/null; then \
+                  COMPRESS="--use-compress-program=pigz"; \
+                else \
+                  COMPRESS="--gzip"; \
+                fi && \
+                tar -cf /out/qt-5.13.2-android-arm64-v8a.tar.gz \
+                    $COMPRESS 5.13.2/android_arm64_v8a 5.13.2/Src 2>/dev/null \
+                    || tar -czf /out/qt-5.13.2-android-arm64-v8a.tar.gz 5.13.2/android_arm64_v8a
+                # Also dump checksum + manifest of what is inside
+                ls -lh /out/qt-5.13.2-android-arm64-v8a.tar.gz
+                sha256sum /out/qt-5.13.2-android-arm64-v8a.tar.gz | tee /out/qt-5.13.2-android-arm64-v8a.sha256
+                tar tzf /out/qt-5.13.2-android-arm64-v8a.tar.gz | head -20 > /out/qt-5.13.2-android-arm64-v8a.manifest.txt
+                tar tzf /out/qt-5.13.2-android-arm64-v8a.tar.gz | wc -l >> /out/qt-5.13.2-android-arm64-v8a.manifest.txt
+              '
+          ls -lh artifacts/
+
+      - name: Upload Qt 5.13.2 Android arm64 as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-5.13.2-android-arm64-v8a
+          path: |
+            artifacts/qt-5.13.2-android-arm64-v8a.tar.gz
+            artifacts/qt-5.13.2-android-arm64-v8a.sha256
+            artifacts/qt-5.13.2-android-arm64-v8a.manifest.txt
+          retention-days: 90
+          # Don't fail if compression of a partial layout happens (the tar
+          # `|| true` above handles missing optional dirs).
+          if-no-files-found: error
+
+      - name: Extract Android NDK r20b as a downloadable tarball
+        run: |
+          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
+              tar -czf /out/android-ndk-r20b.tar.gz \
+                  -C /root/Android android-ndk-r20b
+          ls -lh artifacts/android-ndk-r20b.tar.gz
+          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
+              bash -c 'sha256sum /out/android-ndk-r20b.tar.gz' \
+              | tee artifacts/android-ndk-r20b.sha256
+
+      - name: Upload Android NDK r20b as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-ndk-r20b
+          path: |
+            artifacts/android-ndk-r20b.tar.gz
+            artifacts/android-ndk-r20b.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Extract Android SDK API 28 as a downloadable tarball
+        # SDK is smaller than Qt/NDK (~400 MB) but worth saving for
+        # offline reproducibility.
+        run: |
+          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
+              tar -czf /out/android-sdk-api28.tar.gz \
+                  -C /root/Android tools
+          ls -lh artifacts/android-sdk-api28.tar.gz
+          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
+              bash -c 'sha256sum /out/android-sdk-api28.tar.gz' \
+              | tee artifacts/android-sdk-api28.sha256
+
+      - name: Upload Android SDK API 28 as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-sdk-api28
+          path: |
+            artifacts/android-sdk-api28.tar.gz
+            artifacts/android-sdk-api28.sha256
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Cache build artifacts (source tarballs, sysroot, build dirs)
         uses: actions/cache@v4
         with:
