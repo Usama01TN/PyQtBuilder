@@ -48,10 +48,24 @@ ENV LC_ALL=C.UTF-8
 #
 # These are well-known Debian/Ubuntu bugs that have been "won't fix"
 # for years because the workaround is trivial.
-RUN mkdir -p /usr/share/man/man1 /usr/share/binfmts
-
-RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends \
+#
+# IMPORTANT: the mkdir runs IN THE SAME RUN INSTRUCTION as the apt
+# install.  Putting it in a separate RUN was unreliable -- BuildKit's
+# layer cache and GHA cache-from can together end up reusing a cached
+# apt-install layer that pre-dates the mkdir layer, recreating the
+# original bug.  Same-RUN guarantees no stale cache reuse.
+#
+# Also installs binfmt-support explicitly: this package owns
+# /usr/share/binfmts/ and provides update-binfmts.  Having it
+# installed BEFORE openjdk-11-jre-headless's post-install would
+# work too, but apt orders installs by dependency graph and we
+# can't easily force order.  The mkdir is the reliable fix.
+RUN set -ex \
+ && mkdir -p /usr/share/man/man1 /usr/share/binfmts \
+ && ls -ld /usr/share/man/man1 /usr/share/binfmts \
+ && apt-get update -y \
+ && apt-get install -y --no-install-recommends \
+        binfmt-support \
         ca-certificates curl wget unzip zip git \
         build-essential clang make cmake ninja-build pkg-config \
         zlib1g zlib1g-dev libbz2-dev libssl-dev libffi-dev libreadline-dev \
@@ -61,8 +75,10 @@ RUN apt-get update -y && \
         openjdk-11-jre-headless \
         xvfb \
         file \
-    && rm -rf /var/lib/apt/lists/* \
-    && dpkg --configure -a
+ && dpkg --configure -a \
+ && rm -rf /var/lib/apt/lists/* \
+ && test -d /usr/lib/jvm/java-8-openjdk-amd64 \
+ && test -d /usr/lib/jvm/java-11-openjdk-amd64
 
 # About the TWO JDKs:
 #
