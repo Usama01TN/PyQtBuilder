@@ -31,12 +31,13 @@ ENV LC_ALL=C.UTF-8
 # ---------------------------------------------------------------- system deps
 # kviktor README specifies:
 #   sudo apt-get install clang make zlib1g zlib1g-dev libbz2-dev libssl-dev openjdk-8-jdk build-essential git
-# We add: curl, wget, unzip, zip, ca-certificates, software-properties-common
-# (for deadsnakes PPA), Python 3.7 from deadsnakes, and a few build helpers.
+# We add: curl, wget, unzip, zip, ca-certificates, plus Python 3.7 build
+# dependencies (libffi-dev, libreadline-dev, etc.) so we can compile
+# CPython 3.7.7 from source in the next layer.  Python 3.7.7 from source
+# is the canonical approach the kviktor guide takes; we don't use a PPA.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl wget unzip zip git \
-        software-properties-common gnupg \
         build-essential clang make cmake ninja-build pkg-config \
         zlib1g zlib1g-dev libbz2-dev libssl-dev libffi-dev libreadline-dev \
         libsqlite3-dev libgdbm-dev libncurses5-dev libnss3-dev tk-dev \
@@ -46,13 +47,41 @@ RUN apt-get update -y && \
         file \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 3.7 from deadsnakes PPA (Ubuntu 20.04 ships 3.8 by default;
-# pyqtdeploy 2.5.1 needs 3.7).
-RUN add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update -y && \
-    apt-get install -y --no-install-recommends \
-        python3.7 python3.7-dev python3.7-venv python3.7-distutils \
-    && rm -rf /var/lib/apt/lists/*
+# ---------------------------------------------------------------- Python 3.7.7 from source
+#
+# Why from source: as of 2024-2025, the deadsnakes PPA removed python3.7-dev,
+# python3.7-venv, and python3.7-distutils for Ubuntu 20.04 (focal) because
+# Python 3.7 reached EOL on 2023-06-27.  The PPA now serves only python3.7
+# (runtime) for focal, not the dev/venv/distutils sub-packages.  Trying:
+#
+#     apt-get install python3.7-dev
+#     E: Unable to locate package python3.7-dev
+#
+# The kviktor guide actually specifies a from-source build for Python 3.7.7
+# anyway, so we just do that.  Takes ~3-5 minutes.  Once cached in the
+# Docker layer, subsequent builds skip this entirely.
+#
+# We build with --enable-shared so the venv-wrapped pyqtdeploy can link
+# against libpython3.7m.so.  ldconfig is run so /usr/local/lib is in
+# the dynamic linker's search path.  We SKIP --enable-optimizations
+# because PGO doubles the build time and we don't need a fast host
+# Python (we run pyqtdeploy maybe twice per build).
+RUN cd /tmp && \
+    curl -L --fail --retry 5 -o Python-3.7.7.tgz \
+        "https://www.python.org/ftp/python/3.7.7/Python-3.7.7.tgz" && \
+    tar xzf Python-3.7.7.tgz && \
+    cd Python-3.7.7 && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-shared \
+        --with-ensurepip=install \
+        LDFLAGS="-Wl,-rpath=/usr/local/lib" \
+    && make -j"$(nproc)" \
+    && make altinstall \
+    && cd / && rm -rf /tmp/Python-3.7.7 /tmp/Python-3.7.7.tgz \
+    && ldconfig \
+    && python3.7 --version \
+    && python3.7 -m pip --version
 
 # Pin JAVA_HOME to JDK 8 (kviktor's Gradle templates require it)
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
@@ -62,13 +91,6 @@ ENV PATH=${JAVA_HOME}/bin:${PATH}
 RUN java -version 2>&1 | head -1 && \
     [ "$(java -version 2>&1 | grep -c '1.8')" -gt 0 ] || \
         (echo "ERROR: Java is not 1.8" && exit 1)
-
-# Quick get-pip for python3.7 (its distutils doesn't ship ensurepip by default
-# on deadsnakes)
-RUN curl -sS https://bootstrap.pypa.io/pip/3.7/get-pip.py -o /tmp/get-pip.py && \
-    python3.7 /tmp/get-pip.py && \
-    rm /tmp/get-pip.py && \
-    python3.7 -m pip --version
 
 # ---------------------------------------------------------------- Android NDK r20b
 # r20b is the LAST NDK with GCC.  r21+ ships only Clang, which breaks
