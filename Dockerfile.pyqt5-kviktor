@@ -35,6 +35,21 @@ ENV LC_ALL=C.UTF-8
 # dependencies (libffi-dev, libreadline-dev, etc.) so we can compile
 # CPython 3.7.7 from source in the next layer.  Python 3.7.7 from source
 # is the canonical approach the kviktor guide takes; we don't use a PPA.
+# Pre-create directories that openjdk post-install scripts expect but
+# which Ubuntu base images strip for size.  Without these:
+#
+#   * /usr/share/binfmts/ missing  ->  openjdk-11-jre-headless fails:
+#       update-alternatives: error: error creating symbolic link
+#       '/usr/share/binfmts/jar.dpkg-tmp': No such file or directory
+#       dpkg: error processing package openjdk-11-jre-headless
+#
+#   * /usr/share/man/man1/ missing ->  openjdk-8-jdk fails similarly
+#       on its man-page installation step.
+#
+# These are well-known Debian/Ubuntu bugs that have been "won't fix"
+# for years because the workaround is trivial.
+RUN mkdir -p /usr/share/man/man1 /usr/share/binfmts
+
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl wget unzip zip git \
@@ -46,7 +61,8 @@ RUN apt-get update -y && \
         openjdk-11-jre-headless \
         xvfb \
         file \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && dpkg --configure -a
 
 # About the TWO JDKs:
 #
@@ -101,14 +117,32 @@ RUN cd /tmp && \
     && python3.7 --version \
     && python3.7 -m pip --version
 
-# Pin JAVA_HOME to JDK 8 (kviktor's Gradle templates require it)
+# Pin JAVA_HOME to JDK 8 (kviktor's Gradle templates require it).
+# JDK 11 stays installed but is only invoked explicitly via JDK11_HOME
+# during the Android SDK install layer below.
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 ENV PATH=${JAVA_HOME}/bin:${PATH}
 
-# Sanity-check Java version
-RUN java -version 2>&1 | head -1 && \
-    [ "$(java -version 2>&1 | grep -c '1.8')" -gt 0 ] || \
-        (echo "ERROR: Java is not 1.8" && exit 1)
+# Verify both JDKs ended up where we expect, AND that the default
+# `java` resolves to JDK 8.  Failing here gives a clear error at the
+# image-build stage instead of later at sdkmanager runtime.
+RUN echo "=== JDK 8 check (default JAVA_HOME) ===" \
+ && test -d /usr/lib/jvm/java-8-openjdk-amd64 \
+        || (echo "FATAL: JDK 8 dir missing"; exit 1) \
+ && /usr/lib/jvm/java-8-openjdk-amd64/bin/java -version 2>&1 | head -1 \
+ && (/usr/lib/jvm/java-8-openjdk-amd64/bin/java -version 2>&1 | grep -q '1.8' \
+        || (echo "FATAL: JDK 8 binary is not 1.8"; exit 1)) \
+ && echo "=== JDK 11 check (for sdkmanager only) ===" \
+ && test -d /usr/lib/jvm/java-11-openjdk-amd64 \
+        || (echo "FATAL: JDK 11 dir missing"; exit 1) \
+ && /usr/lib/jvm/java-11-openjdk-amd64/bin/java -version 2>&1 | head -1 \
+ && (/usr/lib/jvm/java-11-openjdk-amd64/bin/java -version 2>&1 | grep -qE '"(11|17)' \
+        || (echo "FATAL: JDK 11 binary is not version 11"; exit 1)) \
+ && echo "=== PATH-resolved java ===" \
+ && java -version 2>&1 | head -1 \
+ && (java -version 2>&1 | grep -q '1.8' \
+        || (echo "FATAL: default 'java' is not JDK 8 -- JAVA_HOME not set correctly"; exit 1)) \
+ && echo "OK: JDK 8 default, JDK 11 available at /usr/lib/jvm/java-11-openjdk-amd64"
 
 # ---------------------------------------------------------------- Android NDK r20b
 # r20b is the LAST NDK with GCC.  r21+ ships only Clang, which breaks
