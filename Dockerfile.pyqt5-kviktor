@@ -43,9 +43,27 @@ RUN apt-get update -y && \
         libsqlite3-dev libgdbm-dev libncurses5-dev libnss3-dev tk-dev \
         liblzma-dev uuid-dev \
         openjdk-8-jdk \
+        openjdk-11-jre-headless \
         xvfb \
         file \
     && rm -rf /var/lib/apt/lists/*
+
+# About the TWO JDKs:
+#
+#   JDK 8  is the build-time/run-time Java for the kviktor pipeline.
+#          kviktor pinned Android Gradle Plugin + build-tools 28.0.3
+#          which only work with JDK 8.  This is the DEFAULT (JAVA_HOME
+#          set later).
+#
+#   JDK 11 is only used to invoke sdkmanager during this Dockerfile.
+#          Modern Android command-line tools (build 9477386, mid-2023+)
+#          require JDK 11+ to run, producing this error otherwise:
+#              Error: A JNI error has occurred
+#              ... sun.launcher.LauncherHelper.validateMainClass ...
+#          Once sdkmanager has installed the platforms/build-tools, we
+#          never need JDK 11 again at runtime.  We could uninstall it
+#          to save ~250 MB but keep it for safety (e.g. if a user wants
+#          to install additional SDK packages later).
 
 # ---------------------------------------------------------------- Python 3.7.7 from source
 #
@@ -108,24 +126,51 @@ RUN mkdir -p /root/Android && cd /root/Android && \
 # ---------------------------------------------------------------- Android SDK
 # We install: platform-tools, build-tools 28.0.3, platforms;android-28.
 # kviktor uses these specific versions.
+#
+# CRITICAL: the modern commandlinetools-linux-9477386 binary requires
+# JDK 11+ to even start (it uses Java 11 bytecode).  Trying to run it
+# under JDK 8 gives:
+#     Error: A JNI error has occurred, please check your installation and try again
+#     Exception in thread "main" java.lang.UnsupportedClassVersionError
+#     ...sun.launcher.LauncherHelper.validateMainClass...
+#
+# Workaround: run sdkmanager with JDK 11's java explicitly, by setting
+# JAVA_HOME to point at JDK 11 just for this RUN step.  After this
+# layer, JAVA_HOME goes back to JDK 8 (set below) which is what the
+# kviktor pipeline needs at app-build time.
 ENV ANDROID_SDK_ROOT=/root/Android/tools
 ENV ANDROID_HOME=${ANDROID_SDK_ROOT}
 ENV PATH=${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}
 
-RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools && cd ${ANDROID_SDK_ROOT}/cmdline-tools && \
-    curl -L --fail --retry 5 --retry-delay 5 \
+# Hardcode JDK 11's install path (Ubuntu 20.04 amd64 installs to this
+# exact directory).  Used only for sdkmanager invocations below.
+ENV JDK11_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+# Download cmdline-tools, install platform-tools + platforms;android-28 +
+# build-tools 28.0.3.  Uses JDK 11 for sdkmanager (required by
+# commandlinetools-linux-9477386) but never affects the default JDK 8.
+RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools \
+ && cd ${ANDROID_SDK_ROOT}/cmdline-tools \
+ && curl -L --fail --retry 5 --retry-delay 5 \
         -o cmdline-tools.zip \
-        "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" && \
-    unzip -q cmdline-tools.zip && \
-    rm cmdline-tools.zip && \
-    mv cmdline-tools latest && \
-    yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null 2>&1 || true && \
-    ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager \
-        "platform-tools" \
-        "platforms;android-28" \
-        "build-tools;28.0.3" \
-        >/dev/null && \
-    ls ${ANDROID_SDK_ROOT}/platforms/android-28 > /dev/null
+        "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" \
+ && unzip -q cmdline-tools.zip \
+ && rm cmdline-tools.zip \
+ && mv cmdline-tools latest \
+ && test -d "${JDK11_HOME}" || (echo "JDK 11 missing at ${JDK11_HOME}"; exit 1) \
+ && echo "Using JDK 11 for sdkmanager: ${JDK11_HOME}" \
+ && JAVA_HOME=${JDK11_HOME} PATH=${JDK11_HOME}/bin:${PATH} \
+        bash -c 'yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null 2>&1 || true' \
+ && JAVA_HOME=${JDK11_HOME} PATH=${JDK11_HOME}/bin:${PATH} \
+        ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-28" \
+            "build-tools;28.0.3" \
+            >/dev/null \
+ && ls ${ANDROID_SDK_ROOT}/platforms/android-28 > /dev/null \
+ && ls ${ANDROID_SDK_ROOT}/build-tools/28.0.3   > /dev/null \
+ && ls ${ANDROID_SDK_ROOT}/platform-tools       > /dev/null \
+ && echo "SDK install OK: platforms/android-28 + build-tools/28.0.3 + platform-tools"
 
 # ---------------------------------------------------------------- Qt 5.13.2 Android arm64
 # Qt 5.13.2 binaries for Android arm64-v8a, installed via `aqtinstall`
