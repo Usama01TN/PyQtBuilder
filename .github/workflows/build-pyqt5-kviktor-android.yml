@@ -410,48 +410,61 @@ jobs:
 
           OUT="$SYSROOT_JSON_PATH" python3 - <<'PYEOF'
           import json, os
-          sysroot = {
-              "Description": "pyqtdeploy 2.5.1 sysroot for PyQt5 5.15.1 Android arm64",
-              "android|macos|win#openssl": {
-                  "android#source": "openssl-1.0.2r.tar.gz",
-                  "no_asm":         True
-              },
-              "qt5": {
-                  "android-32#qt_dir":         "android_armv7",
-                  "android-64#qt_dir":         "android_arm64_v8a",
-                  "edition":                   "opensource",
-                  "android|linux#ssl":         "openssl-runtime"
-              },
-              "python": {
-                  "build_host_from_source":   False,
-                  "build_target_from_source": True,
-                  "source":                   "Python-3.7.7.tgz"
-              },
-              "sip": {
-                  "module_name":  "PyQt5.sip",
-                  "source":       "sip-4.19.24.tar.gz"
-              },
-              "pyqt5": {
-                  "android#disabled_features": [
-                      "PyQt_Desktop_OpenGL", "PyQt_Printer", "PyQt_PrintDialog",
-                      "PyQt_PrintPreviewDialog", "PyQt_PrintPreviewWidget"
-                  ],
-                  "android#modules": [
-                      "QtCore", "QtGui", "QtWidgets", "QtNetwork",
-                      "QtPrintSupport", "QtSvg"
-                  ],
-                  "source": "PyQt5-5.15.1.tar.gz"
-              }
+          # IMPORTANT: order matters!  pyqtdeploy 2.5.1 iterates components in
+          # JSON-key order during the sysroot build.  Components that depend
+          # on others must come AFTER their dependencies:
+          #     openssl -- independent
+          #     qt5     -- independent
+          #     python  -- depends on openssl (for the ssl module)
+          #     sip     -- depends on python
+          #     pyqt5   -- depends on sip + qt5
+          # If we serialised with sort_keys=True, alphabetical order puts
+          # "pyqt5" before "sip", and pyqtdeploy fails with:
+          #     "the sysroot specification must contain an entry for 'sip'
+          #      before anything that depends on it"
+          # Python 3.7+ dicts preserve insertion order, so we just write
+          # the dict in the right order and pass sort_keys=False.
+          sysroot = {}
+          sysroot["Description"] = "pyqtdeploy 2.5.1 sysroot for PyQt5 5.15.1 Android arm64"
+          sysroot["android|macos|win#openssl"] = {
+              "android#source": "openssl-1.0.2r.tar.gz",
+              "no_asm":         True
+          }
+          sysroot["qt5"] = {
+              "android-32#qt_dir":         "android_armv7",
+              "android-64#qt_dir":         "android_arm64_v8a",
+              "edition":                   "opensource",
+              "android|linux#ssl":         "openssl-runtime"
+          }
+          sysroot["python"] = {
+              "build_host_from_source":   False,
+              "build_target_from_source": True,
+              "source":                   "Python-3.7.7.tgz"
+          }
+          sysroot["sip"] = {
+              "module_name":  "PyQt5.sip",
+              "source":       "sip-4.19.24.tar.gz"
+          }
+          sysroot["pyqt5"] = {
+              "android#disabled_features": [
+                  "PyQt_Desktop_OpenGL", "PyQt_Printer", "PyQt_PrintDialog",
+                  "PyQt_PrintPreviewDialog", "PyQt_PrintPreviewWidget"
+              ],
+              "android#modules": [
+                  "QtCore", "QtGui", "QtWidgets", "QtNetwork",
+                  "QtPrintSupport", "QtSvg"
+              ],
+              "source": "PyQt5-5.15.1.tar.gz"
           }
           with open(os.environ["OUT"], "w") as f:
-              json.dump(sysroot, f, indent=4, sort_keys=True)
+              json.dump(sysroot, f, indent=4, sort_keys=False)
           print("Wrote", os.environ["OUT"])
           PYEOF
 
           echo "Pre-created $SYSROOT_JSON_PATH:"
           cat "$SYSROOT_JSON_PATH"
           echo
-          python3 -c "import json; d=json.load(open('$SYSROOT_JSON_PATH')); print('Component keys:', sorted(k for k in d.keys() if k != 'Description'))"
+          python3 -c "import json; d=json.load(open('$SYSROOT_JSON_PATH')); print('Component keys in dependency order:', [k for k in d.keys() if k != 'Description'])"
 
       - name: Run kviktor builder inside container
         run: |
