@@ -806,17 +806,41 @@ jobs:
                   --verbose \
                   2>&1 | tee /work/build.log
 
-              # Find + copy the APK out to /output (which is mounted to host)
-              APK=$(find /root/.cache/pyqt5-kviktor-build -name "*.apk" -type f | head -1)
+              # ──────────────────────────────────────────────────────────
+              # Find + copy the APK out to /output (mounted to the host).
+              # ──────────────────────────────────────────────────────────
+              # The kviktor script (see Step 13 summary log) reports the
+              # APK at:
+              #     /work/workspace/<projname>/build-android-64/app/build/outputs/apk/debug/app-debug.apk
+              # We search the entire build dir tree as a robust fallback
+              # in case the structure differs.  We also rename the file
+              # to ${APP_NAME}-debug.apk so the artifact is identifiable.
+              echo "Searching for APK in /work/workspace and /work ..."
+
+              APK=$(find /work/workspace -name "*.apk" -type f 2>/dev/null \
+                    | grep -E "debug.*\.apk$|app-debug\.apk$" \
+                    | head -1)
+
               if [ -z "$APK" ]; then
-                  APK=$(find /tmp -name "*.apk" -type f 2>/dev/null | head -1)
+                  # Fallback: any .apk in the workspace
+                  APK=$(find /work -name "*.apk" -type f 2>/dev/null | head -1)
               fi
+
               if [ -z "$APK" ]; then
                   echo "::error::Builder reported success but no APK was found"
+                  echo "Diagnostic: contents of build-android-64/app/build/outputs:"
+                  find /work/workspace -type d -name outputs 2>/dev/null | while read d; do
+                      echo "  $d:"
+                      ls -laR "$d" 2>/dev/null | head -30
+                  done
                   exit 1
               fi
-              cp "$APK" /output/
-              echo "✓ APK at /output/$(basename "$APK")"
+
+              echo "Found APK: $APK ($(stat -c %s "$APK") bytes)"
+              # Rename to a friendly artifact name
+              DEST="/output/'"$APP_NAME"'-debug.apk"
+              cp "$APK" "$DEST"
+              echo "✓ APK copied to $DEST"
               ls -la /output/
             '
 
