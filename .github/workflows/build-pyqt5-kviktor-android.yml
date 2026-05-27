@@ -414,6 +414,35 @@ jobs:
               . /root/build-venv/bin/activate
 
               # ──────────────────────────────────────────────────────────
+              # Make the kviktor venv reuse our pre-built one (via symlink)
+              # ──────────────────────────────────────────────────────────
+              # IMPORTANT: the kviktor script creates its OWN venv at
+              # /root/.pyqt5_android_kviktor/venv -- it ignores any venv
+              # we pre-built elsewhere.  Look at lines 185-187 + 468-472
+              # of pyqt5_android_kviktor.py:
+              #     base = join(_HOME, ".pyqt5_android_kviktor")
+              #     self.venv_dir = join(base, "venv")
+              #     ...
+              #     if exists(cfg.venv_dir):
+              #         log.info("Reusing venv: %s", cfg.venv_dir)
+              #     else:
+              #         create(cfg.venv_dir, with_pip=True, clear=True)
+              #
+              # If the path already exists, kviktor reuses it.  So we
+              # symlink the kviktor venv path -> our pre-built /root/build-venv.
+              # The setup_venv step in kviktor then sees "Reusing venv" and
+              # skips re-creation.  Its pip install still runs (which may
+              # downgrade PyQt5 from 5.15.7 -> 5.15.1 to match kviktor's
+              # expected version), but that succeeds quickly and preserves
+              # our case-aliased plugins.
+              mkdir -p /root/.pyqt5_android_kviktor
+              if [ ! -e /root/.pyqt5_android_kviktor/venv ]; then
+                  ln -sfn /root/build-venv /root/.pyqt5_android_kviktor/venv
+                  echo "Symlinked /root/.pyqt5_android_kviktor/venv -> /root/build-venv"
+              fi
+              ls -ld /root/.pyqt5_android_kviktor/venv
+
+              # ──────────────────────────────────────────────────────────
               # Create TitleCase aliases for pyqtdeploy plugins.
               # ──────────────────────────────────────────────────────────
               # The kviktor sysroot.json uses TitleCase keys:
@@ -426,14 +455,17 @@ jobs:
               # Fix: cp the plugins under TitleCase names so both imports work.
               # Note: "Qt" maps to qt5.py (not qt.py -- pyqtdeploy 2.5.1
               # only has the qt5 plugin).
+              #
+              # Because of the symlink above, the aliases apply to BOTH paths.
               PLUGINS_DIR=/root/build-venv/lib/python3.7/site-packages/pyqtdeploy/sysroot/plugins
               echo "Creating TitleCase plugin aliases in $PLUGINS_DIR"
-              [ -f "$PLUGINS_DIR/openssl.py" ] && cp "$PLUGINS_DIR/openssl.py" "$PLUGINS_DIR/OpenSSL.py"
-              [ -f "$PLUGINS_DIR/sip.py"     ] && cp "$PLUGINS_DIR/sip.py"     "$PLUGINS_DIR/SIP.py"
-              [ -f "$PLUGINS_DIR/pyqt5.py"   ] && cp "$PLUGINS_DIR/pyqt5.py"   "$PLUGINS_DIR/PyQt5.py"
-              [ -f "$PLUGINS_DIR/qt5.py"     ] && cp "$PLUGINS_DIR/qt5.py"     "$PLUGINS_DIR/Qt.py"
-              [ -d "$PLUGINS_DIR/python"     ] && cp -r "$PLUGINS_DIR/python"  "$PLUGINS_DIR/Python"
-              ls -la "$PLUGINS_DIR" | grep -E "OpenSSL|SIP|PyQt5|Qt|Python" || true
+              [ -f "$PLUGINS_DIR/openssl.py" ] && [ ! -f "$PLUGINS_DIR/OpenSSL.py" ] && cp "$PLUGINS_DIR/openssl.py" "$PLUGINS_DIR/OpenSSL.py"
+              [ -f "$PLUGINS_DIR/sip.py"     ] && [ ! -f "$PLUGINS_DIR/SIP.py"     ] && cp "$PLUGINS_DIR/sip.py"     "$PLUGINS_DIR/SIP.py"
+              [ -f "$PLUGINS_DIR/pyqt5.py"   ] && [ ! -f "$PLUGINS_DIR/PyQt5.py"   ] && cp "$PLUGINS_DIR/pyqt5.py"   "$PLUGINS_DIR/PyQt5.py"
+              [ -f "$PLUGINS_DIR/qt5.py"     ] && [ ! -f "$PLUGINS_DIR/Qt.py"      ] && cp "$PLUGINS_DIR/qt5.py"     "$PLUGINS_DIR/Qt.py"
+              [ -d "$PLUGINS_DIR/python"     ] && [ ! -d "$PLUGINS_DIR/Python"     ] && cp -r "$PLUGINS_DIR/python"  "$PLUGINS_DIR/Python"
+              echo "Plugin files in $PLUGINS_DIR:"
+              ls "$PLUGINS_DIR" | grep -E "OpenSSL|SIP|PyQt5|Python|Qt" || true
 
               cd /work
               # The kviktor script auto-deduces app_name and package_name
