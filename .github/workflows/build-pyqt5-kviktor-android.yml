@@ -379,6 +379,53 @@ jobs:
           echo "================================================================"
           echo "Patched script SHA256: $(sha256sum pyqt5_android_kviktor.py | awk '{print $1}')"
 
+      - name: Patch the str.rstrip(".exe") bug in builders.py
+        # builders.py:41 has this bug:
+        #     name = '{}{}'.format(name.rstrip('.exe'), '.exe' if ... else '')
+        # str.rstrip() does NOT strip a suffix -- it strips any of the
+        # CHARACTERS in its argument from the right end.  So
+        #     'make'.rstrip('.exe')  ==>  'mak'    (trailing 'e' is in the set)
+        #     'git'.rstrip('.exe')   ==>  'git'    (no chars in set at end)
+        #     'cmake'.rstrip('.exe') ==>  'cmak'   (trailing 'e' stripped)
+        # Result: every executable ending in 'e' loses its 'e' on Linux,
+        # which causes the kviktor script to try to run "/work/mak -j2"
+        # instead of "make -j2", failing with FileNotFoundError.
+        #
+        # The fix is to use a proper suffix check.  Python 3.9 has
+        # str.removesuffix() but we target Python 3.7, so we use
+        # an endswith + slicing pattern.
+        run: |
+          set -e
+          if [ ! -f builders.py ]; then
+              echo "::warning::builders.py not found in workspace -- skipping patch"
+              exit 0
+          fi
+          echo "Before patch:"
+          grep -n "rstrip" builders.py || true
+          echo "================================================================"
+
+          python3 <<'PYEOF'
+          with open("builders.py", "r") as f:
+              content = f.read()
+          before = content
+          content = content.replace(
+              "name.rstrip('.exe')",
+              "(name[:-4] if name.lower().endswith('.exe') else name)"
+          )
+          if content == before:
+              print("::warning::No rstrip('.exe') pattern found in builders.py -- already patched?")
+          else:
+              with open("builders.py", "w") as f:
+                  f.write(content)
+              print("Patched", content.count("name.lower().endswith('.exe')"),
+                    "occurrences of rstrip('.exe') in builders.py")
+          PYEOF
+
+          echo "After patch:"
+          grep -n "endswith\|rstrip" builders.py | head
+          echo "================================================================"
+          echo "Patched builders.py SHA256: $(sha256sum builders.py | awk '{print $1}')"
+
       - name: Pre-create sysroot.json with the correct pyqtdeploy 2.5.1 schema
         # The kviktor script the user has (pyqt5_android_kviktor.py) generates
         # a sysroot.json with INVENTED option names like "android_api",
