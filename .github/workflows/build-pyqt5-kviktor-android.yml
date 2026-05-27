@@ -432,7 +432,7 @@ jobs:
               # symlink the kviktor venv path -> our pre-built /root/build-venv.
               # The setup_venv step in kviktor then sees "Reusing venv" and
               # skips re-creation.  Its pip install still runs (which may
-              # downgrade PyQt5 from 5.15.7 -> 5.15.1 to match kviktor's
+              # downgrade PyQt5 from 5.15.7 -> 5.15.1 to match the kviktor
               # expected version), but that succeeds quickly and preserves
               # our case-aliased plugins.
               mkdir -p /root/.pyqt5_android_kviktor
