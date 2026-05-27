@@ -247,6 +247,86 @@ jobs:
               echo "  (no Qt-binding imports found — this app may not be a Qt app)"
           echo "================================================================"
 
+      - name: Patch broken PyPI download URLs in kviktor script
+        # The kviktor script hardcodes URLs like
+        #     https://pypi.org/packages/source/s/sip/sip-4.19.24.tar.gz
+        # which now return HTTP 404 because PyPI removed the
+        # /packages/source/<letter>/<pkg>/ URL layout years ago (it now
+        # uses files.pythonhosted.org with hash-prefixed paths), and
+        # legacy tarballs like SIP 4.19.24 aren't republished there.
+        #
+        # MacPorts mirrors PyQt/SIP source tarballs at
+        # distfiles.macports.org under /py-<pkgname>/.  We patch in
+        # place before running the builder.
+        #
+        # We also pre-download the SIP tarball into the project's
+        # sources/ directory so that if MacPorts is unreachable, we
+        # already have the file and the kviktor script skips its own
+        # (now patched) download attempt.  Multiple mirrors are tried
+        # with fallback.
+        run: |
+          set -e
+
+          # ── (1) sed-patch the URLs in the kviktor script ──
+          echo "Before patch:"
+          grep -nE "pypi\.org/packages|distfiles\.macports|sip-4.19.24|PyQt5-5.15.1" \
+               pyqt5_android_kviktor.py | head -10 || true
+          echo "================================================================"
+
+          # SIP: pypi.org/packages/source/s/sip/sip-X  ->  distfiles.macports.org/py-sip/sip-X
+          sed -i 's|https://pypi.org/packages/source/s/sip/sip-|https://distfiles.macports.org/py-sip/sip-|g' \
+              pyqt5_android_kviktor.py
+
+          # PyQt5: same pattern (if present in the script — sed is a no-op if not).
+          # PyPI uses lowercase /p/ in old URLs but the tarball is PyQt5-X.tar.gz.
+          sed -i 's|https://pypi.org/packages/source/p/PyQt5/PyQt5-|https://distfiles.macports.org/py-pyqt5/PyQt5-|g' \
+              pyqt5_android_kviktor.py
+          sed -i 's|https://pypi.org/packages/source/P/PyQt5/PyQt5-|https://distfiles.macports.org/py-pyqt5/PyQt5-|g' \
+              pyqt5_android_kviktor.py
+
+          echo "After patch:"
+          grep -nE "distfiles\.macports|pypi\.org/packages|sip-4.19.24|PyQt5-5.15.1" \
+               pyqt5_android_kviktor.py | head -10 || true
+          echo "================================================================"
+
+          # ── (2) Pre-download SIP into the project's sources/ dir ──
+          # The kviktor script downloads sources to /work/<projname>/sources/.
+          # If the file is already there, the script skips downloading it.
+          # We try 3 mirrors with fallback.
+          SOURCES_DIR="$PROJ_DIR/sources"
+          mkdir -p "$SOURCES_DIR"
+          SIP_FILE="$SOURCES_DIR/sip-4.19.24.tar.gz"
+          MIN_SIP_BYTES=$((900 * 1024))   # SIP 4.19.24 is ~1 MB
+
+          SIP_MIRRORS=(
+              "https://distfiles.macports.org/py-sip/sip-4.19.24.tar.gz"
+              "https://sourceforge.net/projects/pyqt/files/sip/sip-4.19.24/sip-4.19.24.tar.gz/download"
+          )
+          for url in "${SIP_MIRRORS[@]}"; do
+              echo "  Trying SIP mirror: $url"
+              if curl -L --fail --retry 2 --max-time 60 -A 'Mozilla/5.0' \
+                      -o "$SIP_FILE" "$url"; then
+                  size=$(stat -c %s "$SIP_FILE")
+                  if [ "$size" -ge "$MIN_SIP_BYTES" ]; then
+                      echo "  ✓ Got SIP from $url ($size bytes)"
+                      break
+                  else
+                      echo "  ! Too small ($size bytes), trying next"
+                      rm -f "$SIP_FILE"
+                  fi
+              fi
+          done
+
+          if [ ! -f "$SIP_FILE" ] || [ "$(stat -c %s "$SIP_FILE")" -lt "$MIN_SIP_BYTES" ]; then
+              echo "::warning::Could not pre-download SIP — kviktor will try its patched URL"
+          else
+              echo "  Pre-downloaded $SIP_FILE"
+              echo "  SHA256: $(sha256sum "$SIP_FILE" | awk '{print $1}')"
+          fi
+
+          echo "================================================================"
+          echo "Patched script SHA256: $(sha256sum pyqt5_android_kviktor.py | awk '{print $1}')"
+
       - name: Run kviktor builder inside container
         run: |
           set -o pipefail
