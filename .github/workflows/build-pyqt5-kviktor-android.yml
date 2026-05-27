@@ -379,6 +379,80 @@ jobs:
           echo "================================================================"
           echo "Patched script SHA256: $(sha256sum pyqt5_android_kviktor.py | awk '{print $1}')"
 
+      - name: Pre-create sysroot.json with the correct pyqtdeploy 2.5.1 schema
+        # The kviktor script the user has (pyqt5_android_kviktor.py) generates
+        # a sysroot.json with INVENTED option names like "android_api",
+        # "install_from_source", "target_arch_abi", "standard_library", etc.
+        # pyqtdeploy 2.5.1's actual schema is COMPLETELY DIFFERENT -- it uses
+        # target-prefix keys like "android|macos|win#openssl" and only
+        # accepts a small fixed set of options per component (as defined in
+        # ComponentOption lists inside each plugin file).
+        #
+        # The canonical schema is the one in the kviktor reference repo at
+        #     github.com/kviktor/pyqtdeploy-android-build/example/sysroot.json
+        # which is what we replicate here.
+        #
+        # Trick: the kviktor script generate_sysroot function has this at
+        # the top:
+        #     if exists(cfg.sysroot_json):
+        #         log.info("  Delete it to regenerate, or edit manually.")
+        #         return
+        # So if we pre-create sysroot.json before running kviktor, the
+        # script SKIPS its own (broken) generation step.  All other steps
+        # (app.pdy, android assets, sysroot build) run normally with our
+        # correct JSON.
+        env:
+          SYSROOT_OUT: ${{ github.workspace }}
+        run: |
+          set -e
+          SYSROOT_JSON_PATH="${GITHUB_WORKSPACE}/${PROJ_DIR}/sysroot.json"
+          mkdir -p "$(dirname "$SYSROOT_JSON_PATH")"
+
+          OUT="$SYSROOT_JSON_PATH" python3 - <<'PYEOF'
+          import json, os
+          sysroot = {
+              "Description": "pyqtdeploy 2.5.1 sysroot for PyQt5 5.15.1 Android arm64",
+              "android|macos|win#openssl": {
+                  "android#source": "openssl-1.0.2r.tar.gz",
+                  "no_asm":         True
+              },
+              "qt5": {
+                  "android-32#qt_dir":         "android_armv7",
+                  "android-64#qt_dir":         "android_arm64_v8a",
+                  "edition":                   "opensource",
+                  "android|linux#ssl":         "openssl-runtime"
+              },
+              "python": {
+                  "build_host_from_source":   False,
+                  "build_target_from_source": True,
+                  "source":                   "Python-3.7.7.tgz"
+              },
+              "sip": {
+                  "module_name":  "PyQt5.sip",
+                  "source":       "sip-4.19.24.tar.gz"
+              },
+              "pyqt5": {
+                  "android#disabled_features": [
+                      "PyQt_Desktop_OpenGL", "PyQt_Printer", "PyQt_PrintDialog",
+                      "PyQt_PrintPreviewDialog", "PyQt_PrintPreviewWidget"
+                  ],
+                  "android#modules": [
+                      "QtCore", "QtGui", "QtWidgets", "QtNetwork",
+                      "QtPrintSupport", "QtSvg"
+                  ],
+                  "source": "PyQt5-5.15.1.tar.gz"
+              }
+          }
+          with open(os.environ["OUT"], "w") as f:
+              json.dump(sysroot, f, indent=4, sort_keys=True)
+          print("Wrote", os.environ["OUT"])
+          PYEOF
+
+          echo "Pre-created $SYSROOT_JSON_PATH:"
+          cat "$SYSROOT_JSON_PATH"
+          echo
+          python3 -c "import json; d=json.load(open('$SYSROOT_JSON_PATH')); print('Component keys:', sorted(k for k in d.keys() if k != 'Description'))"
+
       - name: Run kviktor builder inside container
         run: |
           set -o pipefail
@@ -491,6 +565,18 @@ jobs:
               printf "Pkg.UserSrc=false\nPkg.Revision=26.1.1\nPkg.Path=tools\nPkg.Desc=Android SDK Tools\n" > "$LEGACY_TOOLS_DIR/source.properties"
               echo "Created stub $LEGACY_TOOLS_DIR/source.properties for pyqtdeploy 2.5.1:"
               cat "$LEGACY_TOOLS_DIR/source.properties"
+
+              # ──────────────────────────────────────────────────────────
+              # Ensure python3 (no version suffix) is on PATH.
+              # ──────────────────────────────────────────────────────────
+              # pyqtdeploy 2.5.1 python plugin looks for "python3" on PATH
+              # when build_host_from_source=false.  We have /usr/local/bin/python3.7
+              # but no python3 symlink, so we create one.
+              if [ ! -x /usr/local/bin/python3 ]; then
+                  ln -sf /usr/local/bin/python3.7 /usr/local/bin/python3
+                  echo "Symlinked /usr/local/bin/python3 -> python3.7"
+              fi
+              /usr/local/bin/python3 --version
 
               cd /work
               # The kviktor script auto-deduces app_name and package_name
