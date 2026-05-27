@@ -413,6 +413,28 @@ jobs:
               # so the builder finds pyqtdeploy-sysroot + pyqtdeploy-build.
               . /root/build-venv/bin/activate
 
+              # ──────────────────────────────────────────────────────────
+              # Create TitleCase aliases for pyqtdeploy plugins.
+              # ──────────────────────────────────────────────────────────
+              # The kviktor sysroot.json uses TitleCase keys:
+              #     "OpenSSL", "Python", "PyQt5", "SIP", "Qt"
+              # but pyqtdeploy 2.5.1 ships its plugins with lowercase filenames:
+              #     openssl.py, python/, pyqt5.py, sip.py, qt5.py
+              # pyqtdeploy does `importlib.import_module(".plugins." + name)`
+              # which is case-sensitive on Linux, so it fails with:
+              #     pyqtdeploy-sysroot: unable to find a plugin for "OpenSSL"
+              # Fix: cp the plugins under TitleCase names so both imports work.
+              # Note: "Qt" maps to qt5.py (not qt.py -- pyqtdeploy 2.5.1
+              # only has the qt5 plugin).
+              PLUGINS_DIR=/root/build-venv/lib/python3.7/site-packages/pyqtdeploy/sysroot/plugins
+              echo "Creating TitleCase plugin aliases in $PLUGINS_DIR"
+              [ -f "$PLUGINS_DIR/openssl.py" ] && cp "$PLUGINS_DIR/openssl.py" "$PLUGINS_DIR/OpenSSL.py"
+              [ -f "$PLUGINS_DIR/sip.py"     ] && cp "$PLUGINS_DIR/sip.py"     "$PLUGINS_DIR/SIP.py"
+              [ -f "$PLUGINS_DIR/pyqt5.py"   ] && cp "$PLUGINS_DIR/pyqt5.py"   "$PLUGINS_DIR/PyQt5.py"
+              [ -f "$PLUGINS_DIR/qt5.py"     ] && cp "$PLUGINS_DIR/qt5.py"     "$PLUGINS_DIR/Qt.py"
+              [ -d "$PLUGINS_DIR/python"     ] && cp -r "$PLUGINS_DIR/python"  "$PLUGINS_DIR/Python"
+              ls -la "$PLUGINS_DIR" | grep -E "OpenSSL|SIP|PyQt5|Qt|Python" || true
+
               cd /work
               # The kviktor script auto-deduces app_name and package_name
               # from project-dir if not supplied; we pass them explicitly.
