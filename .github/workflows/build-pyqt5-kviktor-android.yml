@@ -598,7 +598,18 @@ jobs:
                   entrypoint="", isbundle="0", isconsole="0", ispyqt5="1",
                   name="", script="$APP_DIR/main.py", syspath="")
           qm = ET.SubElement(app, "QMakeConfiguration")
-          qm.text = 'ANDROID_PACKAGE_SOURCE_DIR="$$(APP_DIR)/../android_source"'
+          # NOTE: the kviktor canonical example uses
+          #     ANDROID_PACKAGE_SOURCE_DIR="$$(APP_DIR)/../android_source"
+          # because that example puts main.py in example/app/ and
+          # android_source at example/android_source -- so '..' goes
+          # from app/ up to example/ and into android_source/.
+          # Our layout is FLAT: main.py and android_source/ are BOTH
+          # inside the project dir, so APP_DIR == project_dir and we
+          # do NOT need the '..'.  The kviktor script creates the
+          # android_source dir at $(project_dir)/android_source (see
+          # the Config.android_source_dir property at line 273 of
+          # pyqt5_android_kviktor.py), so this resolves correctly.
+          qm.text = 'ANDROID_PACKAGE_SOURCE_DIR="$$(APP_DIR)/android_source"'
 
           # Application's own (mostly-empty) package: just exclusions.
           app_pkg = ET.SubElement(app, "Package", name="")
