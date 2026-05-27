@@ -466,6 +466,149 @@ jobs:
           echo
           python3 -c "import json; d=json.load(open('$SYSROOT_JSON_PATH')); print('Component keys in dependency order:', [k for k in d.keys() if k != 'Description'])"
 
+      - name: Pre-create app.pdy with the correct pyqtdeploy 2.5.1 schema
+        # Same problem as sysroot.json: the user's kviktor script generates
+        # an app.pdy with WRONG XML root tag (<pyqtdeploy> instead of
+        # <Project>) and invented child tags (<EntryPoint>, <IsPackage>, etc.).
+        # pyqtdeploy 2.5.1 fails with:
+        #     pyqtdeploy-build: The project file is invalid.:
+        #     Unexpected root tag 'pyqtdeploy', 'Project' expected.
+        #
+        # The canonical schema (from the kviktor reference repo's app.pdy)
+        # uses root tag <Project version="7"> with Application/Python/
+        # PyQtModule/StdlibModule/ExternalLib/Package children.
+        #
+        # Trick: kviktor generate_app_pdy starts with
+        #     existing = _glob_dir(cfg.project_dir, '*.pdy')
+        #     if existing:
+        #         log.info('Using existing .pdy: %s', existing[0])
+        #         return
+        # so a pre-created app.pdy causes the broken generator to be
+        # skipped.  We also create a minimal main.py if the user did not
+        # ship one (since kviktor would have created one but it skips
+        # that step too when app.pdy already exists).
+        run: |
+          set -e
+          PROJ_PATH="${GITHUB_WORKSPACE}/${PROJ_DIR}"
+          mkdir -p "$PROJ_PATH"
+
+          # If user has no main.py, create a minimal PyQt5 Hello World so
+          # the build has something to compile.  Once their app exists in
+          # the repo, this branch is a no-op.
+          if [ ! -f "$PROJ_PATH/main.py" ]; then
+              cat > "$PROJ_PATH/main.py" <<'PYEOF'
+          import sys
+          from PyQt5.QtWidgets import QApplication, QLabel
+
+          def main():
+              app = QApplication(sys.argv)
+              label = QLabel("Hello from PyQt5 on Android!")
+              label.show()
+              sys.exit(app.exec_())
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+              echo "Created minimal $PROJ_PATH/main.py (template)"
+          fi
+
+          # Build the correct app.pdy using ElementTree for safety.
+          PROJECT_DIR="$PROJ_PATH" OUT="$PROJ_PATH/app.pdy" python3 - <<'PYEOF'
+          import os
+          from xml.etree import ElementTree as ET
+          from xml.dom import minidom
+
+          proj_dir = os.environ["PROJECT_DIR"]
+
+          # Detect Python files in the project directory.  Skip build/cache dirs.
+          SKIP_DIRS = {"sources", "android_source", "__pycache__", ".git",
+                       "build-android-32", "build-android-64",
+                       "sysroot-android-32", "sysroot-android-64"}
+          files_to_include = []
+          for entry in sorted(os.listdir(proj_dir)):
+              full = os.path.join(proj_dir, entry)
+              if entry.startswith(".") or entry in SKIP_DIRS:
+                  continue
+              if entry.endswith((".pyc", ".pyo", ".pdy")):
+                  continue
+              if os.path.isfile(full) and entry.endswith((".py", ".qml", ".ui", ".json", ".txt")):
+                  files_to_include.append((entry, False))   # (name, isdir)
+              # NOTE: we deliberately do not recurse into subdirectories
+              # for now -- if the user has them, they can add them to the
+              # .pdy manually.  Most simple Qt apps are flat.
+
+          print("Files to include in app.pdy:", files_to_include)
+
+          # Build the XML tree -- match the kviktor canonical example structure.
+          root = ET.Element("Project")
+          root.set("usingdefaultlocations", "1")
+          root.set("version", "7")
+
+          ET.SubElement(root, "Python",
+                  major="3", minor="7", patch="7", platformpython="")
+
+          app = ET.SubElement(root, "Application",
+                  entrypoint="", isbundle="0", isconsole="0", ispyqt5="1",
+                  name="", script="$APP_DIR/main.py", syspath="")
+          qm = ET.SubElement(app, "QMakeConfiguration")
+          qm.text = 'ANDROID_PACKAGE_SOURCE_DIR="$$(APP_DIR)/../android_source"'
+
+          # Application's own (mostly-empty) package: just exclusions.
+          app_pkg = ET.SubElement(app, "Package", name="")
+          for excl in ("*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi",
+                       "__pycache__", "*-info", "EGG_INFO", "*.so"):
+              ET.SubElement(app_pkg, "Exclude", name=excl)
+
+          # PyQt5 modules needed at runtime.
+          for mod in ("QtCore", "QtGui", "QtWidgets", "QtNetwork",
+                      "QtPrintSupport", "QtSvg"):
+              ET.SubElement(root, "PyQtModule", name=mod)
+
+          # Stdlib modules to bundle.
+          for mod in ("ssl", "sysconfig", "zlib"):
+              ET.SubElement(root, "StdlibModule", name=mod)
+
+          # External libs.  For android, zlib is provided by the NDK.
+          ET.SubElement(root, "ExternalLib",
+                  target="android", name="zlib",
+                  defines="", includepath="", libs="-lz")
+          ET.SubElement(root, "ExternalLib",
+                  target="ios", name="ssl",
+                  defines="", includepath="", libs="")
+
+          # Other package: the user's source files.
+          other_pkg = ET.SubElement(root, "Package", name="$APP_DIR")
+          for name, isdir in files_to_include:
+              ET.SubElement(other_pkg, "PackageContent",
+                      included="1",
+                      isdirectory="1" if isdir else "0",
+                      name=name)
+          for excl in ("*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi",
+                       "__pycache__", "*-info", "EGG_INFO", "*.so"):
+              ET.SubElement(other_pkg, "Exclude", name=excl)
+
+          # Write the XML.  pyqtdeploy 2.5.1 is content-driven, not
+          # whitespace-sensitive, so we pretty-print for readability.
+          rough = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+          pretty = minidom.parseString(rough).toprettyxml(indent="    ", encoding="utf-8")
+          with open(os.environ["OUT"], "wb") as f:
+              f.write(pretty)
+          print("Wrote", os.environ["OUT"])
+          PYEOF
+
+          echo "Pre-created $PROJ_PATH/app.pdy:"
+          cat "$PROJ_PATH/app.pdy"
+
+          # Sanity-check the XML parses + has the right root tag
+          python3 -c "
+          import xml.etree.ElementTree as ET
+          t = ET.parse('$PROJ_PATH/app.pdy')
+          r = t.getroot()
+          assert r.tag == 'Project', 'Wrong root tag: ' + r.tag
+          assert r.get('version') == '7', 'Wrong version: ' + r.get('version', '?')
+          print('app.pdy validates: root=' + r.tag + ' version=' + r.get('version'))
+          "
+
       - name: Run kviktor builder inside container
         run: |
           set -o pipefail
