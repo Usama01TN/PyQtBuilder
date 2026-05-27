@@ -1,869 +1,277 @@
-name: build-pyqt5-kviktor-android
-
-# PyQt5 5.15.1 / Python 3.7.7 / Qt 5.13.2 -> Android APK builder.
+# ============================================================================
+#  PyQt5 -> Android APK build workflow
+#  ==================================
 #
-# Wraps the pyqt5_android_kviktor.py orchestrator from
-# https://github.com/kviktor/pyqtdeploy-android-build inside an
-# Ubuntu 20.04 Docker container that has the EXACT preinstalled
-# toolchain the kviktor guide specifies:
+#  Uses the clean pyqt5_android_kviktor.py (which applies its own quirks
+#  and uses the correct pyqtdeploy 2.5.1 schemas).
 #
-#     Qt 5.13.2 Android arm64-v8a   (via aqtinstall)
-#     Android NDK r20b
-#     Android SDK API 28 + build-tools 28.0.3
-#     OpenJDK 8
-#     Python 3.7  (from deadsnakes PPA)
-#     pyqtdeploy 2.5.1
+#  Pipeline:
+#    1. Build the Docker image (Python 3.7, Qt, NDK, SDK, pyqtdeploy venv)
+#    2. Cache the heavy sysroot + source tarballs across runs
+#    3. Download the user's PyQt5 project
+#    4. Invoke the builder INSIDE the container (single step, no patches)
+#    5. Upload the APK artifact
 #
-# The Docker image is heavy (~5-6 GB once built) but cached aggressively
-# via GHA's Docker layer cache.  First run: ~25-30 min.  Subsequent
-# runs: ~5-8 min (image cached, source tarballs cached, only the actual
-# build runs).
-#
-# Total APK output: ~30-40 MB for a hello-world PyQt5 app.
-#
-# Inputs:
-#   project_url     Public URL to a zip containing main.py at root
-#   app_name        Application display name
-#   package_name    Android package id (com.example.X format)
-#   install_apk     Set true to run `adb install` (needs adb USB device,
-#                   so really only useful for self-hosted runners)
+#  This workflow does NOT patch the kviktor script or builders.py, does NOT
+#  pre-create sysroot.json/app.pdy externally, does NOT do case-alias
+#  shenanigans.  All of that is handled by the builder itself.
+# ============================================================================
+name: Build PyQt5 -> Android (v3 / clean builder)
 
 on:
   workflow_dispatch:
     inputs:
       project_url:
-        description: "Public URL to PyQt5 project zip (must contain main.py at root)."
+        description: 'URL to a .zip containing the PyQt5 project (with main.py at root)'
         required: true
-        default: "https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip"
+        default: 'https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip'
       app_name:
-        description: "App display name."
-        required: false
-        default: "TestApp"
+        description: 'App name (Java identifier, e.g. MyApp)'
+        required: true
+        default: 'TestApp'
       package_name:
-        description: "Android package id."
+        description: 'Android package name (e.g. com.example.myapp)'
+        required: true
+        default: 'com.example.testapp'
+      pyqt5_modules:
+        description: 'Comma-separated PyQt5 modules (or blank for default Widgets set)'
         required: false
-        default: "com.example.testapp"
-      jobs:
-        description: "Parallel make jobs (kviktor default: 2)."
+        default: ''
+      force_rebuild_sysroot:
+        description: 'Force full sysroot rebuild (slow, ~30 min)'
         required: false
-        default: "2"
+        default: 'false'
+        type: boolean
+  push:
+    branches: [main, master]
+    paths:
+      - 'pyqt5_android_kviktor.py'
+      - 'Dockerfile.pyqt5-kviktor'
+      - '.github/workflows/build-pyqt5-android-v3.yml'
+
+env:
+  PROJECT_URL:   ${{ github.event.inputs.project_url   || 'https://raw.githubusercontent.com/Usama01TN/PyQtBuilder/main/testapp_qt5.zip' }}
+  APP_NAME:      ${{ github.event.inputs.app_name      || 'TestApp' }}
+  PACKAGE_NAME:  ${{ github.event.inputs.package_name  || 'com.example.testapp' }}
+  PYQT5_MODULES: ${{ github.event.inputs.pyqt5_modules || '' }}
+  FORCE_SYSROOT: ${{ github.event.inputs.force_rebuild_sysroot || 'false' }}
+  PROJ_DIR:      workspace/testapp        # project unpacks here
+  JOBS:          2
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
-    env:
-      PROJECT_URL:  ${{ github.event.inputs.project_url }}
-      APP_NAME:     ${{ github.event.inputs.app_name }}
-      PACKAGE_NAME: ${{ github.event.inputs.package_name }}
-      JOBS:         ${{ github.event.inputs.jobs }}
+    timeout-minutes: 240   # sysroot build can take 30-90 min on first run
+    permissions:
+      contents: read
 
     steps:
+      # =================================================================
+      # 1. Checkout
+      # =================================================================
       - name: Checkout repo (for builder script + Dockerfile)
         uses: actions/checkout@v4
 
       - name: Verify required files are in repo
         run: |
-          MISSING=0
-          for f in pyqt5_android_kviktor.py build_utils.py builders.py Dockerfile.pyqt5-kviktor; do
-            if [ ! -f "$f" ]; then
-              echo "::error::$f missing from repo root."
-              MISSING=$((MISSING+1))
-            fi
+          set -e
+          for f in pyqt5_android_kviktor.py Dockerfile.pyqt5-kviktor; do
+              if [ ! -f "$f" ]; then
+                  echo "::error::Missing required file: $f"
+                  exit 1
+              fi
+              echo "  ok: $f ($(stat -c %s "$f") bytes)"
           done
-          if [ "$MISSING" -gt 0 ]; then
-            echo "::error::Place the listed files at the repo root (next to your workflow YAML) and commit."
-            exit 1
-          fi
-          echo "Builder file checksums (for log traceability):"
-          sha256sum pyqt5_android_kviktor.py build_utils.py builders.py Dockerfile.pyqt5-kviktor
 
+      # =================================================================
+      # 2. Free disk
+      # =================================================================
       - name: Free disk space (Docker image + Qt + NDK need ~15 GB)
         run: |
-          echo "BEFORE:"; df -h /
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
-                      /usr/local/lib/android/sdk \
-                      /opt/hostedtoolcache/CodeQL \
-                      "$AGENT_TOOLSDIRECTORY"
-          sudo apt-get -y purge --auto-remove \
-              azure-cli google-cloud-cli microsoft-edge-stable \
-              google-chrome-stable firefox powershell 2>/dev/null || true
-          docker system prune -af 2>/dev/null || true
-          echo "AFTER:"; df -h /
+          set -e
+          df -h /
+          # Remove the GHA runner's bundled tools we don't need.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+              /usr/local/lib/android/sdk/build-tools /opt/ghc \
+              /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get purge -y --no-install-recommends \
+              azure-cli google-cloud-cli google-chrome-stable \
+              firefox powershell mono-devel 2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean
+          docker image prune -af 2>/dev/null || true
+          df -h /
 
-      - name: Set up Docker Buildx (for GHA layer cache)
+      # =================================================================
+      # 3. Docker setup + build
+      # =================================================================
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute Dockerfile hash (cache invalidation key)
+      - name: Compute Dockerfile hash (for cache key)
         id: dockerhash
         run: |
-          HASH=$(sha256sum Dockerfile.pyqt5-kviktor | awk '{print substr($1, 1, 12)}')
-          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
-          echo "================================================================"
-          echo "  Dockerfile.pyqt5-kviktor SHA256 (first 12): $HASH"
-          echo "  GHA cache key: pyqt5-kviktor-img-$HASH-v2"
-          echo "  This prevents using a cached image from a previous"
-          echo "  (broken) version of the Dockerfile."
-          echo "================================================================"
-          # Print the relevant lines for sanity
-          echo "  apt install block (first 20 lines):"
-          grep -nB0 -A20 "^RUN set -ex" Dockerfile.pyqt5-kviktor | head -25 || true
-          echo "================================================================"
+          HASH=$(sha256sum Dockerfile.pyqt5-kviktor | awk '{print $1}' | cut -c1-12)
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "Dockerfile SHA-12: ${HASH}"
 
       - name: Build pyqt5-kviktor-builder Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile.pyqt5-kviktor
+          file: Dockerfile.pyqt5-kviktor
           tags: pyqt5-kviktor-builder:latest
           load: true
-          # The cache key includes the Dockerfile hash so any change
-          # to the file forces a fresh build.  This prevents BuildKit
-          # from reusing a layer cached from a previous broken version.
-          cache-from: type=gha,scope=pyqt5-kviktor-${{ steps.dockerhash.outputs.hash }}-v2
-          cache-to:   type=gha,mode=max,scope=pyqt5-kviktor-${{ steps.dockerhash.outputs.hash }}-v2
+          cache-from: type=gha,scope=pyqt5-kviktor-${{ steps.dockerhash.outputs.hash }}
+          cache-to:   type=gha,scope=pyqt5-kviktor-${{ steps.dockerhash.outputs.hash }},mode=max
 
       - name: Show Docker image contents
-        run: docker run --rm pyqt5-kviktor-builder
-
-      - name: Extract Qt 5.13.2 Android arm64 as a downloadable tarball
-        # The image bakes Qt 5.13.2 Android arm64-v8a at /root/Qt/5.13.2.
-        # We export it here as a standalone tarball so it can be reused:
-        #
-        #   * As a GHA artifact (downloadable for 90 days)
-        #   * As an attachment to a GitHub Release (permanent mirror)
-        #   * As a manual `--qt-dir` input for future builds that don't
-        #     want to rebuild this entire image (skip the aqtinstall step)
-        #
-        # Tarball is about 1 GB compressed.  We use pigz for parallel
-        # compression if available, otherwise plain gzip.
         run: |
-          mkdir -p artifacts
-          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
-              bash -c '
-                cd /root/Qt && \
-                if command -v pigz >/dev/null; then \
-                  COMPRESS="--use-compress-program=pigz"; \
-                else \
-                  COMPRESS="--gzip"; \
-                fi && \
-                tar -cf /out/qt-5.13.2-android-arm64-v8a.tar.gz \
-                    $COMPRESS 5.13.2/android_arm64_v8a 5.13.2/Src 2>/dev/null \
-                    || tar -czf /out/qt-5.13.2-android-arm64-v8a.tar.gz 5.13.2/android_arm64_v8a
-                # Also dump checksum + manifest of what is inside
-                ls -lh /out/qt-5.13.2-android-arm64-v8a.tar.gz
-                sha256sum /out/qt-5.13.2-android-arm64-v8a.tar.gz | tee /out/qt-5.13.2-android-arm64-v8a.sha256
-                tar tzf /out/qt-5.13.2-android-arm64-v8a.tar.gz | head -20 > /out/qt-5.13.2-android-arm64-v8a.manifest.txt
-                tar tzf /out/qt-5.13.2-android-arm64-v8a.tar.gz | wc -l >> /out/qt-5.13.2-android-arm64-v8a.manifest.txt
-              '
-          ls -lh artifacts/
+          docker run --rm pyqt5-kviktor-builder bash -c '
+              echo "=== image identity ==="
+              cat /etc/os-release | head -3
+              echo
+              echo "=== Python ==="
+              /usr/local/bin/python3.7 --version
+              echo
+              echo "=== build venv ==="
+              ls -la /root/build-venv/bin/ | grep -E "pyqt|python|pip" | head
+              echo
+              echo "=== Qt ==="
+              ls /root/Qt/5.13.2/android_arm64_v8a/bin/ | head -5
+              echo
+              echo "=== NDK ==="
+              cat /root/Android/android-ndk-r20b/source.properties 2>/dev/null || echo "(no source.properties)"
+              echo
+              echo "=== SDK ==="
+              ls /root/Android/tools/
+          '
 
-      - name: Upload Qt 5.13.2 Android arm64 as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: qt-5.13.2-android-arm64-v8a
-          path: |
-            artifacts/qt-5.13.2-android-arm64-v8a.tar.gz
-            artifacts/qt-5.13.2-android-arm64-v8a.sha256
-            artifacts/qt-5.13.2-android-arm64-v8a.manifest.txt
-          retention-days: 90
-          # Don't fail if compression of a partial layout happens (the tar
-          # `|| true` above handles missing optional dirs).
-          if-no-files-found: error
-
-      - name: Extract Android NDK r20b as a downloadable tarball
-        run: |
-          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
-              tar -czf /out/android-ndk-r20b.tar.gz \
-                  -C /root/Android android-ndk-r20b
-          ls -lh artifacts/android-ndk-r20b.tar.gz
-          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
-              bash -c 'sha256sum /out/android-ndk-r20b.tar.gz' \
-              | tee artifacts/android-ndk-r20b.sha256
-
-      - name: Upload Android NDK r20b as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-ndk-r20b
-          path: |
-            artifacts/android-ndk-r20b.tar.gz
-            artifacts/android-ndk-r20b.sha256
-          retention-days: 90
-          if-no-files-found: error
-
-      - name: Extract Android SDK API 28 as a downloadable tarball
-        # SDK is smaller than Qt/NDK (~400 MB) but worth saving for
-        # offline reproducibility.
-        run: |
-          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
-              tar -czf /out/android-sdk-api28.tar.gz \
-                  -C /root/Android tools
-          ls -lh artifacts/android-sdk-api28.tar.gz
-          docker run --rm -v "$(pwd)/artifacts:/out" pyqt5-kviktor-builder \
-              bash -c 'sha256sum /out/android-sdk-api28.tar.gz' \
-              | tee artifacts/android-sdk-api28.sha256
-
-      - name: Upload Android SDK API 28 as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-sdk-api28
-          path: |
-            artifacts/android-sdk-api28.tar.gz
-            artifacts/android-sdk-api28.sha256
-          retention-days: 90
-          if-no-files-found: error
-
-      - name: Cache build artifacts (source tarballs, sysroot, build dirs)
+      # =================================================================
+      # 4. Cache the source tarballs + sysroot across runs
+      # =================================================================
+      # The sysroot dir is hundreds of MB and takes 20-40 min to build.
+      # We cache the user's project dir (where sources/ and sysroot-* live).
+      # Cache key includes the builder script hash so re-running with the
+      # same builder reuses the cache.
+      - name: Cache sources + sysroot
+        id: cache-sysroot
         uses: actions/cache@v4
         with:
-          path: /home/runner/kviktor-cache
-          key: pyqt5-kviktor-${{ hashFiles('pyqt5_android_kviktor.py') }}-v1
+          path: |
+            workspace/testapp/sources
+            workspace/testapp/sysroot-android-64
+          key: pyqt5-sysroot-${{ hashFiles('pyqt5_android_kviktor.py', 'Dockerfile.pyqt5-kviktor') }}-v1
           restore-keys: |
-            pyqt5-kviktor-
+            pyqt5-sysroot-
 
+      # =================================================================
+      # 5. Download user project
+      # =================================================================
       - name: Download user project
         run: |
-          mkdir -p workspace
-          curl -L --fail --retry 3 "$PROJECT_URL" -o project.zip
-          unzip -q -o project.zip -d workspace
-          MAIN_PY=$(find workspace -maxdepth 4 -name main.py -type f | head -1)
-          if [ -z "$MAIN_PY" ]; then
-            echo "::error::No main.py found in project zip"
-            exit 1
-          fi
-          PROJ_DIR=$(dirname "$MAIN_PY")
-          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
-
-          # Print the main.py so we can verify it's actually a PyQt5 app
-          echo "================================================================"
-          echo "  main.py at $MAIN_PY"
-          echo "  ($(stat -c %s "$MAIN_PY") bytes)"
-          echo "================================================================"
-          cat -n "$MAIN_PY"
-          echo "================================================================"
-          echo "  Import scan:"
-          grep -nE "^\s*(from|import)\s+(PyQt5|PySide|PyQt6|PySide2|PySide6)\b" "$MAIN_PY" || \
-              echo "  (no Qt-binding imports found — this app may not be a Qt app)"
-          echo "================================================================"
-
-      - name: Patch broken PyPI download URLs in kviktor script
-        # The kviktor script hardcodes URLs like
-        #     https://pypi.org/packages/source/s/sip/sip-4.19.24.tar.gz
-        # which now return HTTP 404 because PyPI removed the
-        # /packages/source/<letter>/<pkg>/ URL layout years ago (it now
-        # uses files.pythonhosted.org with hash-prefixed paths), and
-        # legacy tarballs like SIP 4.19.24 aren't republished there.
-        #
-        # MacPorts mirrors PyQt/SIP source tarballs at
-        # distfiles.macports.org under /py-<pkgname>/.  We patch in
-        # place before running the builder.
-        #
-        # We also pre-download the SIP tarball into the project's
-        # sources/ directory so that if MacPorts is unreachable, we
-        # already have the file and the kviktor script skips its own
-        # (now patched) download attempt.  Multiple mirrors are tried
-        # with fallback.
-        run: |
           set -e
-
-          # ── (1) sed-patch the URLs in the kviktor script ──
-          echo "Before patch:"
-          grep -nE "pypi\.org/packages|distfiles\.macports|sip-4.19.24|PyQt5-5.15.1" \
-               pyqt5_android_kviktor.py | head -10 || true
-          echo "================================================================"
-
-          # SIP: pypi.org/packages/source/s/sip/sip-X  ->  distfiles.macports.org/py-sip/sip-X
-          sed -i 's|https://pypi.org/packages/source/s/sip/sip-|https://distfiles.macports.org/py-sip/sip-|g' \
-              pyqt5_android_kviktor.py
-
-          # PyQt5: same pattern (if present in the script — sed is a no-op if not).
-          # PyPI uses lowercase /p/ in old URLs but the tarball is PyQt5-X.tar.gz.
-          sed -i 's|https://pypi.org/packages/source/p/PyQt5/PyQt5-|https://distfiles.macports.org/py-pyqt5/PyQt5-|g' \
-              pyqt5_android_kviktor.py
-          sed -i 's|https://pypi.org/packages/source/P/PyQt5/PyQt5-|https://distfiles.macports.org/py-pyqt5/PyQt5-|g' \
-              pyqt5_android_kviktor.py
-
-          echo "After patch:"
-          grep -nE "distfiles\.macports|pypi\.org/packages|sip-4.19.24|PyQt5-5.15.1" \
-               pyqt5_android_kviktor.py | head -10 || true
-          echo "================================================================"
-
-          # ── (2) Pre-download SIP into the project's sources/ dir ──
-          # The kviktor script downloads sources to /work/<projname>/sources/.
-          # If the file is already there, the script skips downloading it.
-          # We try 3 mirrors with fallback.
-          SOURCES_DIR="$PROJ_DIR/sources"
-          mkdir -p "$SOURCES_DIR"
-          SIP_FILE="$SOURCES_DIR/sip-4.19.24.tar.gz"
-          MIN_SIP_BYTES=$((900 * 1024))   # SIP 4.19.24 is ~1 MB
-
-          SIP_MIRRORS=(
-              "https://distfiles.macports.org/py-sip/sip-4.19.24.tar.gz"
-              "https://sourceforge.net/projects/pyqt/files/sip/sip-4.19.24/sip-4.19.24.tar.gz/download"
-          )
-          for url in "${SIP_MIRRORS[@]}"; do
-              echo "  Trying SIP mirror: $url"
-              if curl -L --fail --retry 2 --max-time 60 -A 'Mozilla/5.0' \
-                      -o "$SIP_FILE" "$url"; then
-                  size=$(stat -c %s "$SIP_FILE")
-                  if [ "$size" -ge "$MIN_SIP_BYTES" ]; then
-                      echo "  ✓ Got SIP from $url ($size bytes)"
-                      break
-                  else
-                      echo "  ! Too small ($size bytes), trying next"
-                      rm -f "$SIP_FILE"
-                  fi
-              fi
-          done
-
-          if [ ! -f "$SIP_FILE" ] || [ "$(stat -c %s "$SIP_FILE")" -lt "$MIN_SIP_BYTES" ]; then
-              echo "::warning::Could not pre-download SIP — kviktor will try its patched URL"
-          else
-              echo "  Pre-downloaded $SIP_FILE"
-              echo "  SHA256: $(sha256sum "$SIP_FILE" | awk '{print $1}')"
-          fi
-
-          # ── (3) Patch OpenSSL URL and pre-download ──
-          # The kviktor script downloads OpenSSL from
-          #     https://www.openssl.org/source/old/1.0.2/openssl-1.0.2r.tar.gz
-          # which now returns HTTP 404.  OpenSSL 1.0.2 reached EOL on
-          # 2019-12-31 and the OpenSSL Project pruned their /source/old/
-          # archives.  GitHub Releases mirror the canonical tarballs.
+          mkdir -p "${PROJ_DIR}"
+          echo "Downloading: ${PROJECT_URL}"
+          curl -fL --retry 3 --max-time 120 -o /tmp/project.zip "${PROJECT_URL}"
+          unzip -o /tmp/project.zip -d "${PROJ_DIR}"
           echo
-          echo "Patching OpenSSL URL ..."
-
-          # Replace any flavor of the dead URL.  We match on
-          # "openssl.org/source/" so both /source/old/X.Y/ and the
-          # newer /source/ paths get redirected to GitHub.
-          sed -i 's|https://www.openssl.org/source/old/1.0.2/openssl-|https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2r/openssl-|g' \
-              pyqt5_android_kviktor.py
-          sed -i 's|https://www.openssl.org/source/openssl-1.0.2r|https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2r/openssl-1.0.2r|g' \
-              pyqt5_android_kviktor.py
-
-          echo "OpenSSL URL after patch:"
-          grep -nE "openssl-1.0.2r|openssl\.org/source|openssl/releases" \
-               pyqt5_android_kviktor.py | head -5 || true
-          echo "================================================================"
-
-          OPENSSL_FILE="$SOURCES_DIR/openssl-1.0.2r.tar.gz"
-          MIN_OPENSSL_BYTES=$((4 * 1024 * 1024))  # OpenSSL 1.0.2r is ~5 MB
-
-          OPENSSL_MIRRORS=(
-              "https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2r/openssl-1.0.2r.tar.gz"
-              "https://distfiles.macports.org/openssl10/openssl-1.0.2r.tar.gz"
-              "https://artfiles.org/openssl.org/source/old/1.0.2/openssl-1.0.2r.tar.gz"
-          )
-          for url in "${OPENSSL_MIRRORS[@]}"; do
-              echo "  Trying OpenSSL mirror: $url"
-              if curl -L --fail --retry 2 --max-time 120 -A 'Mozilla/5.0' \
-                      -o "$OPENSSL_FILE" "$url"; then
-                  size=$(stat -c %s "$OPENSSL_FILE")
-                  if [ "$size" -ge "$MIN_OPENSSL_BYTES" ]; then
-                      echo "  ✓ Got OpenSSL from $url ($size bytes)"
-                      break
-                  else
-                      echo "  ! Too small ($size bytes), trying next"
-                      rm -f "$OPENSSL_FILE"
-                  fi
-              fi
-          done
-
-          if [ ! -f "$OPENSSL_FILE" ] || [ "$(stat -c %s "$OPENSSL_FILE")" -lt "$MIN_OPENSSL_BYTES" ]; then
-              echo "::warning::Could not pre-download OpenSSL — kviktor will try its patched URL"
-          else
-              echo "  Pre-downloaded $OPENSSL_FILE"
-              echo "  SHA256: $(sha256sum "$OPENSSL_FILE" | awk '{print $1}')"
-          fi
-
-          echo "================================================================"
-          echo "Patched script SHA256: $(sha256sum pyqt5_android_kviktor.py | awk '{print $1}')"
-
-      - name: Patch the str.rstrip(".exe") bug in builders.py
-        # builders.py:41 has this bug:
-        #     name = '{}{}'.format(name.rstrip('.exe'), '.exe' if ... else '')
-        # str.rstrip() does NOT strip a suffix -- it strips any of the
-        # CHARACTERS in its argument from the right end.  So
-        #     'make'.rstrip('.exe')  ==>  'mak'    (trailing 'e' is in the set)
-        #     'git'.rstrip('.exe')   ==>  'git'    (no chars in set at end)
-        #     'cmake'.rstrip('.exe') ==>  'cmak'   (trailing 'e' stripped)
-        # Result: every executable ending in 'e' loses its 'e' on Linux,
-        # which causes the kviktor script to try to run "/work/mak -j2"
-        # instead of "make -j2", failing with FileNotFoundError.
-        #
-        # The fix is to use a proper suffix check.  Python 3.9 has
-        # str.removesuffix() but we target Python 3.7, so we use
-        # an endswith + slicing pattern.
-        run: |
-          set -e
-          if [ ! -f builders.py ]; then
-              echo "::warning::builders.py not found in workspace -- skipping patch"
-              exit 0
-          fi
-          echo "Before patch:"
-          grep -n "rstrip" builders.py || true
-          echo "================================================================"
-
-          python3 <<'PYEOF'
-          with open("builders.py", "r") as f:
-              content = f.read()
-          before = content
-          content = content.replace(
-              "name.rstrip('.exe')",
-              "(name[:-4] if name.lower().endswith('.exe') else name)"
-          )
-          if content == before:
-              print("::warning::No rstrip('.exe') pattern found in builders.py -- already patched?")
-          else:
-              with open("builders.py", "w") as f:
-                  f.write(content)
-              print("Patched", content.count("name.lower().endswith('.exe')"),
-                    "occurrences of rstrip('.exe') in builders.py")
-          PYEOF
-
-          echo "After patch:"
-          grep -n "endswith\|rstrip" builders.py | head
-          echo "================================================================"
-          echo "Patched builders.py SHA256: $(sha256sum builders.py | awk '{print $1}')"
-
-      - name: Pre-create sysroot.json with the correct pyqtdeploy 2.5.1 schema
-        # The kviktor script the user has (pyqt5_android_kviktor.py) generates
-        # a sysroot.json with INVENTED option names like "android_api",
-        # "install_from_source", "target_arch_abi", "standard_library", etc.
-        # pyqtdeploy 2.5.1's actual schema is COMPLETELY DIFFERENT -- it uses
-        # target-prefix keys like "android|macos|win#openssl" and only
-        # accepts a small fixed set of options per component (as defined in
-        # ComponentOption lists inside each plugin file).
-        #
-        # The canonical schema is the one in the kviktor reference repo at
-        #     github.com/kviktor/pyqtdeploy-android-build/example/sysroot.json
-        # which is what we replicate here.
-        #
-        # Trick: the kviktor script generate_sysroot function has this at
-        # the top:
-        #     if exists(cfg.sysroot_json):
-        #         log.info("  Delete it to regenerate, or edit manually.")
-        #         return
-        # So if we pre-create sysroot.json before running kviktor, the
-        # script SKIPS its own (broken) generation step.  All other steps
-        # (app.pdy, android assets, sysroot build) run normally with our
-        # correct JSON.
-        env:
-          SYSROOT_OUT: ${{ github.workspace }}
-        run: |
-          set -e
-          SYSROOT_JSON_PATH="${GITHUB_WORKSPACE}/${PROJ_DIR}/sysroot.json"
-          mkdir -p "$(dirname "$SYSROOT_JSON_PATH")"
-
-          OUT="$SYSROOT_JSON_PATH" python3 - <<'PYEOF'
-          import json, os
-          # IMPORTANT: order matters!  pyqtdeploy 2.5.1 iterates components in
-          # JSON-key order during the sysroot build.  Components that depend
-          # on others must come AFTER their dependencies:
-          #     openssl -- independent
-          #     qt5     -- independent
-          #     python  -- depends on openssl (for the ssl module)
-          #     sip     -- depends on python
-          #     pyqt5   -- depends on sip + qt5
-          # If we serialised with sort_keys=True, alphabetical order puts
-          # "pyqt5" before "sip", and pyqtdeploy fails with:
-          #     "the sysroot specification must contain an entry for 'sip'
-          #      before anything that depends on it"
-          # Python 3.7+ dicts preserve insertion order, so we just write
-          # the dict in the right order and pass sort_keys=False.
-          sysroot = {}
-          sysroot["Description"] = "pyqtdeploy 2.5.1 sysroot for PyQt5 5.15.1 Android arm64"
-          sysroot["android|macos|win#openssl"] = {
-              "android#source": "openssl-1.0.2r.tar.gz",
-              "no_asm":         True
-          }
-          sysroot["qt5"] = {
-              "android-32#qt_dir":         "android_armv7",
-              "android-64#qt_dir":         "android_arm64_v8a",
-              "edition":                   "opensource",
-              "android|linux#ssl":         "openssl-runtime"
-          }
-          sysroot["python"] = {
-              "build_host_from_source":   False,
-              "build_target_from_source": True,
-              "source":                   "Python-3.7.7.tgz"
-          }
-          sysroot["sip"] = {
-              "module_name":  "PyQt5.sip",
-              "source":       "sip-4.19.24.tar.gz"
-          }
-          sysroot["pyqt5"] = {
-              "android#disabled_features": [
-                  "PyQt_Desktop_OpenGL", "PyQt_Printer", "PyQt_PrintDialog",
-                  "PyQt_PrintPreviewDialog", "PyQt_PrintPreviewWidget"
-              ],
-              "android#modules": [
-                  "QtCore", "QtGui", "QtWidgets", "QtNetwork",
-                  "QtPrintSupport", "QtSvg"
-              ],
-              "source": "PyQt5-5.15.1.tar.gz"
-          }
-          with open(os.environ["OUT"], "w") as f:
-              json.dump(sysroot, f, indent=4, sort_keys=False)
-          print("Wrote", os.environ["OUT"])
-          PYEOF
-
-          echo "Pre-created $SYSROOT_JSON_PATH:"
-          cat "$SYSROOT_JSON_PATH"
+          echo "Project contents:"
+          find "${PROJ_DIR}" -maxdepth 3 -not -path '*sources*' \
+              -not -path '*sysroot-*' -not -path '*build-*' | sort
           echo
-          python3 -c "import json; d=json.load(open('$SYSROOT_JSON_PATH')); print('Component keys in dependency order:', [k for k in d.keys() if k != 'Description'])"
-
-      - name: Pre-create app.pdy with the correct pyqtdeploy 2.5.1 schema
-        # Same problem as sysroot.json: the user's kviktor script generates
-        # an app.pdy with WRONG XML root tag (<pyqtdeploy> instead of
-        # <Project>) and invented child tags (<EntryPoint>, <IsPackage>, etc.).
-        # pyqtdeploy 2.5.1 fails with:
-        #     pyqtdeploy-build: The project file is invalid.:
-        #     Unexpected root tag 'pyqtdeploy', 'Project' expected.
-        #
-        # The canonical schema (from the kviktor reference repo's app.pdy)
-        # uses root tag <Project version="7"> with Application/Python/
-        # PyQtModule/StdlibModule/ExternalLib/Package children.
-        #
-        # Trick: kviktor generate_app_pdy starts with
-        #     existing = _glob_dir(cfg.project_dir, '*.pdy')
-        #     if existing:
-        #         log.info('Using existing .pdy: %s', existing[0])
-        #         return
-        # so a pre-created app.pdy causes the broken generator to be
-        # skipped.  We also create a minimal main.py if the user did not
-        # ship one (since kviktor would have created one but it skips
-        # that step too when app.pdy already exists).
-        run: |
-          set -e
-          PROJ_PATH="${GITHUB_WORKSPACE}/${PROJ_DIR}"
-          mkdir -p "$PROJ_PATH"
-
-          # If user has no main.py, create a minimal PyQt5 Hello World so
-          # the build has something to compile.  Once their app exists in
-          # the repo, this branch is a no-op.
-          if [ ! -f "$PROJ_PATH/main.py" ]; then
-              cat > "$PROJ_PATH/main.py" <<'PYEOF'
-          import sys
-          from PyQt5.QtWidgets import QApplication, QLabel
-
-          def main():
-              app = QApplication(sys.argv)
-              label = QLabel("Hello from PyQt5 on Android!")
-              label.show()
-              sys.exit(app.exec_())
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-              echo "Created minimal $PROJ_PATH/main.py (template)"
+          echo "main.py preview:"
+          if [ -f "${PROJ_DIR}/main.py" ]; then
+              head -20 "${PROJ_DIR}/main.py"
+          else
+              echo "(no main.py at project root -- builder will create a template)"
           fi
 
-          # Build the correct app.pdy using ElementTree for safety.
-          PROJECT_DIR="$PROJ_PATH" OUT="$PROJ_PATH/app.pdy" python3 - <<'PYEOF'
-          import os
-          from xml.etree import ElementTree as ET
-          from xml.dom import minidom
-
-          proj_dir = os.environ["PROJECT_DIR"]
-
-          # Detect Python files in the project directory.  Skip build/cache dirs.
-          SKIP_DIRS = {"sources", "android_source", "__pycache__", ".git",
-                       "build-android-32", "build-android-64",
-                       "sysroot-android-32", "sysroot-android-64"}
-          files_to_include = []
-          for entry in sorted(os.listdir(proj_dir)):
-              full = os.path.join(proj_dir, entry)
-              if entry.startswith(".") or entry in SKIP_DIRS:
-                  continue
-              if entry.endswith((".pyc", ".pyo", ".pdy")):
-                  continue
-              if os.path.isfile(full) and entry.endswith((".py", ".qml", ".ui", ".json", ".txt")):
-                  files_to_include.append((entry, False))   # (name, isdir)
-              # NOTE: we deliberately do not recurse into subdirectories
-              # for now -- if the user has them, they can add them to the
-              # .pdy manually.  Most simple Qt apps are flat.
-
-          print("Files to include in app.pdy:", files_to_include)
-
-          # Build the XML tree -- match the kviktor canonical example structure.
-          root = ET.Element("Project")
-          root.set("usingdefaultlocations", "1")
-          root.set("version", "7")
-
-          ET.SubElement(root, "Python",
-                  major="3", minor="7", patch="7", platformpython="")
-
-          app = ET.SubElement(root, "Application",
-                  entrypoint="", isbundle="0", isconsole="0", ispyqt5="1",
-                  name="", script="$APP_DIR/main.py", syspath="")
-          qm = ET.SubElement(app, "QMakeConfiguration")
-          # NOTE: the kviktor canonical example uses
-          #     ANDROID_PACKAGE_SOURCE_DIR="$$(APP_DIR)/../android_source"
-          # because that example puts main.py in example/app/ and
-          # android_source at example/android_source -- so '..' goes
-          # from app/ up to example/ and into android_source/.
-          # Our layout is FLAT: main.py and android_source/ are BOTH
-          # inside the project dir, so APP_DIR == project_dir and we
-          # do NOT need the '..'.  The kviktor script creates the
-          # android_source dir at $(project_dir)/android_source (see
-          # the Config.android_source_dir property at line 273 of
-          # pyqt5_android_kviktor.py), so this resolves correctly.
-          qm.text = 'ANDROID_PACKAGE_SOURCE_DIR="$$(APP_DIR)/android_source"'
-
-          # Application's own (mostly-empty) package: just exclusions.
-          app_pkg = ET.SubElement(app, "Package", name="")
-          for excl in ("*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi",
-                       "__pycache__", "*-info", "EGG_INFO", "*.so"):
-              ET.SubElement(app_pkg, "Exclude", name=excl)
-
-          # PyQt5 modules needed at runtime.
-          for mod in ("QtCore", "QtGui", "QtWidgets", "QtNetwork",
-                      "QtPrintSupport", "QtSvg"):
-              ET.SubElement(root, "PyQtModule", name=mod)
-
-          # Stdlib modules to bundle.
-          for mod in ("ssl", "sysconfig", "zlib"):
-              ET.SubElement(root, "StdlibModule", name=mod)
-
-          # External libs.  For android, zlib is provided by the NDK.
-          ET.SubElement(root, "ExternalLib",
-                  target="android", name="zlib",
-                  defines="", includepath="", libs="-lz")
-          ET.SubElement(root, "ExternalLib",
-                  target="ios", name="ssl",
-                  defines="", includepath="", libs="")
-
-          # Other package: the user's source files.
-          other_pkg = ET.SubElement(root, "Package", name="$APP_DIR")
-          for name, isdir in files_to_include:
-              ET.SubElement(other_pkg, "PackageContent",
-                      included="1",
-                      isdirectory="1" if isdir else "0",
-                      name=name)
-          for excl in ("*.pyc", "*.pyd", "*.pyo", "*.pyx", "*.pxi",
-                       "__pycache__", "*-info", "EGG_INFO", "*.so"):
-              ET.SubElement(other_pkg, "Exclude", name=excl)
-
-          # Write the XML.  pyqtdeploy 2.5.1 is content-driven, not
-          # whitespace-sensitive, so we pretty-print for readability.
-          rough = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-          pretty = minidom.parseString(rough).toprettyxml(indent="    ", encoding="utf-8")
-          with open(os.environ["OUT"], "wb") as f:
-              f.write(pretty)
-          print("Wrote", os.environ["OUT"])
-          PYEOF
-
-          echo "Pre-created $PROJ_PATH/app.pdy:"
-          cat "$PROJ_PATH/app.pdy"
-
-          # Sanity-check the XML parses + has the right root tag
-          python3 -c "
-          import xml.etree.ElementTree as ET
-          t = ET.parse('$PROJ_PATH/app.pdy')
-          r = t.getroot()
-          assert r.tag == 'Project', 'Wrong root tag: ' + r.tag
-          assert r.get('version') == '7', 'Wrong version: ' + r.get('version', '?')
-          print('app.pdy validates: root=' + r.tag + ' version=' + r.get('version'))
-          "
-
-      - name: Run kviktor builder inside container
+      # =================================================================
+      # 6. Run the builder
+      # =================================================================
+      # ONE step.  The builder script handles its own SDK quirks,
+      # source download fallbacks, config generation, compilation,
+      # packaging, and APK location.
+      - name: Build APK
+        id: build
         run: |
           set -o pipefail
-          mkdir -p /home/runner/kviktor-cache /home/runner/kviktor-output
+          mkdir -p /home/runner/apk-output
 
-          # Mount:
-          #   /work          -> the GHA workspace (where our scripts + project live)
-          #   /cache         -> persistent cache (source tarballs, build dirs)
-          #   /output        -> where the APK gets copied at the end
+          # Build args for the builder
+          FORCE_ARG=""
+          if [ "${FORCE_SYSROOT}" = "true" ]; then
+              FORCE_ARG="--force"
+              echo "::notice::Forced sysroot rebuild requested (will take ~30 min)"
+          fi
+          PYQT5_ARG=""
+          if [ -n "${PYQT5_MODULES}" ]; then
+              PYQT5_ARG="--pyqt5-modules ${PYQT5_MODULES}"
+          fi
+
           docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/work" \
-            -v "/home/runner/kviktor-cache:/cache" \
-            -v "/home/runner/kviktor-output:/output" \
-            -w /work \
-            -e JOBS="$JOBS" \
-            pyqt5-kviktor-builder \
-            bash -c '
-              set -e
-              # The kviktor script defaults to ~/Qt and ~/Android which already
-              # exist in our image (installed in the Dockerfile).  We override
-              # nothing; the defaults match the image layout exactly.
-
-              # The kviktor builder writes intermediate state to its own
-              # workspace dir.  Symlink that under /cache so it survives
-              # between runs.
-              KVIKTOR_WORK="/root/.cache/pyqt5-kviktor-build"
-              mkdir -p /cache/kviktor-work
-              rm -rf "$KVIKTOR_WORK"
-              ln -s /cache/kviktor-work "$KVIKTOR_WORK"
-
-              # Activate the prebuilt venv (image has pyqtdeploy 2.5.1 in there)
-              # so the builder finds pyqtdeploy-sysroot + pyqtdeploy-build.
-              . /root/build-venv/bin/activate
-
-              # ──────────────────────────────────────────────────────────
-              # Make the kviktor venv reuse our pre-built one (via symlink)
-              # ──────────────────────────────────────────────────────────
-              # IMPORTANT: the kviktor script creates its OWN venv at
-              # /root/.pyqt5_android_kviktor/venv -- it ignores any venv
-              # we pre-built elsewhere.  Look at lines 185-187 + 468-472
-              # of pyqt5_android_kviktor.py:
-              #     base = join(_HOME, ".pyqt5_android_kviktor")
-              #     self.venv_dir = join(base, "venv")
-              #     ...
-              #     if exists(cfg.venv_dir):
-              #         log.info("Reusing venv: %s", cfg.venv_dir)
-              #     else:
-              #         create(cfg.venv_dir, with_pip=True, clear=True)
-              #
-              # If the path already exists, kviktor reuses it.  So we
-              # symlink the kviktor venv path -> our pre-built /root/build-venv.
-              # The setup_venv step in kviktor then sees "Reusing venv" and
-              # skips re-creation.  Its pip install still runs (which may
-              # downgrade PyQt5 from 5.15.7 -> 5.15.1 to match the kviktor
-              # expected version), but that succeeds quickly and preserves
-              # our case-aliased plugins.
-              mkdir -p /root/.pyqt5_android_kviktor
-              if [ ! -e /root/.pyqt5_android_kviktor/venv ]; then
-                  ln -sfn /root/build-venv /root/.pyqt5_android_kviktor/venv
-                  echo "Symlinked /root/.pyqt5_android_kviktor/venv -> /root/build-venv"
-              fi
-              ls -ld /root/.pyqt5_android_kviktor/venv
-
-              # ──────────────────────────────────────────────────────────
-              # Create TitleCase aliases for pyqtdeploy plugins.
-              # ──────────────────────────────────────────────────────────
-              # The kviktor sysroot.json uses TitleCase keys:
-              #     "OpenSSL", "Python", "PyQt5", "SIP", "Qt"
-              # but pyqtdeploy 2.5.1 ships its plugins with lowercase filenames:
-              #     openssl.py, python/, pyqt5.py, sip.py, qt5.py
-              # pyqtdeploy does `importlib.import_module(".plugins." + name)`
-              # which is case-sensitive on Linux, so it fails with:
-              #     pyqtdeploy-sysroot: unable to find a plugin for "OpenSSL"
-              # Fix: cp the plugins under TitleCase names so both imports work.
-              # Note: "Qt" maps to qt5.py (not qt.py -- pyqtdeploy 2.5.1
-              # only has the qt5 plugin).
-              #
-              # Because of the symlink above, the aliases apply to BOTH paths.
-              PLUGINS_DIR=/root/build-venv/lib/python3.7/site-packages/pyqtdeploy/sysroot/plugins
-              echo "Creating TitleCase plugin aliases in $PLUGINS_DIR"
-              [ -f "$PLUGINS_DIR/openssl.py" ] && [ ! -f "$PLUGINS_DIR/OpenSSL.py" ] && cp "$PLUGINS_DIR/openssl.py" "$PLUGINS_DIR/OpenSSL.py"
-              [ -f "$PLUGINS_DIR/sip.py"     ] && [ ! -f "$PLUGINS_DIR/SIP.py"     ] && cp "$PLUGINS_DIR/sip.py"     "$PLUGINS_DIR/SIP.py"
-              [ -f "$PLUGINS_DIR/pyqt5.py"   ] && [ ! -f "$PLUGINS_DIR/PyQt5.py"   ] && cp "$PLUGINS_DIR/pyqt5.py"   "$PLUGINS_DIR/PyQt5.py"
-              [ -f "$PLUGINS_DIR/qt5.py"     ] && [ ! -f "$PLUGINS_DIR/Qt.py"      ] && cp "$PLUGINS_DIR/qt5.py"     "$PLUGINS_DIR/Qt.py"
-              [ -d "$PLUGINS_DIR/python"     ] && [ ! -d "$PLUGINS_DIR/Python"     ] && cp -r "$PLUGINS_DIR/python"  "$PLUGINS_DIR/Python"
-              echo "Plugin files in $PLUGINS_DIR:"
-              ls "$PLUGINS_DIR" | grep -E "OpenSSL|SIP|PyQt5|Python|Qt" || true
-
-              # ──────────────────────────────────────────────────────────
-              # Create the legacy tools/source.properties stub.
-              # ──────────────────────────────────────────────────────────
-              # pyqtdeploy 2.5.1 platforms.py:508 hardcodes a check for
-              #     $ANDROID_SDK_ROOT/tools/source.properties
-              # (see the source: it does
-              #      source_properties = os.path.join(self.sdk_root, "tools",
-              #                                       "source.properties"))
-              # This was the legacy "Android SDK Tools" package, deprecated
-              # by Google in 2021 and replaced with cmdline-tools.  Modern
-              # SDKs (like the one we install via sdkmanager) do not ship
-              # the legacy tools/ subdir, so pyqtdeploy fails with:
-              #   "..tools/source.properties" does not exist, make sure
-              #    ANDROID_SDK_ROOT is set correctly
-              #
-              # The _get_version function in pyqtdeploy reads ONLY the
-              # "Pkg.Revision = X.Y.Z" line.  Stubbing that with the last
-              # legacy tools version (26.1.1, Sept 2017) satisfies the check.
-              SDK_ROOT=/root/Android/tools
-              LEGACY_TOOLS_DIR="$SDK_ROOT/tools"
-              mkdir -p "$LEGACY_TOOLS_DIR"
-              printf "Pkg.UserSrc=false\nPkg.Revision=26.1.1\nPkg.Path=tools\nPkg.Desc=Android SDK Tools\n" > "$LEGACY_TOOLS_DIR/source.properties"
-              echo "Created stub $LEGACY_TOOLS_DIR/source.properties for pyqtdeploy 2.5.1:"
-              cat "$LEGACY_TOOLS_DIR/source.properties"
-
-              # ──────────────────────────────────────────────────────────
-              # Ensure python3 (no version suffix) is on PATH.
-              # ──────────────────────────────────────────────────────────
-              # pyqtdeploy 2.5.1 python plugin looks for "python3" on PATH
-              # when build_host_from_source=false.  We have /usr/local/bin/python3.7
-              # but no python3 symlink, so we create one.
-              if [ ! -x /usr/local/bin/python3 ]; then
-                  ln -sf /usr/local/bin/python3.7 /usr/local/bin/python3
-                  echo "Symlinked /usr/local/bin/python3 -> python3.7"
-              fi
-              /usr/local/bin/python3 --version
-
-              cd /work
-              # The kviktor script auto-deduces app_name and package_name
-              # from project-dir if not supplied; we pass them explicitly.
-              python3.7 pyqt5_android_kviktor.py \
-                  --project-dir   "/work/'"$PROJ_DIR"'" \
-                  --app-name      "'"$APP_NAME"'" \
-                  --package-name  "'"$PACKAGE_NAME"'" \
-                  --qt-dir        "/root/Qt/5.13.2" \
-                  --ndk-path      "/root/Android/android-ndk-r20b" \
-                  --sdk-path      "/root/Android/tools" \
-                  --jobs          "$JOBS" \
+              -v "${GITHUB_WORKSPACE}:/work" \
+              -v "/home/runner/apk-output:/output" \
+              -w /work \
+              -e LANG=C.UTF-8 \
+              pyqt5-kviktor-builder \
+              /usr/local/bin/python3.7 /work/pyqt5_android_kviktor.py \
+                  --project-dir   "/work/${PROJ_DIR}" \
+                  --app-name      "${APP_NAME}" \
+                  --package-name  "${PACKAGE_NAME}" \
+                  --output-dir    "/output" \
+                  --jobs          "${JOBS}" \
+                  ${PYQT5_ARG} \
+                  ${FORCE_ARG} \
                   --verbose \
-                  2>&1 | tee /work/build.log
+              2>&1 | tee /home/runner/apk-output/build.log
 
-              # ──────────────────────────────────────────────────────────
-              # Find + copy the APK out to /output (mounted to the host).
-              # ──────────────────────────────────────────────────────────
-              # The kviktor script (see Step 13 summary log) reports the
-              # APK at:
-              #     /work/workspace/<projname>/build-android-64/app/build/outputs/apk/debug/app-debug.apk
-              # We search the entire build dir tree as a robust fallback
-              # in case the structure differs.  We also rename the file
-              # to ${APP_NAME}-debug.apk so the artifact is identifiable.
-              echo "Searching for APK in /work/workspace and /work ..."
-
-              APK=$(find /work/workspace -name "*.apk" -type f 2>/dev/null \
-                    | grep -E "debug.*\.apk$|app-debug\.apk$" \
-                    | head -1)
-
-              if [ -z "$APK" ]; then
-                  # Fallback: any .apk in the workspace
-                  APK=$(find /work -name "*.apk" -type f 2>/dev/null | head -1)
-              fi
-
-              if [ -z "$APK" ]; then
-                  echo "::error::Builder reported success but no APK was found"
-                  echo "Diagnostic: contents of build-android-64/app/build/outputs:"
-                  find /work/workspace -type d -name outputs 2>/dev/null | while read d; do
-                      echo "  $d:"
-                      ls -laR "$d" 2>/dev/null | head -30
-                  done
-                  exit 1
-              fi
-
-              echo "Found APK: $APK ($(stat -c %s "$APK") bytes)"
-              # Rename to a friendly artifact name
-              DEST="/output/'"$APP_NAME"'-debug.apk"
-              cp "$APK" "$DEST"
-              echo "✓ APK copied to $DEST"
-              ls -la /output/
-            '
-
+      # =================================================================
+      # 7. Verify + upload
+      # =================================================================
       - name: Verify APK output
         if: success()
-        id: locate
         run: |
-          APK=$(find /home/runner/kviktor-output -name "*.apk" -type f | head -1)
-          if [ -z "$APK" ]; then
-            echo "::error::No APK in /home/runner/kviktor-output/"
-            exit 1
+          set -e
+          OUTPUT_DIR=/home/runner/apk-output
+          echo "Contents of ${OUTPUT_DIR}:"
+          ls -la "${OUTPUT_DIR}/"
+
+          APK="${OUTPUT_DIR}/${APP_NAME}-debug.apk"
+          if [ ! -f "${APK}" ]; then
+              echo "::error::Expected APK not found: ${APK}"
+              echo "Available .apk files:"
+              find "${OUTPUT_DIR}" -name "*.apk" 2>/dev/null || true
+              exit 1
           fi
-          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
-          ls -lh "$APK"
-          file "$APK"
-          unzip -l "$APK" | head -30
+          SIZE=$(stat -c %s "${APK}")
+          SHA=$(sha256sum "${APK}" | awk '{print $1}')
+          echo "  APK:    ${APK}"
+          echo "  Size:   ${SIZE} bytes ($((SIZE / 1024 / 1024)) MB)"
+          echo "  SHA256: ${SHA}"
+
+          # Sanity: APK should be a valid ZIP
+          if ! unzip -l "${APK}" > /dev/null 2>&1; then
+              echo "::error::APK is not a valid ZIP file"
+              exit 1
+          fi
+          # Should contain libmain.so and classes.dex
+          if ! unzip -l "${APK}" | grep -q 'libmain.so'; then
+              echo "::warning::APK does not contain libmain.so"
+          fi
+          if ! unzip -l "${APK}" | grep -q 'classes.dex'; then
+              echo "::warning::APK does not contain classes.dex"
+          fi
+          echo "  ok: APK validated"
 
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: apk-pyqt5-kviktor
-          path: ${{ steps.locate.outputs.apk_path }}
+          name: ${{ env.APP_NAME }}-debug-apk
+          path: /home/runner/apk-output/*.apk
+          if-no-files-found: error
           retention-days: 30
 
       - name: Upload build log
@@ -871,6 +279,39 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build.log
+          path: /home/runner/apk-output/build.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
+
+      # =================================================================
+      # 8. Failure diagnostics
+      # =================================================================
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "::group::Last 200 lines of build log"
+          tail -200 /home/runner/apk-output/build.log 2>/dev/null || \
+              echo "(no build log)"
+          echo "::endgroup::"
+
+          echo "::group::Workspace tree (depth 4)"
+          find "${GITHUB_WORKSPACE}/${PROJ_DIR}" -maxdepth 4 \
+              -not -path '*sysroot*' \
+              -not -path '*sources*' 2>/dev/null | sort || true
+          echo "::endgroup::"
+
+          if [ -f "${GITHUB_WORKSPACE}/${PROJ_DIR}/sysroot.json" ]; then
+              echo "::group::Generated sysroot.json"
+              cat "${GITHUB_WORKSPACE}/${PROJ_DIR}/sysroot.json"
+              echo "::endgroup::"
+          fi
+          if [ -f "${GITHUB_WORKSPACE}/${PROJ_DIR}/app.pdy" ]; then
+              echo "::group::Generated app.pdy"
+              cat "${GITHUB_WORKSPACE}/${PROJ_DIR}/app.pdy"
+              echo "::endgroup::"
+          fi
+
+          echo "::group::Disk usage"
+          df -h /
+          du -sh "${GITHUB_WORKSPACE}/${PROJ_DIR}"/* 2>/dev/null || true
+          echo "::endgroup::"
