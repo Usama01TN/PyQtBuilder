@@ -324,6 +324,58 @@ jobs:
               echo "  SHA256: $(sha256sum "$SIP_FILE" | awk '{print $1}')"
           fi
 
+          # ── (3) Patch OpenSSL URL and pre-download ──
+          # The kviktor script downloads OpenSSL from
+          #     https://www.openssl.org/source/old/1.0.2/openssl-1.0.2r.tar.gz
+          # which now returns HTTP 404.  OpenSSL 1.0.2 reached EOL on
+          # 2019-12-31 and the OpenSSL Project pruned their /source/old/
+          # archives.  GitHub Releases mirror the canonical tarballs.
+          echo
+          echo "Patching OpenSSL URL ..."
+
+          # Replace any flavor of the dead URL.  We match on
+          # "openssl.org/source/" so both /source/old/X.Y/ and the
+          # newer /source/ paths get redirected to GitHub.
+          sed -i 's|https://www.openssl.org/source/old/1.0.2/openssl-|https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2r/openssl-|g' \
+              pyqt5_android_kviktor.py
+          sed -i 's|https://www.openssl.org/source/openssl-1.0.2r|https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2r/openssl-1.0.2r|g' \
+              pyqt5_android_kviktor.py
+
+          echo "OpenSSL URL after patch:"
+          grep -nE "openssl-1.0.2r|openssl\.org/source|openssl/releases" \
+               pyqt5_android_kviktor.py | head -5 || true
+          echo "================================================================"
+
+          OPENSSL_FILE="$SOURCES_DIR/openssl-1.0.2r.tar.gz"
+          MIN_OPENSSL_BYTES=$((4 * 1024 * 1024))  # OpenSSL 1.0.2r is ~5 MB
+
+          OPENSSL_MIRRORS=(
+              "https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2r/openssl-1.0.2r.tar.gz"
+              "https://distfiles.macports.org/openssl10/openssl-1.0.2r.tar.gz"
+              "https://artfiles.org/openssl.org/source/old/1.0.2/openssl-1.0.2r.tar.gz"
+          )
+          for url in "${OPENSSL_MIRRORS[@]}"; do
+              echo "  Trying OpenSSL mirror: $url"
+              if curl -L --fail --retry 2 --max-time 120 -A 'Mozilla/5.0' \
+                      -o "$OPENSSL_FILE" "$url"; then
+                  size=$(stat -c %s "$OPENSSL_FILE")
+                  if [ "$size" -ge "$MIN_OPENSSL_BYTES" ]; then
+                      echo "  ✓ Got OpenSSL from $url ($size bytes)"
+                      break
+                  else
+                      echo "  ! Too small ($size bytes), trying next"
+                      rm -f "$OPENSSL_FILE"
+                  fi
+              fi
+          done
+
+          if [ ! -f "$OPENSSL_FILE" ] || [ "$(stat -c %s "$OPENSSL_FILE")" -lt "$MIN_OPENSSL_BYTES" ]; then
+              echo "::warning::Could not pre-download OpenSSL — kviktor will try its patched URL"
+          else
+              echo "  Pre-downloaded $OPENSSL_FILE"
+              echo "  SHA256: $(sha256sum "$OPENSSL_FILE" | awk '{print $1}')"
+          fi
+
           echo "================================================================"
           echo "Patched script SHA256: $(sha256sum pyqt5_android_kviktor.py | awk '{print $1}')"
 
