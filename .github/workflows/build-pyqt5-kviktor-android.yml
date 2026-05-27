@@ -467,6 +467,31 @@ jobs:
               echo "Plugin files in $PLUGINS_DIR:"
               ls "$PLUGINS_DIR" | grep -E "OpenSSL|SIP|PyQt5|Python|Qt" || true
 
+              # ──────────────────────────────────────────────────────────
+              # Create the legacy tools/source.properties stub.
+              # ──────────────────────────────────────────────────────────
+              # pyqtdeploy 2.5.1 platforms.py:508 hardcodes a check for
+              #     $ANDROID_SDK_ROOT/tools/source.properties
+              # (see the source: it does
+              #      source_properties = os.path.join(self.sdk_root, "tools",
+              #                                       "source.properties"))
+              # This was the legacy "Android SDK Tools" package, deprecated
+              # by Google in 2021 and replaced with cmdline-tools.  Modern
+              # SDKs (like the one we install via sdkmanager) do not ship
+              # the legacy tools/ subdir, so pyqtdeploy fails with:
+              #   "..tools/source.properties" does not exist, make sure
+              #    ANDROID_SDK_ROOT is set correctly
+              #
+              # The _get_version function in pyqtdeploy reads ONLY the
+              # "Pkg.Revision = X.Y.Z" line.  Stubbing that with the last
+              # legacy tools version (26.1.1, Sept 2017) satisfies the check.
+              SDK_ROOT=/root/Android/tools
+              LEGACY_TOOLS_DIR="$SDK_ROOT/tools"
+              mkdir -p "$LEGACY_TOOLS_DIR"
+              printf "Pkg.UserSrc=false\nPkg.Revision=26.1.1\nPkg.Path=tools\nPkg.Desc=Android SDK Tools\n" > "$LEGACY_TOOLS_DIR/source.properties"
+              echo "Created stub $LEGACY_TOOLS_DIR/source.properties for pyqtdeploy 2.5.1:"
+              cat "$LEGACY_TOOLS_DIR/source.properties"
+
               cd /work
               # The kviktor script auto-deduces app_name and package_name
               # from project-dir if not supplied; we pass them explicitly.
