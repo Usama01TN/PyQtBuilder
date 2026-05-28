@@ -42,6 +42,11 @@ on:
         required: false
         default: 'false'
         type: boolean
+      upload_qt_prebuild:
+        description: 'Upload Qt 5.13.2 Android prebuild as artifact (adds ~3 min, ~300 MB download)'
+        required: false
+        default: true
+        type: boolean
   push:
     branches: [main, master]
     paths:
@@ -146,6 +151,89 @@ jobs:
               echo "=== SDK ==="
               ls /root/Android/tools/
           '
+
+      # =================================================================
+      # 3.5. Extract Qt prebuild artifact (for downstream reuse)
+      # =================================================================
+      # Packages /root/Qt/5.13.2 from the Docker image into a tarball and
+      # uploads it as a workflow artifact.  Users (or follow-up workflows)
+      # can download this artifact and extract it to skip the slow Qt
+      # install step entirely.
+      #
+      # Tarball structure (matches what aqtinstall produces, so extracting
+      # to ~/ gives ~/Qt/5.13.2/android_arm64_v8a/...):
+      #     Qt/
+      #     └── 5.13.2/
+      #         └── android_arm64_v8a/
+      #             ├── bin/      (qmake, androiddeployqt, moc, rcc, ...)
+      #             ├── lib/
+      #             ├── plugins/
+      #             ├── qml/
+      #             └── ...
+      - name: Extract Qt prebuild artifact from Docker image
+        if: ${{ github.event.inputs.upload_qt_prebuild != 'false' }}
+        run: |
+          set -e
+          mkdir -p /home/runner/qt-artifact
+
+          echo "Extracting Qt 5.13.2 Android arm64 prebuild from container ..."
+          docker run --rm \
+              -v /home/runner/qt-artifact:/out \
+              pyqt5-kviktor-builder \
+              bash -c '
+                  set -e
+                  ARCHIVE_NAME="qt-5.13.2-android-arm64-prebuild"
+                  echo "Compressing /root/Qt/5.13.2 ..."
+                  # tarball entries will be relative to /root, so users can
+                  # extract directly into $HOME to get ~/Qt/5.13.2/...
+                  tar czf "/out/${ARCHIVE_NAME}.tar.gz" -C /root Qt/
+                  cd /out
+                  sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.sha256"
+
+                  # Write a manifest so users know what they got
+                  cat > "${ARCHIVE_NAME}.manifest.txt" << EOF
+          Qt prebuild artifact manifest
+          ===================================================================
+          Qt version       : 5.13.2
+          Architecture     : android_arm64_v8a (Android arm64-v8a / aarch64)
+          Built via        : aqtinstall in Dockerfile.pyqt5-kviktor
+          Built on         : $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          Tarball SHA256   : $(cat "${ARCHIVE_NAME}.sha256" | awk "{print \$1}")
+          Tarball size     : $(stat -c %s "${ARCHIVE_NAME}.tar.gz") bytes
+          Tarball size MB  : $(stat -c "%s" "${ARCHIVE_NAME}.tar.gz" | awk "{ printf \"%.1f\", \$1/1024/1024 }")
+          File count       : $(tar tzf "${ARCHIVE_NAME}.tar.gz" | wc -l)
+
+          USAGE
+          -----
+            tar xzf ${ARCHIVE_NAME}.tar.gz -C \$HOME
+            export QT_DIR=\$HOME/Qt/5.13.2
+            export PATH=\$QT_DIR/android_arm64_v8a/bin:\$PATH
+
+          KEY TOOLS INCLUDED
+          ------------------
+          EOF
+                  tar tzf "${ARCHIVE_NAME}.tar.gz" \
+                      | grep -E "bin/(qmake|androiddeployqt|moc|rcc|uic|qmlimportscanner)$" \
+                      | sort -u >> "${ARCHIVE_NAME}.manifest.txt"
+
+                  echo
+                  echo "=== Artifact summary ==="
+                  cat "${ARCHIVE_NAME}.manifest.txt"
+              '
+
+          echo
+          echo "Final artifact files:"
+          ls -lh /home/runner/qt-artifact/
+
+      - name: Upload Qt prebuild artifact
+        if: ${{ github.event.inputs.upload_qt_prebuild != 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-5.13.2-android-arm64-prebuild
+          path: /home/runner/qt-artifact/*
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0    # tarball is already gzipped; no double compression
 
       # =================================================================
       # 4. Cache the source tarballs + sysroot across runs
