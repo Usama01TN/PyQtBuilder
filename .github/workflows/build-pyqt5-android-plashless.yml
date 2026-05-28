@@ -1,0 +1,298 @@
+# ============================================================================
+#  PyQt5 -> Android (plashless toolchain: Qt 5.3 / NDK r10 / Python 3.4)
+#  =====================================================================
+#
+#  This workflow uses the ORIGINAL 2014 plashless.wordpress.com toolchain
+#  (Qt 5.3 Android armv7 / pyqtdeploy 0.5 / NDK r10e / Python 3.4.0) rather
+#  than the modern pyqtdeploy 2.5.1 / Qt 5.13 toolchain used by the v3
+#  workflow.  Output is a 32-bit armv7 APK.
+#
+#  Pipeline:
+#    1. Build Docker image (caches Python 3.4, OpenSSL 1.0.2, Qt 5.3,
+#       NDK r10e, pyqtdeploy 0.5, SIP 4.16.9, PyQt-gpl-5.3.2)
+#    2. Download user's project zip
+#    3. Run pyqt5_android_plashless.py inside the container
+#    4. Upload APK + build log
+# ============================================================================
+name: Build PyQt5 -> Android (plashless / Qt 5.3 / armv7)
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: 'URL to a .zip containing the PyQt5 project (with main.py at root)'
+        required: true
+        default: 'https://github.com/Usama01TN/PyQtBuilder/raw/main/testapp_qt5.zip'
+      app_name:
+        description: 'App name (default: project dir basename)'
+        required: false
+        default: 'TestApp'
+      extra_modules:
+        description: 'Extra Python C extension modules (comma-separated, e.g. _posixsubprocess,select)'
+        required: false
+        default: ''
+      keep_build:
+        description: 'Retain intermediate build files for diagnosis'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main, master]
+    paths:
+      - 'pyqt5_android_plashless.py'
+      - 'builders.py'
+      - 'build_utils.py'
+      - 'qt-install.qs'
+      - 'Dockerfile.pyqt5-plashless'
+      - '.github/workflows/build-pyqt5-android-plashless.yml'
+
+env:
+  PROJECT_URL:   ${{ github.event.inputs.project_url   || 'https://github.com/Usama01TN/PyQtBuilder/raw/main/testapp_qt5.zip' }}
+  APP_NAME:      ${{ github.event.inputs.app_name      || 'TestApp' }}
+  EXTRA_MODULES: ${{ github.event.inputs.extra_modules || '' }}
+  PROJ_DIR:      workspace/testapp_plashless
+  JOBS:          2
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # Image build alone runs ~25-40 min the first time; full pipeline may
+    # take 60-90 min on cold cache.
+    timeout-minutes: 240
+    permissions:
+      contents: read
+
+    steps:
+      # ====================================================================
+      # 1. Checkout
+      # ====================================================================
+      - name: Checkout repo (for builder script + Dockerfile)
+        uses: actions/checkout@v4
+
+      - name: Verify required files are in repo
+        run: |
+          set -e
+          for f in pyqt5_android_plashless.py \
+                   builders.py \
+                   build_utils.py \
+                   qt-install.qs \
+                   Dockerfile.pyqt5-plashless; do
+              if [ ! -f "$f" ]; then
+                  echo "::error::Missing required file: $f"
+                  exit 1
+              fi
+              echo "  ok: $f ($(stat -c %s "$f") bytes)"
+          done
+
+      # ====================================================================
+      # 2. Free disk space (this image is BIG ~ 10-15 GB)
+      # ====================================================================
+      - name: Free disk space
+        run: |
+          set -e
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get purge -y --no-install-recommends \
+              azure-cli google-cloud-cli google-chrome-stable \
+              firefox powershell mono-devel 2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean
+          docker image prune -af 2>/dev/null || true
+          df -h /
+
+      # ====================================================================
+      # 3. Docker buildx + image build
+      # ====================================================================
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute Dockerfile + script hash (for cache key)
+        id: hashes
+        run: |
+          HASH=$(cat Dockerfile.pyqt5-plashless qt-install.qs builders.py build_utils.py \
+                  | sha256sum | awk '{print $1}' | cut -c1-12)
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "Cache key prefix SHA: ${HASH}"
+
+      - name: Build pyqt5-plashless-builder Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.pyqt5-plashless
+          tags: pyqt5-plashless-builder:latest
+          load: true
+          cache-from: type=gha,scope=plashless-${{ steps.hashes.outputs.hash }}
+          cache-to:   type=gha,scope=plashless-${{ steps.hashes.outputs.hash }},mode=max
+
+      - name: Show image summary
+        run: |
+          docker run --rm pyqt5-plashless-builder:latest bash -lc '
+              echo "=== identity ==="
+              cat /etc/os-release | head -3
+              echo
+              echo "=== Python 3.4 ==="
+              python3.4 --version
+              python3.4 -c "import ssl; print(\"  SSL:\", ssl.OPENSSL_VERSION)"
+              echo
+              echo "=== NDK r10e ==="
+              ls -la /root/android-ndk-r10e/ndk-build || true
+              echo
+              echo "=== Qt 5.3 ==="
+              /root/Qt/5.3/android_armv7/bin/qmake --version | head -2 || echo "(qmake not found yet)"
+              echo
+              echo "=== pyqtdeploy ==="
+              (command -v pyqtdeploycli || command -v pyqtdeploy) || echo "(pyqtdeploy CLI not on PATH)"
+              echo
+              echo "=== Pre-fetched downloads ==="
+              ls -la /root/.pyqt5_android_plashless/downloads/
+          '
+
+      # ====================================================================
+      # 4. Cache the plashless work directory across runs
+      # ====================================================================
+      # The work_dir holds extracted SIP/PyQt5/Python sources + the aRoot
+      # sysroot (which contains the cross-compiled static libs).
+      # Cache key changes when the script changes -- otherwise the cached
+      # sysroot is reused so Steps 5-12 can be skipped via --skip-static-build.
+      - name: Cache plashless work dir + aRoot
+        id: cache-aroot
+        uses: actions/cache@v4
+        with:
+          path: |
+            workspace/.pyqt5_android_plashless
+            workspace/aRoot
+          key: plashless-aroot-${{ hashFiles('pyqt5_android_plashless.py', 'Dockerfile.pyqt5-plashless') }}-v1
+          restore-keys: |
+            plashless-aroot-
+
+      # ====================================================================
+      # 5. Download user project
+      # ====================================================================
+      - name: Download user project
+        run: |
+          set -e
+          mkdir -p "${PROJ_DIR}"
+          echo "Downloading: ${PROJECT_URL}"
+          curl -fL --retry 3 --max-time 120 -o /tmp/project.zip "${PROJECT_URL}"
+          unzip -o /tmp/project.zip -d "${PROJ_DIR}"
+          echo
+          echo "Project contents:"
+          find "${PROJ_DIR}" -maxdepth 3 \
+              -not -path '*build*' -not -path '*aRoot*' | sort
+          echo
+          if [ -f "${PROJ_DIR}/main.py" ]; then
+              echo "main.py preview:"
+              head -20 "${PROJ_DIR}/main.py"
+          else
+              echo "(no main.py at root -- the script will create a template)"
+          fi
+
+      # ====================================================================
+      # 6. Run the plashless builder
+      # ====================================================================
+      - name: Build APK with plashless toolchain
+        id: build
+        run: |
+          set -o pipefail
+          mkdir -p /home/runner/apk-output workspace/aRoot workspace/.pyqt5_android_plashless
+
+          KEEP_FLAG=""
+          if [ "${{ github.event.inputs.keep_build }}" = "true" ]; then
+              KEEP_FLAG="--keep-build"
+          fi
+          EXTRA_ARG=""
+          if [ -n "${EXTRA_MODULES}" ]; then
+              EXTRA_ARG="--extra-modules ${EXTRA_MODULES}"
+          fi
+
+          docker run --rm \
+              -v "${GITHUB_WORKSPACE}:/work" \
+              -v "/home/runner/apk-output:/output" \
+              -w /work \
+              -e LANG=C.UTF-8 \
+              pyqt5-plashless-builder:latest \
+              /usr/local/bin/python3.4 /work/pyqt5_android_plashless.py \
+                  --project-dir   "/work/${PROJ_DIR}" \
+                  --app-name      "${APP_NAME}" \
+                  --ndk-root      /root/android-ndk-r10e \
+                  --qt-dir        /root/Qt/5.3 \
+                  --sysroot       "/work/workspace/aRoot" \
+                  --work-dir      "/work/workspace/.pyqt5_android_plashless" \
+                  --jobs          "${JOBS}" \
+                  --output-dir    "/output" \
+                  ${EXTRA_ARG} \
+                  ${KEEP_FLAG} \
+                  --verbose \
+              2>&1 | tee /home/runner/apk-output/build.log
+
+      # ====================================================================
+      # 7. Verify + upload APK
+      # ====================================================================
+      - name: Verify APK output
+        if: success()
+        run: |
+          set -e
+          OUTPUT_DIR=/home/runner/apk-output
+          echo "Contents of ${OUTPUT_DIR}:"
+          ls -la "${OUTPUT_DIR}/"
+
+          APK=$(find "${OUTPUT_DIR}" -name "*.apk" -type f | head -1)
+          if [ -z "${APK}" ]; then
+              echo "::error::No APK produced.  See build.log for details."
+              exit 1
+          fi
+          SIZE=$(stat -c %s "${APK}")
+          SHA=$(sha256sum "${APK}" | awk '{print $1}')
+          echo "  APK:    ${APK}"
+          echo "  Size:   ${SIZE} bytes ($((SIZE / 1024 / 1024)) MB)"
+          echo "  SHA256: ${SHA}"
+
+          if ! unzip -l "${APK}" > /dev/null 2>&1; then
+              echo "::error::APK is not a valid ZIP"
+              exit 1
+          fi
+          echo "  ok: APK is a valid ZIP"
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-plashless-debug-apk
+          path: /home/runner/apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plashless-build-log
+          path: /home/runner/apk-output/build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ====================================================================
+      # 8. Failure diagnostics
+      # ====================================================================
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "::group::Last 300 lines of build log"
+          tail -300 /home/runner/apk-output/build.log 2>/dev/null || echo "(no build log)"
+          echo "::endgroup::"
+
+          echo "::group::Workspace tree (depth 4, no build artifacts)"
+          find "${GITHUB_WORKSPACE}/${PROJ_DIR}" -maxdepth 4 \
+              -not -path '*pensoolAndroidBuild*' \
+              -not -path '*aRoot*' 2>/dev/null | sort || true
+          echo "::endgroup::"
+
+          echo "::group::aRoot sysroot tree (top 50)"
+          find "${GITHUB_WORKSPACE}/workspace/aRoot" -maxdepth 4 2>/dev/null | head -50
+          echo "::endgroup::"
+
+          echo "::group::Disk usage"
+          df -h /
+          du -sh "${GITHUB_WORKSPACE}"/workspace/* 2>/dev/null || true
+          echo "::endgroup::"
