@@ -92,8 +92,20 @@ NDK_DIRNAME = 'android-ndk-r10'
 PYQTDEPLOY_HG = 'http://www.riverbankcomputing.com/hg/pyqtdeploy'
 # Source download URLs.
 PYTHON_URL = 'https://www.python.org/ftp/python/{ver}/Python-{ver}.tgz'.format(ver=PYTHON_VERSION)
-SIP_SNAPSHOT_URL = 'https://www.riverbankcomputing.com/software/sip/download'  # Navigate manually; latest snapshot.
-PYQT5_SNAP_URL = 'https://www.riverbankcomputing.com/software/pyqt/download5'  # Navigate manually; latest snapshot.
+# --- patched: direct download URLs for sources that the original script ---
+# --- required to be downloaded "manually".  All mirrors verified working. ---
+SIP_VERSION = '4.16.9'
+PYQT5_VERSION = '5.3.2'
+PYQTDEPLOY_VERSION = '0.5'
+SIP_URL = 'https://distfiles.macports.org/py-sip/sip-{0}.tar.gz'.format(SIP_VERSION)
+SIP_URL_FALLBACK = 'https://sourceforge.net/projects/pyqt/files/sip/sip-{0}/sip-{0}.tar.gz/download'.format(SIP_VERSION)
+PYQT5_URL = 'https://distfiles.macports.org/py-pyqt5/PyQt-gpl-{0}.tar.gz'.format(PYQT5_VERSION)
+PYQT5_URL_FALLBACK = ('https://sourceforge.net/projects/pyqt/files/PyQt5/PyQt-{0}/'
+                     'PyQt-gpl-{0}.tar.gz/download').format(PYQT5_VERSION)
+PYQTDEPLOY_URL = 'https://distfiles.macports.org/py-pyqtdeploy/pyqtdeploy-{0}.tar.gz'.format(PYQTDEPLOY_VERSION)
+# Kept for log-message backward-compat:
+SIP_SNAPSHOT_URL = SIP_URL
+PYQT5_SNAP_URL = PYQT5_URL
 # Default install paths (match plashless guide).
 DEFAULT_HOME = expanduser('~')
 DEFAULT_NDK_ROOT = join(DEFAULT_HOME, NDK_DIRNAME)
@@ -136,6 +148,7 @@ class BuildConfig(object):
         """
         self.project_dir = realpath(args.project_dir)
         self.app_name = args.app_name or basename(self.project_dir)
+        self.output_dir = realpath(args.output_dir) if getattr(args, 'output_dir', '') else join(self.project_dir, 'output')
         self.ndk_root = expanduser(args.ndk_root)
         self.qt_dir = expanduser(args.qt_dir)
         self.sysroot = expanduser(args.sysroot)
@@ -305,6 +318,56 @@ def _download(url, dest):
         log.info('Saved:       %s', dest)
     except URLError as exc:
         raise RuntimeError('Download failed: {0}\n{1}'.format(url, exc))
+
+
+def _download_with_fallback(urls, dest):
+    """
+    Try a list of URLs in order; first success wins.  Used when the primary
+    download mirror may be flaky (e.g. SourceForge under load).
+    :param urls: list[str]
+    :param dest: str
+    :return: None
+    """
+    _makedirs(dirname(dest))
+    if exists(dest) and getsize(dest) > 0:
+        log.info('Cached: %s', basename(dest))
+        return
+    for url in urls:
+        log.info('Trying:     %s', url)
+        try:
+            urlretrieve(url, dest)
+            if exists(dest) and getsize(dest) > 1024:
+                log.info('Saved:       %s', dest)
+                return
+        except URLError as exc:
+            log.warning('  failed: %s', exc)
+            if exists(dest):
+                try:
+                    from os import remove
+                    remove(dest)
+                except OSError:
+                    pass
+    raise RuntimeError(
+        'Failed to download {0} from any of: {1}'.format(basename(dest), urls))
+
+
+def _maybe_sudo(cmd_list):
+    """
+    Prepend 'sudo' only if we are NOT already root (in Docker we run as root,
+    so calling sudo is both unnecessary and often broken because sudo may
+    not even be installed).
+    :param cmd_list: list[str]
+    :return: list[str]
+    """
+    try:
+        from os import geteuid
+        if geteuid() == 0:
+            return list(cmd_list)
+    except (AttributeError, ImportError):
+        pass
+    if which('sudo'):
+        return ['sudo'] + list(cmd_list)
+    return list(cmd_list)
 
 
 def _extract_tgz(archive, dest_dir):
@@ -521,16 +584,43 @@ def install_pyqtdeploy(cfg):
     else:
         src_dir = join(cfg.work_dir, 'pyqtdeploy')
         if not isdir(src_dir):
-            log.info('Cloning pyqtdeploy from Mercurial ...')
-            _run([getHgExecutable(), 'clone', PYQTDEPLOY_HG, src_dir], dry_run=cfg.dry_run)
+            # --- patched: original Riverbank Mercurial server is dead.
+            # Try a source-tarball download FIRST; only fall through to
+            # `hg clone` if no tarball mirror works (very unlikely now).
+            tarball_dest = join(cfg.downloads_dir, 'pyqtdeploy-{0}.tar.gz'.format(PYQTDEPLOY_VERSION))
+            try:
+                log.info('Fetching pyqtdeploy %s source tarball ...', PYQTDEPLOY_VERSION)
+                _download_with_fallback([PYQTDEPLOY_URL], tarball_dest)
+                _extract_tgz(tarball_dest, cfg.work_dir)
+                # Locate extracted dir (may be pyqtdeploy-0.5 or just pyqtdeploy)
+                for entry in listdir(cfg.work_dir):
+                    full = join(cfg.work_dir, entry)
+                    if entry.lower().startswith('pyqtdeploy') and isdir(full):
+                        src_dir = full
+                        break
+            except RuntimeError as exc:
+                log.warning('Tarball download failed (%s); trying hg clone ...', exc)
+                hg = which('hg')
+                if not hg:
+                    raise RuntimeError(
+                        'Cannot install pyqtdeploy: no working tarball mirror '
+                        'and "hg" not on PATH for fallback clone.')
+                _run([hg, 'clone', PYQTDEPLOY_HG, src_dir], dry_run=cfg.dry_run)
         else:
-            log.info('Updating pyqtdeploy ...')
-            _run([getHgExecutable(), 'pull'], cwd=src_dir, dry_run=cfg.dry_run)
-            _run([getHgExecutable(), 'update'], cwd=src_dir, dry_run=cfg.dry_run)
-    # Build pyqtdeploy version file and install.
-    _run([getMakeExecutable(), 'VERSION'], cwd=src_dir, dry_run=cfg.dry_run)
-    _run([getMakeExecutable(), 'pyqtdeploy/version.py'], cwd=src_dir, dry_run=cfg.dry_run)
-    _run(['sudo', getPythonExecutable(), 'setup.py', 'install'], cwd=src_dir, dry_run=cfg.dry_run)
+            log.info('Updating pyqtdeploy (existing checkout) ...')
+            # Existing checkout -- try `hg pull` only if it's an hg repo.
+            if isdir(join(src_dir, '.hg')):
+                _run([getHgExecutable(), 'pull'], cwd=src_dir, dry_run=cfg.dry_run)
+                _run([getHgExecutable(), 'update'], cwd=src_dir, dry_run=cfg.dry_run)
+    # Some pyqtdeploy versions build a VERSION file via make; older tarballs
+    # already ship one.  Make targets are best-effort.
+    if isfile(join(src_dir, 'Makefile')):
+        try:
+            _run([getMakeExecutable(), 'VERSION'], cwd=src_dir, dry_run=cfg.dry_run, check=False)
+            _run([getMakeExecutable(), 'pyqtdeploy/version.py'], cwd=src_dir, dry_run=cfg.dry_run, check=False)
+        except RuntimeError as exc:
+            log.warning('VERSION make targets failed (%s); continuing ...', exc)
+    _run(_maybe_sudo([getPythonExecutable(), 'setup.py', 'install']), cwd=src_dir, dry_run=cfg.dry_run)
     # Detect which command name was installed.
     for cmd_name in ('pyqtdeploycli', 'pyqtdeploy'):
         if which(cmd_name):
@@ -579,26 +669,25 @@ def download_sources(cfg):
             cfg.sip_src = join(cfg.work_dir, sorted(sip_dirs)[-1])
             log.info('SIP source (found): %s', cfg.sip_src)
         else:
-            # Try to find a tarball in downloads.
+            # Try to find a tarball in downloads, or auto-download SIP 4.16.9.
             sip_tarballs = [
                 f for f in listdir(cfg.downloads_dir)
                 if f.lower().startswith('sip') and (f.endswith('.tar.gz') or f.endswith('.tgz'))]
+            if not sip_tarballs and not cfg.dry_run:
+                # --- patched: auto-download SIP 4.16.9 instead of warning user ---
+                log.info('SIP tarball not found in downloads; fetching SIP %s ...', SIP_VERSION)
+                sip_dest = join(cfg.downloads_dir, 'sip-{0}.tar.gz'.format(SIP_VERSION))
+                _download_with_fallback([SIP_URL, SIP_URL_FALLBACK], sip_dest)
+                sip_tarballs = [basename(sip_dest)]
             if sip_tarballs:
                 archive = join(cfg.downloads_dir, sorted(sip_tarballs)[-1])
-                _extract_tgz(archive, cfg.work_dir)
+                if not cfg.dry_run:
+                    _extract_tgz(archive, cfg.work_dir)
                 sip_dirs2 = [d for d in listdir(cfg.work_dir) if d.lower().startswith('sip') and isdir(
                     join(cfg.work_dir, d))]
                 if sip_dirs2:
                     cfg.sip_src = join(cfg.work_dir, sorted(sip_dirs2)[-1])
-            else:
-                log.warning(
-                    'SIP snapshot not found.\n'
-                    '  Download the LATEST SIP snapshot from:\n'
-                    '    %s\n'
-                    '  Save the .tar.gz to: %s\n'
-                    '  Then re-run this script.',
-                    SIP_SNAPSHOT_URL, cfg.downloads_dir)
-    log.info('SIP source: %s', cfg.sip_src or '(not found -- download manually)')
+    log.info('SIP source: %s', cfg.sip_src or '(not found)')
     # PyQt5 -- must be latest snapshot.
     if cfg.pyqt5_src and isdir(cfg.pyqt5_src):
         log.info('PyQt5 source (user-provided): %s', cfg.pyqt5_src)
@@ -610,22 +699,21 @@ def download_sources(cfg):
         else:
             pyqt_tarballs = [f for f in listdir(cfg.downloads_dir) if f.lower().startswith('pyqt') and (
                     f.endswith('.tar.gz') or f.endswith('.tgz'))]
+            if not pyqt_tarballs and not cfg.dry_run:
+                # --- patched: auto-download PyQt 5.3.2 ---
+                log.info('PyQt5 tarball not found in downloads; fetching PyQt %s ...', PYQT5_VERSION)
+                pyqt_dest = join(cfg.downloads_dir, 'PyQt-gpl-{0}.tar.gz'.format(PYQT5_VERSION))
+                _download_with_fallback([PYQT5_URL, PYQT5_URL_FALLBACK], pyqt_dest)
+                pyqt_tarballs = [basename(pyqt_dest)]
             if pyqt_tarballs:
                 archive = join(cfg.downloads_dir, sorted(pyqt_tarballs)[-1])
-                _extract_tgz(archive, cfg.work_dir)
+                if not cfg.dry_run:
+                    _extract_tgz(archive, cfg.work_dir)
                 pyqt_dirs2 = [
                     d for d in listdir(cfg.work_dir) if d.lower().startswith('pyqt') and isdir(join(cfg.work_dir, d))]
                 if pyqt_dirs2:
                     cfg.pyqt5_src = join(cfg.work_dir, sorted(pyqt_dirs2)[-1])
-            else:
-                log.warning(
-                    'PyQt5 snapshot not found.\n'
-                    '  Download the LATEST PyQt5 GPL snapshot from:\n'
-                    '    %s\n'
-                    '  Save the .tar.gz to: %s\n'
-                    '  Then re-run this script.',
-                    PYQT5_SNAP_URL, cfg.downloads_dir)
-    log.info('PyQt5 source: %s', cfg.pyqt5_src or '(not found -- download manually)')
+    log.info('PyQt5 source: %s', cfg.pyqt5_src or '(not found)')
     log.info('Sources step done OK')
 
 
@@ -656,7 +744,7 @@ def build_host_sip(cfg):
     log.info('Building host SIP ...')
     _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)], cwd=cfg.sip_src, env=env, dry_run=cfg.dry_run)
     log.info('Installing host SIP (sudo) ...')
-    _run(['sudo', getMakeExecutable(), 'install'], cwd=cfg.sip_src, env=env, dry_run=cfg.dry_run)
+    _run(_maybe_sudo([getMakeExecutable(), 'install']), cwd=cfg.sip_src, env=env, dry_run=cfg.dry_run)
     log.info('Host SIP built OK')
 
 
@@ -1572,7 +1660,64 @@ def make_parser():
     parser.add_argument('--keep-build', action='store_true', help='Retain intermediate build files.')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable debug-level output.')
+    parser.add_argument('--output-dir', default='', metavar='DIR',
+                        help='Where to copy the final APK after a successful build (default: <project-dir>/output).')
     return parser
+
+
+# =============================================================================
+# APK locate + copy to output dir.
+# =============================================================================
+
+def _locate_and_copy_apk(cfg):
+    """
+    After a successful build, find any .apk under build_dir and copy it into
+    cfg.output_dir under the friendly name <AppName>-debug.apk.
+    Non-fatal on failure (build_with_qtcreator may have printed guidance for
+    manual finishing in Qt Creator GUI).
+    :param cfg: BuildConfig
+    :return:
+    """
+    step('Locate + copy APK')
+    candidates = []
+    try:
+        for root_dir, dirs, files in walk(cfg.build_dir):
+            for name in files:
+                if name.lower().endswith('.apk'):
+                    candidates.append(join(root_dir, name))
+    except OSError:
+        pass
+    # Also check project_dir as a fallback (some pipelines drop the APK there).
+    try:
+        for root_dir, dirs, files in walk(cfg.project_dir):
+            for name in files:
+                if name.lower().endswith('.apk') and join(root_dir, name) not in candidates:
+                    candidates.append(join(root_dir, name))
+    except OSError:
+        pass
+    if not candidates:
+        log.warning('No .apk file found under %s -- nothing to copy.\n'
+                    '  Check %s for build artifacts you can manually transfer.',
+                    cfg.build_dir, cfg.build_dir)
+        return
+    # Prefer debug APKs / sort by mtime
+    candidates.sort(key=lambda p: (0 if 'debug' in p.lower() else 1, -getmtime(p)))
+    apk = candidates[0]
+    sz = getsize(apk)
+    _makedirs(cfg.output_dir)
+    dest_name = '{0}-debug.apk'.format(cfg.app_name)
+    dest = join(cfg.output_dir, dest_name)
+    log.info('Source APK:  %s (%d bytes)', apk, sz)
+    log.info('Copying to:  %s', dest)
+    try:
+        from shutil import copy2
+        copy2(apk, dest)
+    except (IOError, OSError) as exc:
+        log.error('APK copy failed: %s', exc)
+        return
+    log.info('APK copied OK: %s', dest)
+    if len(candidates) > 1:
+        log.info('(%d additional APK candidate(s) were ignored)', len(candidates) - 1)
 
 
 # =============================================================================
@@ -1608,6 +1753,7 @@ def main(argv=None):
         create_pdy_project(cfg)
         run_pyqtdeploy_build(cfg)
         build_with_qtcreator(cfg)
+        _locate_and_copy_apk(cfg)
         print_summary(cfg)
         return 0
     except EnvironmentError as exc:

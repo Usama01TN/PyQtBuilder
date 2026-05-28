@@ -1,0 +1,239 @@
+# ============================================================================
+# pyqt5_android_plashless build environment
+# ----------------------------------------------------------------------------
+# Replicates the plashless.wordpress.com 2014 tutorial toolchain in a CI-
+# friendly Docker image:
+#   * Ubuntu 20.04 base (matches old enough glibc; widely available in CI)
+#   * OpenSSL 1.0.2u (Python 3.4 cannot build against modern OpenSSL 1.1)
+#   * Python 3.4.0 built from source against that OpenSSL
+#   * NDK r10e from Google's archive
+#   * Qt 5.3.2 Android armv7 (installed unattended via QInstaller --script)
+#   * SIP 4.16.9 + PyQt-gpl-5.3.2 source pre-fetched
+#   * pyqtdeploy 0.5 source pre-fetched
+#
+# All slow downloads happen here so they're cached in the image layer and
+# don't repeat on every workflow run.
+# ============================================================================
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# ----------------------------------------------------------------------------
+# 1) System dependencies (apt)
+# ----------------------------------------------------------------------------
+#
+# Python 3.4 build deps:        libffi, zlib, bz2, readline, sqlite, ncurses,
+#                               gdbm, db, tk (we keep the list permissive --
+#                               anything missing here turns into a silently
+#                               disabled stdlib module which often surfaces
+#                               only deep in the plashless pipeline).
+#
+# Qt installer deps:            libfontconfig + libGL + libxkbcommon + Xvfb so
+#                               the Qt Installer Framework's GUI can run
+#                               headless under --script automation.
+#
+# Build tools:                  build-essential, make, autoconf, automake,
+#                               libtool, pkg-config, mercurial, git, wget,
+#                               curl, p7zip-full (for online repo .7z), file,
+#                               tar, zip, unzip.
+# ----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    make \
+    file \
+    # Source-fetching tools
+    mercurial \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    tar \
+    zip \
+    unzip \
+    xz-utils \
+    p7zip-full \
+    # Python 3.4 build deps
+    libffi-dev \
+    libreadline-dev \
+    libbz2-dev \
+    libsqlite3-dev \
+    libgdbm-dev \
+    libdb-dev \
+    libncurses5-dev \
+    libncursesw5-dev \
+    tk-dev \
+    uuid-dev \
+    zlib1g-dev \
+    # Qt installer GUI deps (used under xvfb)
+    libfontconfig1 \
+    libglib2.0-0 \
+    libgl1-mesa-glx \
+    libxrender1 \
+    libxkbcommon-x11-0 \
+    libdbus-1-3 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-sync1 \
+    libxcb-xfixes0 \
+    libxcb-xinerama0 \
+    libxcb-xkb1 \
+    libxkbcommon0 \
+    xvfb \
+    libx11-xcb1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# ----------------------------------------------------------------------------
+# 2) OpenSSL 1.0.2u  (Python 3.4 is incompatible with OpenSSL 1.1+)
+# ----------------------------------------------------------------------------
+# Build into /opt/openssl-1.0.2; we'll point Python's ssl module here.
+WORKDIR /tmp
+RUN curl -fL --retry 3 -o openssl-1.0.2u.tar.gz \
+        https://github.com/openssl/openssl/releases/download/OpenSSL_1_0_2u/openssl-1.0.2u.tar.gz \
+ && tar xzf openssl-1.0.2u.tar.gz \
+ && cd openssl-1.0.2u \
+ && ./config --prefix=/opt/openssl-1.0.2 --openssldir=/opt/openssl-1.0.2 \
+        -fPIC shared no-ssl2 no-ssl3 \
+ && make -j"$(nproc)" \
+ && make install_sw \
+ && cd /tmp && rm -rf openssl-1.0.2u*
+
+# ----------------------------------------------------------------------------
+# 3) Python 3.4.0  (built against OpenSSL 1.0.2u)
+# ----------------------------------------------------------------------------
+WORKDIR /tmp
+RUN curl -fL --retry 3 -o Python-3.4.0.tgz \
+        https://www.python.org/ftp/python/3.4.0/Python-3.4.0.tgz \
+ && tar xzf Python-3.4.0.tgz \
+ && cd Python-3.4.0 \
+    # Patch Modules/Setup.dist so ssl gets built against our OpenSSL.
+ && sed -i 's|#SSL=/usr/local/ssl|SSL=/opt/openssl-1.0.2|' Modules/Setup.dist \
+ && sed -i 's|#_ssl _ssl.c |_ssl _ssl.c |' Modules/Setup.dist \
+ && sed -i 's|#\t-DUSE_SSL|\t-DUSE_SSL|' Modules/Setup.dist \
+ && sed -i 's|#\t-L\$(SSL)/lib|\t-L$(SSL)/lib|' Modules/Setup.dist \
+ && sed -i 's|#\t-lssl -lcrypto|\t-lssl -lcrypto|' Modules/Setup.dist \
+ && CFLAGS="-I/opt/openssl-1.0.2/include" \
+    LDFLAGS="-L/opt/openssl-1.0.2/lib -Wl,-rpath,/opt/openssl-1.0.2/lib" \
+    CPPFLAGS="-I/opt/openssl-1.0.2/include" \
+    ./configure --prefix=/usr/local --with-ensurepip=install \
+ && make -j"$(nproc)" \
+ && make altinstall \
+ && cd /tmp && rm -rf Python-3.4.0*
+
+# python3.4 -> python3 symlink (the plashless script invokes `python3`)
+RUN ln -sf /usr/local/bin/python3.4 /usr/local/bin/python3 \
+ && ln -sf /usr/local/bin/pip3.4    /usr/local/bin/pip3
+
+# Verify Python 3.4 has SSL working (so SIP/PyQt5 source downloads succeed).
+RUN python3.4 --version \
+ && python3.4 -c "import ssl; print('Python 3.4 SSL:', ssl.OPENSSL_VERSION)"
+
+# Pip on Python 3.4 is stuck at 19.1.1 (last release supporting py34).
+# Upgrade only what's safe.
+RUN pip3.4 install --no-cache-dir 'pip==19.1.1' 'setuptools<44' 'wheel<0.35' \
+ && pip3.4 install --no-cache-dir 'cmake<3.18'    \
+ || echo "(cmake install best-effort; not strictly required for plashless pipeline)"
+
+# ----------------------------------------------------------------------------
+# 4) NDK r10e
+# ----------------------------------------------------------------------------
+WORKDIR /root
+RUN curl -fL --retry 3 -o ndk.zip \
+        https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip \
+ && unzip -q ndk.zip \
+ && rm ndk.zip \
+ && ls -la android-ndk-r10e/ | head -5
+
+ENV ANDROID_NDK_ROOT=/root/android-ndk-r10e
+ENV PATH=/root/android-ndk-r10e:${PATH}
+
+# ----------------------------------------------------------------------------
+# 5) Qt 5.3.2 Android armv7  (unattended install via QInstaller --script)
+# ----------------------------------------------------------------------------
+# The Qt Installer Framework supports a --script JavaScript argument for
+# automation.  We render the GUI under Xvfb because the Qt 5.3-era installer
+# does not have a true headless mode.
+COPY qt-install.qs /tmp/qt-install.qs
+WORKDIR /tmp
+RUN curl -fL --retry 3 -o qt-installer.run \
+        https://download.qt.io/archive/qt/5.3/5.3.2/qt-opensource-linux-x64-android-5.3.2.run \
+ && chmod +x qt-installer.run \
+ && echo "Running Qt 5.3.2 installer under xvfb (this takes ~3-5 minutes) ..." \
+ && xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+        ./qt-installer.run --script /tmp/qt-install.qs --no-force-installations --verbose \
+        2>&1 | tail -40 \
+ && rm -f qt-installer.run \
+ && ls /root/Qt/5.3/android_armv7/bin/qmake
+
+ENV QT_ROOT=/root/Qt/5.3
+ENV PATH=/root/Qt/5.3/android_armv7/bin:${PATH}
+
+# ----------------------------------------------------------------------------
+# 6) Pre-download SIP 4.16.9 and PyQt-gpl-5.3.2 source tarballs
+# ----------------------------------------------------------------------------
+# The plashless script's Step 4 looks for these in /root/.pyqt5_android_plashless/downloads/.
+# By staging them in the image they don't have to be re-downloaded each run.
+RUN mkdir -p /root/.pyqt5_android_plashless/downloads \
+ && cd /root/.pyqt5_android_plashless/downloads \
+ && curl -fL --retry 3 -o sip-4.16.9.tar.gz \
+        https://distfiles.macports.org/py-sip/sip-4.16.9.tar.gz \
+ && curl -fL --retry 3 -o PyQt-gpl-5.3.2.tar.gz \
+        https://distfiles.macports.org/py-pyqt5/PyQt-gpl-5.3.2.tar.gz \
+ && curl -fL --retry 3 -o Python-3.4.0.tgz \
+        https://www.python.org/ftp/python/3.4.0/Python-3.4.0.tgz \
+ && ls -la
+
+# ----------------------------------------------------------------------------
+# 7) Install pyqtdeploy 0.5 from source
+# ----------------------------------------------------------------------------
+# The original Riverbank hg server is dead.  We try multiple sources in
+# decreasing order of reliability.  Each `curl -fL` either succeeds and the
+# `&&` continues to install, or fails and falls through to the next attempt.
+WORKDIR /tmp
+RUN ( \
+        curl -fL --retry 3 -o pyqtdeploy-0.5.tar.gz \
+            https://distfiles.macports.org/py-pyqtdeploy/pyqtdeploy-0.5.tar.gz \
+        || curl -fL --retry 3 -o pyqtdeploy-0.5.tar.gz \
+            https://files.pythonhosted.org/packages/source/p/pyqtdeploy/pyqtdeploy-0.5.tar.gz \
+        || curl -fL --retry 3 -o pyqtdeploy-0.5.tar.gz \
+            https://www.riverbankcomputing.com/static/Downloads/pyqtdeploy/0.5/pyqtdeploy-0.5.tar.gz \
+    ) \
+ && tar xzf pyqtdeploy-0.5.tar.gz \
+ && cd pyqtdeploy-0.5 \
+ && python3.4 setup.py install \
+ && cd /tmp && rm -rf pyqtdeploy-0.5* \
+ && ( command -v pyqtdeploycli || command -v pyqtdeploy || \
+        echo "WARNING: pyqtdeploy installed but no CLI shim on PATH" )
+
+# ----------------------------------------------------------------------------
+# 8) Environment defaults expected by the plashless script
+# ----------------------------------------------------------------------------
+ENV PYTHONPATH=/usr/local/lib/python3.4/site-packages
+ENV SYSROOT=/root/aRoot
+
+RUN mkdir -p /root/aRoot /work /output
+
+# ----------------------------------------------------------------------------
+# 9) Sanity dump (visible in `docker build` output for diagnosis)
+# ----------------------------------------------------------------------------
+RUN echo "==== Image summary ====" \
+ && python3.4 --version \
+ && python3.4 -c "import ssl; print('SSL:', ssl.OPENSSL_VERSION)" \
+ && /root/Qt/5.3/android_armv7/bin/qmake --version | head -2 \
+ && (command -v hg && hg --version | head -1) \
+ && ls /root/android-ndk-r10e/ndk-build \
+ && ls /root/.pyqt5_android_plashless/downloads/ \
+ && (command -v pyqtdeploycli || command -v pyqtdeploy || echo "(pyqtdeploy CLI not on PATH)")
+
+WORKDIR /work
+CMD ["/bin/bash"]

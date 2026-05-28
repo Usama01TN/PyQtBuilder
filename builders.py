@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Helping to get builders tools currently.
+Builder tool resolution helpers.
+
+Patched from the original to:
+  1. Fix str.rstrip('.exe') bug -- rstrip strips CHARACTERS not a suffix.
+     'make'.rstrip('.exe')  => 'mak'   (eats trailing 'e')
+     'cmake'.rstrip('.exe') => 'cmak'
+     We use a proper endswith() check instead.
+  2. Make the `cmake` PyPI package optional.  The plashless pipeline never
+     calls getCmakeExecutable(); we don't want it failing to import.
 """
 from os.path import isfile, join, exists, dirname
 from sys import executable, platform, path
-from cmake import CMAKE_BIN_DIR
 from json import loads
 
 if dirname(__file__) not in path:
@@ -12,8 +19,27 @@ if dirname(__file__) not in path:
 
 try:
     from .build_utils import run, which
-except:
+except (ImportError, ValueError):
     from build_utils import run, which
+
+# cmake PyPI package is optional -- only needed by getCmakeExecutable(), which
+# the plashless build never calls.  If it's missing we just provide a stub.
+try:
+    from cmake import CMAKE_BIN_DIR
+except ImportError:
+    CMAKE_BIN_DIR = ''
+
+
+def _strip_exe_suffix(name):
+    """
+    Correctly strip a trailing '.exe' suffix (case-insensitive).
+
+    The original code used name.rstrip('.exe') which removes any combination
+    of '.', 'e', 'x' chars from the right -- 'make' becomes 'mak'.
+    """
+    if name.lower().endswith('.exe'):
+        return name[:-4]
+    return name
 
 
 def getCmakeVersion(cmakePath):
@@ -24,13 +50,11 @@ def getCmakeVersion(cmakePath):
     try:
         result = run([str(cmakePath), '-E', 'capabilities'], capture_output=True, text=True)
         return loads(result.stdout)['version']['string']
-    except:
-        # In some cases (like Pyodide<0.26's cmake wrapper), `-E` isn't handled
-        # correctly, so let's try `--version`, which is more common so more likely to be wrapped correctly.
+    except Exception:
         try:
             result = run([str(cmakePath), '--version'], capture_output=True, text=True)
             return result.stdout.splitlines()[0].split()[-1].split('-')[0]
-        except:
+        except Exception:
             return '0.0'
 
 
@@ -39,146 +63,67 @@ def getCurrentExecutable(name):
     :param name: str | unicode
     :return: str | unicode
     """
-    name = '{}{}'.format(name.rstrip('.exe'), '.exe' if platform.lower() == 'win32' else '')
-    if exists(name):
-        return name
-    prog = which(name.rstrip('.exe'))  # type: str
+    base = _strip_exe_suffix(name)
+    full = '{0}{1}'.format(base, '.exe' if platform.lower() == 'win32' else '')
+    if exists(full):
+        return full
+    prog = which(base)
     if prog:
         return prog
-    # Just guess otherwise.
-    return join(dirname(__file__), name)
+    return join(dirname(__file__), full)
 
 
 def getCmakeExecutable():
     """
     :return: str | unicode
     """
-    pth = '{}/cmake'.format(CMAKE_BIN_DIR)  # type: str
-    cmakeExec = '{}.exe'.format(pth) if isfile('{}.exe'.format(pth)) else pth
-    if exists(cmakeExec):
-        return cmakeExec
+    if CMAKE_BIN_DIR:
+        pth = '{0}/cmake'.format(CMAKE_BIN_DIR)
+        cmakeExec = '{0}.exe'.format(pth) if isfile('{0}.exe'.format(pth)) else pth
+        if exists(cmakeExec):
+            return cmakeExec
     for name in ('cmake', 'cmake3'):
-        prog = which(name)  # type: str
+        prog = which(name)
         if prog and getCmakeVersion(prog) != '0.0':
             return prog
-    # Just guess otherwise.
     return 'cmake'
 
 
-def getMakeExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('make')
-
-
-def getGitExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('git')
-
-
-def getAntExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('ant')
-
-
-def getAdbExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('adb')
-
-
-def getNdkBuildExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('ndk-build')
+def getMakeExecutable():        return getCurrentExecutable('make')
+def getGitExecutable():         return getCurrentExecutable('git')
+def getAntExecutable():         return getCurrentExecutable('ant')
+def getAdbExecutable():         return getCurrentExecutable('adb')
+def getNdkBuildExecutable():    return getCurrentExecutable('ndk-build')
+def getUVExecutable():          return getCurrentExecutable('uv')
+def getXcodebuildExecutable():  return getCurrentExecutable('xcodebuild')
+def getXcrunExecutable():       return getCurrentExecutable('xcrun')
+def getXcodeSelectExecutable(): return getCurrentExecutable('xcode-select')
+def getHgExecutable():          return getCurrentExecutable('hg')
+def getJavaExecutable():        return getCurrentExecutable('java')
 
 
 def getArmLinuxAndroideabiStripExecutable():
-    """
-    :return: str | unicode
-    """
     return getCurrentExecutable('arm-linux-androideabi-strip')
 
 
-def getUVExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('uv')
-
-
-def getXcodebuildExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('xcodebuild')
-
-
-def getXcrunExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('xcrun')
-
-
-def getXcodeSelectExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('xcode-select')
-
-
 def getPythonExecutable():
-    """
-    :return: str | unicode
-    """
     if exists(executable):
         return executable
-    for name in ('python', 'python3', 'python3.4', 'python2'):
-        if exists(getCurrentExecutable(name)):
-            return getCurrentExecutable(name)
-    # Just guess otherwise.
+    for name in ('python3.4', 'python3', 'python', 'python2'):
+        prog = which(name)
+        if prog:
+            return prog
     return getCurrentExecutable(join('bin', 'python'))
 
 
 def getPyqtdeploySysrootExecutable():
-    """
-    :return: str | unicode
-    """
     return getCurrentExecutable('pyqtdeploy-sysroot')
 
 
 def getPyqtdeployBuildExecutable():
-    """
-    :return: str | unicode
-    """
     return getCurrentExecutable('pyqtdeploy-build')
 
 
-def getHgExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('hg')
-
-
 def getOpenExecutable():
-    """
-    :return: str | unicode
-    """
-    o = getCurrentExecutable('open')  # type: str
+    o = getCurrentExecutable('open')
     return o if exists(o) else ''
-
-
-def getJavaExecutable():
-    """
-    :return: str | unicode
-    """
-    return getCurrentExecutable('java')
