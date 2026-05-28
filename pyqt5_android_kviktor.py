@@ -1221,6 +1221,68 @@ class Builder(object):
                             candidates.append(m)
         return candidates[0] if candidates else None
 
+    def _patch_python_source(self):
+        """Fix known issues in the Python source extracted by pyqtdeploy.
+
+        pyqtdeploy 2.5.1's generated Makefile references some Python source
+        files that either (a) don't exist in Python 3.7.7's tree at all, or
+        (b) are Windows-only and not shipped on Unix.  When `make` tries to
+        compile them, it fails with "No rule to make target ... .c".
+
+        We pre-create empty C stubs for these known-missing files.  An
+        empty translation unit is valid C99 and produces a no-op .o file.
+        The functions these files would normally provide are Windows-only
+        and not referenced by anything in an Android build, so the empty
+        .o just gets included and ignored.
+
+        This patch is IDEMPOTENT: it checks if the file already exists
+        (e.g. user has a real Python source with these files) and skips.
+        """
+        cfg = self.cfg
+        python_src_dir = join(cfg.sysroot_dir, 'src',
+                              'Python-{0}'.format(PYTHON_VERSION))
+        if not exists(python_src_dir):
+            _log.debug('  python source not yet extracted, skipping patch')
+            return
+
+        # List of (relpath-under-python-src, brief explanation) tuples.
+        # If you hit another "No rule to make target XXX.c" error from
+        # pyqtdeploy, add the file here.
+        missing_stubs = [
+            ('Modules/expat/loadlibrary.c',
+             'Windows-only expat dynamic-loader; empty stub for non-Windows '
+             'builds'),
+        ]
+
+        stub_template = (
+            '/* Empty stub created by pyqt5_android_kviktor.py.\n'
+            ' *\n'
+            ' * Original file: {relpath}\n'
+            ' * Reason: {reason}\n'
+            ' *\n'
+            ' * pyqtdeploy 2.5.1\'s generated Makefile references this file\n'
+            ' * unconditionally even on non-Windows builds, but Python 3.7.7\n'
+            ' * does not ship it on Unix.  We provide an empty translation\n'
+            ' * unit (valid C99) so make has something to compile.  The\n'
+            ' * resulting .o contains no symbols and is harmlessly linked.\n'
+            ' */\n'
+        )
+
+        patched_any = False
+        for relpath, reason in missing_stubs:
+            full = join(python_src_dir, relpath)
+            if exists(full):
+                _log.debug('  %s already exists, skipping', relpath)
+                continue
+            _makedirs(dirname(full))
+            _write_text(full,
+                        stub_template.format(relpath=relpath, reason=reason))
+            _log.info('  stubbed missing Python source: %s', relpath)
+            patched_any = True
+
+        if not patched_any:
+            _log.debug('  no Python source patches needed')
+
     def stage_pyqtdeploy_sysroot(self):
         banner('PYQTDEPLOY_SR')
         cfg = self.cfg
@@ -1232,51 +1294,57 @@ class Builder(object):
             _log.info('  sysroot exists with libpython at %s -- skipping',
                       existing)
             _log.info('  (use --force to rebuild)')
-            return
+        else:
+            cmd = [
+                cfg.pyqtdeploy_sysroot_exe,
+                '--target',     PYQTDEPLOY_TARGET,
+                '--source-dir', cfg.sources_dir,
+                '--source-dir', cfg.qt_dir,
+                '--sysroot',    cfg.sysroot_dir,
+                '--verbose',
+                cfg.sysroot_json,
+            ]
+            _log.info('  this typically takes 20-40 minutes on first run')
+            _run(cmd, cwd=cfg.project_dir, env=cfg.build_env())
 
-        cmd = [
-            cfg.pyqtdeploy_sysroot_exe,
-            '--target',     PYQTDEPLOY_TARGET,
-            '--source-dir', cfg.sources_dir,
-            '--source-dir', cfg.qt_dir,
-            '--sysroot',    cfg.sysroot_dir,
-            '--verbose',
-            cfg.sysroot_json,
-        ]
-        _log.info('  this typically takes 20-40 minutes on first run')
-        _run(cmd, cwd=cfg.project_dir, env=cfg.build_env())
+            # Post-condition: look for ANY libpython variant.
+            libpython = self._find_libpython(cfg.sysroot_dir)
+            if not libpython:
+                msg = ['pyqtdeploy-sysroot reported success but no '
+                       'libpython*.{a,so} was found.']
+                for base, label in [(cfg.sysroot_dir, 'sysroot'),
+                                    (join(cfg.sysroot_dir, 'host'),
+                                     'sysroot/host')]:
+                    if not exists(base):
+                        msg.append('  {0} ({1}): does not exist'.format(
+                            label, base))
+                        continue
+                    msg.append('  {0} ({1}):'.format(label, base))
+                    for sub in ('lib', 'lib64', 'bin', 'include'):
+                        sub_dir = join(base, sub)
+                        if exists(sub_dir):
+                            try:
+                                items = sorted(os.listdir(sub_dir))[:30]
+                            except OSError as e:
+                                items = ['(could not list: {0})'.format(e)]
+                            msg.append('    {0}/  ({1} items)'.format(
+                                sub, len(items)))
+                            for it in items[:15]:
+                                msg.append('      ' + it)
+                            if len(items) >= 30:
+                                msg.append('      ... (truncated)')
+                msg.append('')
+                msg.append('Note: this often indicates the cross-compile of '
+                           'Python failed but pyqtdeploy did not propagate '
+                           'the error.  Try --force --verbose for a clean '
+                           'rebuild with full logs.')
+                raise BuildError('\n'.join(msg))
+            _log.info('  ok: sysroot built (libpython at %s)', libpython)
 
-        # Post-condition: look for ANY libpython variant.
-        libpython = self._find_libpython(cfg.sysroot_dir)
-        if not libpython:
-            # Detailed diagnostic so the user can see what actually got built.
-            msg = ['pyqtdeploy-sysroot reported success but no libpython*.{a,so} '
-                   'was found.']
-            for base, label in [(cfg.sysroot_dir, 'sysroot'),
-                                (join(cfg.sysroot_dir, 'host'), 'sysroot/host')]:
-                if not exists(base):
-                    msg.append('  {0} ({1}): does not exist'.format(label, base))
-                    continue
-                msg.append('  {0} ({1}):'.format(label, base))
-                for sub in ('lib', 'lib64', 'bin', 'include'):
-                    sub_dir = join(base, sub)
-                    if exists(sub_dir):
-                        try:
-                            items = sorted(os.listdir(sub_dir))[:30]
-                        except OSError as e:
-                            items = ['(could not list: {0})'.format(e)]
-                        msg.append('    {0}/  ({1} items)'.format(
-                            sub, len(items)))
-                        for it in items[:15]:
-                            msg.append('      ' + it)
-                        if len(items) >= 30:
-                            msg.append('      ... (truncated)')
-            msg.append('')
-            msg.append('Note: this often indicates the cross-compile of Python '
-                       'failed but pyqtdeploy did not propagate the error.  Try '
-                       '--force --verbose for a clean rebuild with full logs.')
-            raise BuildError('\n'.join(msg))
-        _log.info('  ok: sysroot built (libpython at %s)', libpython)
+        # Patch known-broken Python source files (idempotent).  Runs
+        # whether or not we skipped the sysroot build above -- handles
+        # the case where the cache restored an unpatched sysroot.
+        self._patch_python_source()
 
     # ===== stage 9 ============================================ pyqtdeploy-build
 
@@ -1388,6 +1456,85 @@ class Builder(object):
                 return matches[0]
         return None
 
+    def _stub_missing_makefile_sources(self):
+        """Defensive safety net: after qmake generates the Makefile but
+        before `make` runs, scan the Makefile for references to .c source
+        files in the Python source tree and create empty stubs for any
+        that don't exist on disk.
+
+        This catches the same class of bug as _patch_python_source (where
+        pyqtdeploy 2.5.1 generates rules for source files that don't exist
+        in Python 3.7.7's tree on Unix) but works generically -- if any
+        new "No rule to make target ... .c" issue appears, this catches
+        it without code changes.
+
+        Restricts stubbing to .c files under sysroot/src/Python-*/Modules/
+        so we don't accidentally stub real files elsewhere that should
+        exist (which would mask a genuine problem).
+        """
+        import re as _re
+        cfg = self.cfg
+        makefile = join(cfg.build_dir, 'Makefile')
+        if not exists(makefile):
+            _log.debug('  no Makefile yet, skipping safety scan')
+            return
+
+        try:
+            content = _read_text(makefile)
+        except (IOError, OSError) as e:
+            _log.warning('  could not read Makefile for safety scan: %s', e)
+            return
+
+        # Find all .c file references in the Makefile.  Pattern matches
+        # paths ending in .c, no whitespace, no Make variables ($X, $(X)).
+        # Restrict to paths containing "src/Python-" so we only stub files
+        # in the Python source tree.
+        candidates = set()
+        for m in _re.finditer(r'(\S+\.c)\b', content):
+            path = m.group(1)
+            if '$' in path or '{' in path:
+                continue
+            if 'src/Python-' not in path:
+                continue
+            candidates.add(path)
+
+        if not candidates:
+            _log.debug('  no Python source references in Makefile (unusual)')
+            return
+
+        # Resolve and check existence
+        stubbed = []
+        for c_rel in sorted(candidates):
+            if os.path.isabs(c_rel):
+                full = c_rel
+            else:
+                # Makefile is in build_dir, so relative paths are too
+                full = os.path.normpath(join(cfg.build_dir, c_rel))
+            if exists(full):
+                continue
+            # Missing!  Create a stub.
+            _makedirs(dirname(full))
+            stub = (
+                '/* Empty stub created by pyqt5_android_kviktor.py.\n'
+                ' *\n'
+                ' * Reason: the generated Makefile references this file but\n'
+                ' * Python 3.7.7\'s source tree does not contain it on Unix.\n'
+                ' * pyqtdeploy 2.5.1 includes Windows-only sources in the\n'
+                ' * build rules unconditionally; this stub satisfies make\n'
+                ' * without contributing any symbols.\n'
+                ' */\n'
+            )
+            _write_text(full, stub)
+            stubbed.append(c_rel)
+
+        if stubbed:
+            _log.warning('  ! stubbed %d missing Python source file(s) '
+                         'referenced by Makefile:', len(stubbed))
+            for s in stubbed:
+                _log.warning('    - %s', s)
+        else:
+            _log.debug('  Makefile safety scan: all referenced .c files exist')
+
     def stage_compile(self):
         banner('COMPILE')
         cfg = self.cfg
@@ -1398,6 +1545,10 @@ class Builder(object):
         _run([cfg.qmake_exe], cwd=cfg.build_dir, env=env)
         if not exists(join(cfg.build_dir, 'Makefile')):
             raise BuildError('qmake did not produce a Makefile')
+
+        # Defensive: scan the Makefile and stub any missing Python source
+        # files it references (pyqtdeploy 2.5.1 has known bugs here)
+        self._stub_missing_makefile_sources()
 
         # make
         _log.info('  [make -j%d] compiling app shared library ...', cfg.jobs)
