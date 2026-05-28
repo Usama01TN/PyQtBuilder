@@ -1092,16 +1092,45 @@ class Builder(object):
 
     # ===== stage 8 ============================================ pyqtdeploy-sysroot
 
+    @staticmethod
+    def _find_libpython(sysroot_dir):
+        """Return the path to a libpython*.{a,so} in the sysroot, or None.
+
+        pyqtdeploy 2.5.1's Python plugin may produce any of:
+            lib/libpython3.7m.a   (traditional, with pymalloc 'm' suffix)
+            lib/libpython3.7.a    (when pymalloc disabled)
+            lib/libpython3.7m.so  (shared variant)
+            lib/libpython3.7.so   (shared, no 'm')
+        We check all of them.  Also searches the host/ subdir as a sanity
+        backstop (some pyqtdeploy variants stage there).
+        """
+        import glob as _glob
+        candidates = []
+        for base in (sysroot_dir, join(sysroot_dir, 'host')):
+            for sub in ('lib', 'lib64'):
+                lib_dir = join(base, sub)
+                if not exists(lib_dir):
+                    continue
+                for pat in ('libpython3.7m.a', 'libpython3.7.a',
+                            'libpython3.7m.so', 'libpython3.7.so',
+                            'libpython3.7*.a', 'libpython3.7*.so',
+                            'libpython3*.a',   'libpython3*.so'):
+                    matches = sorted(_glob.glob(join(lib_dir, pat)))
+                    for m in matches:
+                        if m not in candidates:
+                            candidates.append(m)
+        return candidates[0] if candidates else None
+
     def stage_pyqtdeploy_sysroot(self):
         banner('PYQTDEPLOY_SR')
         cfg = self.cfg
 
         # Sysroot is huge (~600 MB).  If it already exists and looks built
-        # (has a usable libpython3.7m.a), skip.
-        libpython = join(cfg.sysroot_dir, 'lib', 'libpython3.7m.a')
-        if exists(libpython) and not cfg.force:
+        # (has any libpython static or shared lib), skip.
+        existing = self._find_libpython(cfg.sysroot_dir)
+        if existing and not cfg.force:
             _log.info('  sysroot exists with libpython at %s -- skipping',
-                      libpython)
+                      existing)
             _log.info('  (use --force to rebuild)')
             return
 
@@ -1117,11 +1146,37 @@ class Builder(object):
         _log.info('  this typically takes 20-40 minutes on first run')
         _run(cmd, cwd=cfg.project_dir, env=cfg.build_env())
 
-        if not exists(libpython):
-            raise BuildError(
-                'sysroot build appeared to succeed but {0} is missing'.format(
-                    libpython))
-        _log.info('  ok: sysroot built at %s', cfg.sysroot_dir)
+        # Post-condition: look for ANY libpython variant.
+        libpython = self._find_libpython(cfg.sysroot_dir)
+        if not libpython:
+            # Detailed diagnostic so the user can see what actually got built.
+            msg = ['pyqtdeploy-sysroot reported success but no libpython*.{a,so} '
+                   'was found.']
+            for base, label in [(cfg.sysroot_dir, 'sysroot'),
+                                (join(cfg.sysroot_dir, 'host'), 'sysroot/host')]:
+                if not exists(base):
+                    msg.append('  {0} ({1}): does not exist'.format(label, base))
+                    continue
+                msg.append('  {0} ({1}):'.format(label, base))
+                for sub in ('lib', 'lib64', 'bin', 'include'):
+                    sub_dir = join(base, sub)
+                    if exists(sub_dir):
+                        try:
+                            items = sorted(os.listdir(sub_dir))[:30]
+                        except OSError as e:
+                            items = ['(could not list: {0})'.format(e)]
+                        msg.append('    {0}/  ({1} items)'.format(
+                            sub, len(items)))
+                        for it in items[:15]:
+                            msg.append('      ' + it)
+                        if len(items) >= 30:
+                            msg.append('      ... (truncated)')
+            msg.append('')
+            msg.append('Note: this often indicates the cross-compile of Python '
+                       'failed but pyqtdeploy did not propagate the error.  Try '
+                       '--force --verbose for a clean rebuild with full logs.')
+            raise BuildError('\n'.join(msg))
+        _log.info('  ok: sysroot built (libpython at %s)', libpython)
 
     # ===== stage 9 ============================================ pyqtdeploy-build
 
