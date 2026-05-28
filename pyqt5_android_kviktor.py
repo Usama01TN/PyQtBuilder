@@ -124,6 +124,28 @@ DEFAULT_PYQT5_MODULES = [
 # Default Python stdlib modules to freeze into the APK.  Comprehensive list
 # to reduce ModuleNotFoundError surface at runtime -- pyqtdeploy only bundles
 # modules listed here, so unlisted ones crash the app on first import.
+#
+# IMPORTANT: only modules whose C extensions either (a) have no external
+# dependency or (b) depend on libraries we already cross-compile (OpenSSL,
+# zlib).  Modules that need OTHER native libs MUST NOT be added here unless
+# the lib is also cross-compiled and added to sysroot.json.
+#
+# Intentionally NOT in this list (need libs we don't provide):
+#   sqlite3   -> needs libsqlite3      (header sqlite3.h missing from NDK)
+#   _curses   -> needs ncurses
+#   _tkinter  -> needs Tcl/Tk
+#   _dbm      -> needs gdbm / ndbm
+#   _gdbm     -> needs gdbm
+#   _lzma     -> needs liblzma
+#   _bz2      -> needs libbz2
+#   readline  -> needs libreadline
+#   nis       -> needs libnsl
+#   ossaudiodev -> Linux-only audio (no Android equivalent)
+#   spwd      -> needs Linux shadow passwd db (no Android equivalent)
+#
+# To enable any of the above, you would need to (1) add a cross-compile
+# step to sysroot.json for the dependent library, and (2) add the module
+# here.  This is beyond the scope of the default build.
 DEFAULT_STDLIB_MODULES = [
     'abc', 'argparse', 'ast', 'atexit', 'base64', 'binascii', 'bisect',
     'calendar', 'cmath', 'cmd', 'code', 'codecs', 'codeop',
@@ -155,7 +177,7 @@ DEFAULT_STDLIB_MODULES = [
     'queue', 'quopri',
     'random', 're', 'reprlib', 'runpy',
     'secrets', 'select', 'selectors', 'shlex', 'shutil', 'signal',
-    'site', 'smtplib', 'socket', 'socketserver', 'sqlite3', 'ssl',
+    'site', 'smtplib', 'socket', 'socketserver', 'ssl',
     'stat', 'statistics', 'string', 'stringprep', 'struct', 'subprocess',
     'sys', 'sysconfig',
     'tarfile', 'telnetlib', 'tempfile', 'textwrap', 'threading', 'time',
@@ -170,6 +192,30 @@ DEFAULT_STDLIB_MODULES = [
     'xmlrpc',
     'zipapp', 'zipfile', 'zipimport', 'zlib',
 ]
+
+# Stdlib modules whose C extensions need external libraries not provided by
+# our sysroot.  If the user's code imports any of these we fail at scan
+# time with a clear actionable message, rather than letting them hit a
+# confusing C compile error 25 minutes into the build.
+PROBLEMATIC_STDLIB_MODULES = {
+    'sqlite3':   'requires libsqlite3 (header sqlite3.h not in NDK)',
+    '_sqlite3':  'requires libsqlite3 (header sqlite3.h not in NDK)',
+    'curses':    'requires ncurses (not in NDK)',
+    '_curses':   'requires ncurses (not in NDK)',
+    'tkinter':   'requires Tcl/Tk (not in NDK)',
+    '_tkinter':  'requires Tcl/Tk (not in NDK)',
+    'dbm':       'requires gdbm/ndbm (not in NDK)',
+    '_dbm':      'requires gdbm/ndbm (not in NDK)',
+    '_gdbm':     'requires gdbm (not in NDK)',
+    'lzma':      'requires liblzma (not in NDK)',
+    '_lzma':     'requires liblzma (not in NDK)',
+    'bz2':       'requires libbz2 (not in NDK)',
+    '_bz2':      'requires libbz2 (not in NDK)',
+    'readline':  'requires libreadline (not in NDK)',
+    'nis':       'requires libnsl (not in NDK)',
+    'ossaudiodev': 'Linux-only audio (no Android equivalent)',
+    'spwd':      'requires Linux shadow passwd db (no Android equivalent)',
+}
 
 # Common package-content exclusions
 PACKAGE_EXCLUDES = [
@@ -784,6 +830,37 @@ class Builder(object):
                                 found.add(parts[1])
         return found
 
+    def _detect_problematic_stdlib_imports(self, files):
+        """Scan .py files for imports of stdlib modules that won't build on
+        Android (need libs the NDK doesn't provide).  Returns dict mapping
+        module name -> list of (relpath, lineno) tuples.
+        """
+        cfg = self.cfg
+        problems = {}   # module_name -> [(relpath, lineno), ...]
+        for relpath, isdir_ in files:
+            if isdir_ or not relpath.endswith('.py'):
+                continue
+            fpath = join(cfg.project_dir, relpath)
+            try:
+                source_text = _read_text(fpath)
+                tree = ast.parse(source_text, filename=fpath)
+            except (SyntaxError, IOError, OSError):
+                continue
+            for node in ast.walk(tree):
+                # Resolve every import to its top-level module name
+                names_to_check = []
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        names_to_check.append(alias.name.split('.')[0])
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        names_to_check.append(node.module.split('.')[0])
+                for n in names_to_check:
+                    if n in PROBLEMATIC_STDLIB_MODULES:
+                        problems.setdefault(n, []).append(
+                            (relpath, getattr(node, 'lineno', '?')))
+        return problems
+
     def stage_scan(self):
         """Scan project_dir for source files.  Returns metadata used by
         subsequent stages.  Also auto-detects which PyQt5 submodules the
@@ -847,6 +924,29 @@ class Builder(object):
             _log.info('    %s%s', '[d] ' if is_dir else '    ', path)
         if len(files) > 20:
             _log.info('    ... and %d more', len(files) - 20)
+
+        # ---- detect problematic stdlib imports (fail fast) ----
+        bad_stdlib = self._detect_problematic_stdlib_imports(files)
+        if bad_stdlib:
+            msg_lines = [
+                '',
+                'Your code imports stdlib modules that cannot be cross-',
+                'compiled for Android with the default sysroot (NDK does',
+                'not ship the required headers / libraries):',
+                '',
+            ]
+            for mod in sorted(bad_stdlib.keys()):
+                reason = PROBLEMATIC_STDLIB_MODULES[mod]
+                msg_lines.append('  - {0:12s}  {1}'.format(mod, reason))
+                for relpath, lineno in bad_stdlib[mod][:5]:
+                    msg_lines.append('      imported in {0}:{1}'.format(
+                        relpath, lineno))
+            msg_lines.append('')
+            msg_lines.append('To proceed, either:')
+            msg_lines.append('  (a) remove these imports from your code')
+            msg_lines.append('  (b) add cross-compile steps for the required')
+            msg_lines.append('      native libs to sysroot.json (advanced).')
+            raise BuildError('\n'.join(msg_lines))
 
         # ---- auto-detect PyQt5 imports ----
         detected = self._detect_pyqt5_imports(files)
