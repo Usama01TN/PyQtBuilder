@@ -1180,6 +1180,22 @@ class Builder(object):
 
     # ===== stage 9 ============================================ pyqtdeploy-build
 
+    @staticmethod
+    def _find_pro_file(build_dir):
+        """Return the path to any *.pro file in the build dir, or None.
+
+        pyqtdeploy 2.5.1 names the .pro after the Application's name
+        attribute in the .pdy (or 'app', 'pyqtdeploy', or some other
+        default when name is empty).  The actual name doesn't matter --
+        qmake picks up whatever .pro is in cwd.  We just need to verify
+        that pyqtdeploy-build actually produced one.
+        """
+        import glob as _glob
+        if not exists(build_dir):
+            return None
+        matches = sorted(_glob.glob(join(build_dir, '*.pro')))
+        return matches[0] if matches else None
+
     def stage_pyqtdeploy_build(self):
         banner('PYQTDEPLOY_B')
         cfg = self.cfg
@@ -1194,13 +1210,83 @@ class Builder(object):
         ]
         _run(cmd, cwd=cfg.project_dir, env=cfg.build_env())
 
-        pro_file = join(cfg.build_dir, 'pyqtdeploy.pro')
-        if not exists(pro_file):
-            raise BuildError(
-                'pyqtdeploy-build did not produce {0}'.format(pro_file))
+        # Post-condition: pyqtdeploy-build should have produced a .pro file
+        # in the build dir.  The actual filename varies (depends on the
+        # Application name in the .pdy), so we glob for any .pro file.
+        pro_file = self._find_pro_file(cfg.build_dir)
+        if not pro_file:
+            # Diagnostic dump
+            msg = ['pyqtdeploy-build reported success but no .pro file was '
+                   'found in {0}.'.format(cfg.build_dir)]
+            if exists(cfg.build_dir):
+                try:
+                    items = sorted(os.listdir(cfg.build_dir))[:40]
+                except OSError as e:
+                    items = ['(could not list: {0})'.format(e)]
+                msg.append('  Contents of build dir ({0} items):'.format(
+                    len(items)))
+                for it in items:
+                    full = join(cfg.build_dir, it)
+                    if isdir(full):
+                        msg.append('    [d] ' + it + '/')
+                    else:
+                        msg.append('        ' + it)
+            else:
+                msg.append('  Build dir does not exist!')
+            msg.append('')
+            msg.append('Note: pyqtdeploy-build normally produces *.pro, '
+                       'main.cpp, resources/, and similar files.  If they '
+                       'are missing, the .pdy may be malformed or the '
+                       'sysroot incomplete.  Try --force --verbose.')
+            raise BuildError('\n'.join(msg))
         _log.info('  ok: build dir populated at %s', cfg.build_dir)
+        _log.info('  ok: project file: %s', pro_file)
 
     # ===== stage 10 =========================================== compile
+
+    @staticmethod
+    def _find_libmain(build_dir):
+        """Return the path to the main shared library in the build dir.
+
+        qmake produces lib<TARGET>.so where TARGET is derived from the
+        Application name in the .pdy.  With our empty name='' default,
+        it is 'libmain.so', but a customised .pdy could produce something
+        else.  We check for the conventional name first, then glob.
+        """
+        import glob as _glob
+        canonical = join(build_dir, 'libmain.so')
+        if exists(canonical):
+            return canonical
+        for pat in ('lib*.so',):
+            matches = sorted(_glob.glob(join(build_dir, pat)))
+            # Exclude obvious non-app libs (Qt copies, runtime, etc.)
+            for m in matches:
+                name = basename(m)
+                if any(name.startswith(p) for p in ('libQt5', 'libc++',
+                        'libssl', 'libcrypto', 'libgdbserver')):
+                    continue
+                return m
+        return None
+
+    @staticmethod
+    def _find_deployment_settings(build_dir):
+        """Return the path to androiddeployqt's input JSON, or None.
+
+        Filename is android-<libname>.so-deployment-settings.json where
+        libname matches the qmake TARGET.  We accept any variant.
+        """
+        import glob as _glob
+        if not exists(build_dir):
+            return None
+        # Most specific first
+        for pat in ('android-libmain.so-deployment-settings.json',
+                    'android-lib*.so-deployment-settings.json',
+                    'android-*deployment-settings.json',
+                    '*deployment-settings.json'):
+            matches = sorted(_glob.glob(join(build_dir, pat)))
+            if matches:
+                return matches[0]
+        return None
 
     def stage_compile(self):
         banner('COMPILE')
@@ -1214,13 +1300,23 @@ class Builder(object):
             raise BuildError('qmake did not produce a Makefile')
 
         # make
-        _log.info('  [make -j%d] compiling libmain.so ...', cfg.jobs)
+        _log.info('  [make -j%d] compiling app shared library ...', cfg.jobs)
         _run(['make', '-j{0}'.format(cfg.jobs)], cwd=cfg.build_dir, env=env)
-        libmain = join(cfg.build_dir, 'libmain.so')
-        if not exists(libmain):
-            raise BuildError('make did not produce {0}'.format(libmain))
+        libmain = self._find_libmain(cfg.build_dir)
+        if not libmain:
+            # Diagnostic
+            try:
+                so_files = sorted([f for f in os.listdir(cfg.build_dir)
+                                   if f.endswith('.so')])
+            except OSError:
+                so_files = []
+            raise BuildError(
+                'make completed but no app shared library (lib*.so) was '
+                'found in {0}.  Found .so files: {1}'.format(
+                    cfg.build_dir, so_files or '(none)'))
         sz = os.path.getsize(libmain)
-        _log.info('  ok: libmain.so produced (%.1f MB)', sz / (1024.0 * 1024.0))
+        _log.info('  ok: %s produced (%.1f MB)',
+                  basename(libmain), sz / (1024.0 * 1024.0))
 
         # make install INSTALL_ROOT=app
         install_root = join(cfg.build_dir, 'app')
@@ -1234,12 +1330,18 @@ class Builder(object):
         banner('PACKAGE')
         cfg = self.cfg
 
-        deployment_json = join(
-            cfg.build_dir, 'android-libmain.so-deployment-settings.json')
-        if not exists(deployment_json):
+        deployment_json = self._find_deployment_settings(cfg.build_dir)
+        if not deployment_json:
+            # Diagnostic
+            try:
+                json_files = sorted([f for f in os.listdir(cfg.build_dir)
+                                     if f.endswith('.json')])
+            except OSError:
+                json_files = []
             raise BuildError(
-                'deployment settings JSON not found at {0}'.format(
-                    deployment_json))
+                'deployment settings JSON not found in {0}.  Found .json '
+                'files: {1}'.format(cfg.build_dir, json_files or '(none)'))
+        _log.info('  using deployment settings: %s', deployment_json)
 
         cmd = [
             cfg.androiddeployqt_exe,
