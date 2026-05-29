@@ -163,17 +163,39 @@ ENV PATH=/root/android-ndk-r10e:${PATH}
 # The Qt Installer Framework supports a --script JavaScript argument for
 # automation.  We render the GUI under Xvfb because the Qt 5.3-era installer
 # does not have a true headless mode.
+#
+# KNOWN ISSUE: Qt 5.3's installer reliably segfaults during the final
+# "SHOW FINISHED PAGE" cleanup, AFTER all files have been successfully
+# written to disk.  We tolerate any non-zero exit code from the installer
+# itself and validate success by checking that qmake exists on disk.
+# (Symptom from a previous attempt: ".../MaintenanceTool.new ... Segmentation
+# fault (core dumped)" right after all "Done" lines.  Install was complete.)
 COPY qt-install.qs /tmp/qt-install.qs
 WORKDIR /tmp
-RUN curl -fL --retry 3 -o qt-installer.run \
+RUN set +e ; \
+    curl -fL --retry 3 -o qt-installer.run \
         https://download.qt.io/archive/qt/5.3/5.3.2/qt-opensource-linux-x64-android-5.3.2.run \
- && chmod +x qt-installer.run \
- && echo "Running Qt 5.3.2 installer under xvfb (this takes ~3-5 minutes) ..." \
- && xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+    && chmod +x qt-installer.run \
+    && echo "Running Qt 5.3.2 installer under xvfb (this takes ~3-5 minutes) ..." ; \
+    xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
         ./qt-installer.run --script /tmp/qt-install.qs --no-force-installations --verbose \
-        2>&1 | tail -40 \
- && rm -f qt-installer.run \
- && ls /root/Qt/5.3/android_armv7/bin/qmake
+        > /tmp/qt-installer.log 2>&1 ; \
+    INSTALL_EXIT=$? ; \
+    echo "Installer exit code: ${INSTALL_EXIT}" ; \
+    echo "Last 40 lines of installer output:" ; \
+    tail -40 /tmp/qt-installer.log ; \
+    rm -f qt-installer.run /tmp/qt-installer.log ; \
+    set -e ; \
+    # ---- validate: qmake must exist regardless of installer exit code ---- \
+    QMAKE=/root/Qt/5.3/android_armv7/bin/qmake ; \
+    if [ ! -x "${QMAKE}" ]; then \
+        echo "::error:: qmake not found at expected path: ${QMAKE}" ; \
+        echo "Looking for any qmake under /root/Qt:" ; \
+        find /root/Qt -name 'qmake' -type f 2>/dev/null || echo "(none)" ; \
+        exit 1 ; \
+    fi ; \
+    echo "Qt 5.3.2 install OK (installer exit ${INSTALL_EXIT} was tolerated):" ; \
+    "${QMAKE}" --version
 
 ENV QT_ROOT=/root/Qt/5.3
 ENV PATH=/root/Qt/5.3/android_armv7/bin:${PATH}
