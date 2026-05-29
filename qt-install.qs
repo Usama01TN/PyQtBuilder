@@ -38,7 +38,11 @@ Controller.prototype.IntroductionPageCallback = function() {
 };
 
 Controller.prototype.TargetDirectoryPageCallback = function() {
-    gui.currentPageWidget().TargetDirectoryLineEdit.setText("/root/Qt/5.3");
+    // IMPORTANT: Qt's installer ALWAYS appends a version subfolder to the
+    // target directory.  Setting target to /root/Qt yields the conventional
+    // layout /root/Qt/5.3/android_armv7/.  Setting it to /root/Qt/5.3 would
+    // produce the doubled path /root/Qt/5.3/5.3/android_armv7/.
+    gui.currentPageWidget().TargetDirectoryLineEdit.setText("/root/Qt");
     gui.clickButton(buttons.NextButton);
 };
 
