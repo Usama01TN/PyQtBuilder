@@ -173,6 +173,9 @@ class BuildConfig(object):
         # Derived paths
         self.downloads_dir = join(self.work_dir, 'downloads')
         self.build_dir = join(self.project_dir, 'pensoolAndroidBuild')
+        # Directory holding the pure-Python PyQt5 shim that lets pyqtdeploy 0.5
+        # run head-lessly (no host PyQt5 needed).  Populated in Step 3.
+        self.pyqt5_shim_dir = join(self.work_dir, '_pyqt5_headless_shim')
 
     # ------------------------------------------------------------------ #
     # Properties for frequently-used derived paths.                      #
@@ -235,6 +238,11 @@ class BuildConfig(object):
         # 'PyQt5 installs to /usr/lib/Python3.4/site-packages, and that must be on PYTHONPATH.'
         existing_pp = env.get('PYTHONPATH', '')
         env['PYTHONPATH'] = '/usr/lib/python3.4/site-packages' + (pathsep + existing_pp if existing_pp else '')
+        # Put the pure-Python PyQt5 shim first so pyqtdeploy 0.5 can run without
+        # a host PyQt5 installation (configure/build only need a few QtCore
+        # filesystem classes, which the shim provides).
+        if getattr(self, 'pyqt5_shim_dir', '') and isdir(self.pyqt5_shim_dir):
+            env['PYTHONPATH'] = self.pyqt5_shim_dir + pathsep + env['PYTHONPATH']
         # NDK toolchain on PATH
         env['PATH'] = self.ndk_toolchain_bin + pathsep + env.get('PATH', '')
         return env
@@ -630,6 +638,273 @@ def install_pyqtdeploy(cfg):
     cfg.pyqtdeploycli = 'pyqtdeploycli'  # Fallback.
     log.warning('pyqtdeploycli/pyqtdeploy not found on PATH after install.')
     log.info('pyqtdeploy install done OK')
+
+
+# =============================================================================
+# Step 3b -- Make pyqtdeploy 0.5 run head-lessly (no host PyQt5).
+# =============================================================================
+#
+# pyqtdeploy 0.5 is itself a PyQt5 application.  Importing the package runs
+# pyqtdeploy/__init__.py, which eagerly imports the GUI (PyQt5.QtWidgets) and
+# the Builder/Project (PyQt5.QtCore).  On this build host there is no host
+# PyQt5, so even the command-line `configure`/`build` actions fail with:
+#     ImportError: No module named 'PyQt5'
+#
+# Building a real host PyQt5 just to run pyqtdeploy would be enormous and
+# pointless: the CLI path only uses a handful of QtCore *filesystem* classes
+# (QDir, QFile, QFileInfo, QIODevice, QByteArray) plus inert QObject/pyqtSignal.
+# So we:
+#   1. Drop a tiny *pure-Python* PyQt5.QtCore shim onto PYTHONPATH (build_env()
+#      puts cfg.pyqt5_shim_dir first), satisfying builder.py / project.py /
+#      file_utilities.py with zero real Qt.
+#   2. Make pyqtdeploy/__init__.py's GUI import non-fatal, so the head-less CLI
+#      never tries to import PyQt5.QtWidgets.  (If a real PyQt5 is ever present,
+#      the GUI still loads -- the patch is a try/except, not a deletion.)
+#
+# Both steps are idempotent and self-healing, so they work whether or not the
+# Docker image was rebuilt.
+
+# The shim source.  QtCore only -- it's all the CLI path touches.
+_PYQT5_QTCORE_SHIM = r'''# -*- coding: utf-8 -*-
+"""Auto-generated pure-Python stand-in for the subset of PyQt5.QtCore used by
+pyqtdeploy 0.5's command-line (configure/build) path.  No real Qt; signals are
+inert no-ops (the CLI has no event loop)."""
+import os as _os
+import shutil as _shutil
+
+
+class QIODevice(object):
+    ReadOnly = 0x0001; WriteOnly = 0x0002; ReadWrite = ReadOnly | WriteOnly
+    Append = 0x0004; Truncate = 0x0008; Text = 0x0010; Unbuffered = 0x0020
+
+
+class QByteArray(object):
+    def __init__(self, data=b""):
+        if isinstance(data, QByteArray): data = data._data
+        elif isinstance(data, str): data = data.encode("utf-8")
+        elif data is None: data = b""
+        self._data = bytes(data)
+    @staticmethod
+    def _b(v):
+        if isinstance(v, QByteArray): return v._data
+        if isinstance(v, str): return v.encode("utf-8")
+        return bytes(v)
+    def replace(self, before, after):
+        self._data = self._data.replace(self._b(before), self._b(after)); return self
+    def endsWith(self, suffix): return self._data.endswith(self._b(suffix))
+    def startsWith(self, prefix): return self._data.startswith(self._b(prefix))
+    def chop(self, n):
+        if n > 0: self._data = self._data[:-n]
+    def isEmpty(self): return len(self._data) == 0
+    def split(self, sep): return [QByteArray(p) for p in self._data.split(self._b(sep))]
+    def data(self): return self._data
+    def __bytes__(self): return self._data
+    def __len__(self): return len(self._data)
+    def __str__(self): return self._data.decode("utf-8", "replace")
+
+
+class QFileInfo(object):
+    def __init__(self, path): self._path = _os.path.abspath(str(path))
+    def absoluteDir(self): return QDir(_os.path.dirname(self._path))
+    def absoluteFilePath(self): return self._path
+
+
+class QDir(object):
+    Dirs = 0x001; Files = 0x002; Drives = 0x004; NoSymLinks = 0x008
+    NoDotAndDotDot = 0x1000; AllEntries = Dirs | Files | Drives
+    def __init__(self, path="."): self._path = _os.path.abspath(str(path))
+    def cd(self, name):
+        c = _os.path.abspath(_os.path.join(self._path, str(name)))
+        if _os.path.isdir(c): self._path = c; return True
+        return False
+    def absolutePath(self): return self._path
+    def exists(self, name=None):
+        if name is None: return _os.path.isdir(self._path)
+        return _os.path.exists(_os.path.join(self._path, str(name)))
+    def absoluteFilePath(self, name):
+        return _os.path.abspath(_os.path.join(self._path, str(name)))
+    def entryList(self, filters=0):
+        try: names = sorted(_os.listdir(self._path))
+        except OSError: return []
+        want_dirs = bool(filters & QDir.Dirs); want_files = bool(filters & QDir.Files)
+        if not want_dirs and not want_files: want_dirs = want_files = True
+        no_dots = bool(filters & QDir.NoDotAndDotDot); result = []
+        for name in names:
+            full = _os.path.join(self._path, name)
+            if _os.path.isdir(full):
+                if want_dirs: result.append(name)
+            elif want_files: result.append(name)
+        if want_dirs and not no_dots: result = [".", ".."] + result
+        return result
+    @staticmethod
+    def fromNativeSeparators(path): return str(path).replace("\\", "/")
+    @staticmethod
+    def toNativeSeparators(path): return str(path)
+
+
+class QFile(object):
+    def __init__(self, name=""):
+        self._name = str(name); self._fh = None; self._error = ""
+    def fileName(self): return self._name
+    def errorString(self): return self._error
+    def open(self, mode):
+        text = bool(mode & QIODevice.Text)
+        base = ("a" if (mode & QIODevice.Append) else "w") if (mode & QIODevice.WriteOnly) else "r"
+        try:
+            self._fh = open(self._name, base, encoding="utf-8") if text else open(self._name, base + "b")
+            return True
+        except (IOError, OSError) as e:
+            self._error = str(e); self._fh = None; return False
+    def readAll(self):
+        if self._fh is None: return QByteArray(b"")
+        data = self._fh.read()
+        if isinstance(data, str): data = data.encode("utf-8")
+        return QByteArray(data)
+    def write(self, data):
+        if self._fh is None: self._error = "file not open"; return -1
+        try:
+            payload = data.data() if isinstance(data, QByteArray) else (data.encode("utf-8") if isinstance(data, str) else bytes(data))
+            if "b" in getattr(self._fh, "mode", "wb"): self._fh.write(payload)
+            else: self._fh.write(payload.decode("utf-8"))
+            return len(payload)
+        except (IOError, OSError) as e:
+            self._error = str(e); return -1
+    def close(self):
+        if self._fh is not None:
+            try: self._fh.close()
+            finally: self._fh = None
+    @staticmethod
+    def exists(name): return _os.path.exists(str(name))
+    @staticmethod
+    def remove(name):
+        try: _os.remove(str(name)); return True
+        except OSError: return False
+    @staticmethod
+    def copy(src, dst):
+        try:
+            if _os.path.exists(str(dst)): return False
+            _shutil.copyfile(str(src), str(dst)); return True
+        except (IOError, OSError): return False
+
+
+class _Signal(object):
+    def __init__(self, *types): self._types = types
+    def connect(self, *a, **k): return None
+    def disconnect(self, *a, **k): return None
+    def emit(self, *a, **k): return None
+
+
+def pyqtSignal(*types, **kwargs): return _Signal(*types)
+
+
+class QObject(object):
+    def __init__(self, *args, **kwargs): pass
+    def blockSignals(self, b): return False
+    def objectName(self): return ""
+    def setObjectName(self, name): pass
+'''
+
+
+def _write_pyqt5_shim(cfg):
+    """ Write the pure-Python PyQt5 shim into cfg.pyqt5_shim_dir (idempotent).
+    :param cfg: BuildConfig
+    """
+    pkg_dir = join(cfg.pyqt5_shim_dir, 'PyQt5')
+    _makedirs(pkg_dir)
+    init_py = join(pkg_dir, '__init__.py')
+    qtcore_py = join(pkg_dir, 'QtCore.py')
+    if not isfile(init_py):
+        with open(init_py, 'w') as fh:
+            fh.write('# Pure-Python head-less stand-in for PyQt5 (QtCore only).\n')
+    with open(qtcore_py, 'w') as fh:
+        fh.write(_PYQT5_QTCORE_SHIM)
+    log.info('PyQt5 head-less shim ready: %s', pkg_dir)
+
+
+def _locate_pyqtdeploy_init():
+    """ Return the path to the installed pyqtdeploy package __init__.py without
+    importing it (importing would trigger the very PyQt5 ImportError we fix).
+    :return: str | None
+    """
+    # importlib.util.find_spec locates a package without executing __init__.
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('pyqtdeploy')
+        if spec is not None:
+            if getattr(spec, 'origin', None) and basename(spec.origin) == '__init__.py':
+                return spec.origin
+            for loc in (getattr(spec, 'submodule_search_locations', None) or []):
+                cand = join(loc, '__init__.py')
+                if isfile(cand):
+                    return cand
+    except Exception as exc:
+        log.debug('find_spec(pyqtdeploy) failed: %s', exc)
+    # Fallback: scan sys.path entries (incl. eggs) for pyqtdeploy/__init__.py.
+    candidates = []
+    for entry in list(path):
+        if not entry or not isdir(entry):
+            continue
+        direct = join(entry, 'pyqtdeploy', '__init__.py')
+        if isfile(direct):
+            candidates.append(direct)
+        try:
+            for name in listdir(entry):
+                if name.lower().startswith('pyqtdeploy') and name.lower().endswith('.egg'):
+                    cand = join(entry, name, 'pyqtdeploy', '__init__.py')
+                    if isfile(cand):
+                        candidates.append(cand)
+        except OSError:
+            pass
+    return candidates[0] if candidates else None
+
+
+def _patch_pyqtdeploy_gui_import(init_path):
+    """ Make pyqtdeploy/__init__.py's GUI import non-fatal so the head-less CLI
+    works without PyQt5.QtWidgets.  Idempotent.
+    :param init_path: str
+    :return: bool  -- True if patched/already-OK, False if anchor missing.
+    """
+    with open(init_path, 'r') as fh:
+        src = fh.read()
+    sentinel = 'except ImportError:\n    ProjectGUI = None'
+    if sentinel in src:
+        log.info('pyqtdeploy __init__ already head-less-patched OK')
+        return True
+    anchor = 'from .gui import ProjectGUI'
+    if anchor not in src:
+        log.warning('Could not find GUI import anchor in %s; skipping patch.', init_path)
+        return False
+    patched = src.replace(
+        anchor,
+        'try:\n    from .gui import ProjectGUI\nexcept ImportError:\n    ProjectGUI = None',
+        1)
+    try:
+        with open(init_path, 'w') as fh:
+            fh.write(patched)
+        log.info('Patched pyqtdeploy __init__ for head-less use: %s', init_path)
+        return True
+    except (IOError, OSError) as exc:
+        log.warning('Could not write patched %s (%s); relying on shim only.', init_path, exc)
+        return False
+
+
+def ensure_pyqtdeploy_headless(cfg):
+    """ Step 3b: install the PyQt5 shim and patch pyqtdeploy so its command-line
+    actions run without a host PyQt5.  Safe to call repeatedly.
+    :param cfg: BuildConfig
+    """
+    step('Step 3b/15 -- Enabling head-less pyqtdeploy (PyQt5 shim)')
+    if cfg.dry_run:
+        log.info('[DRY-RUN] would write PyQt5 shim + patch pyqtdeploy __init__')
+        return
+    _write_pyqt5_shim(cfg)
+    init_path = _locate_pyqtdeploy_init()
+    if init_path:
+        _patch_pyqtdeploy_gui_import(init_path)
+    else:
+        log.warning('Installed pyqtdeploy package not located; the PyQt5 shim '
+                    'should still satisfy the QtCore imports.')
+    log.info('Head-less pyqtdeploy ready OK')
 
 
 # =============================================================================
@@ -1741,6 +2016,7 @@ def main(argv=None):
         preflight(cfg)
         setup_environment(cfg)
         install_pyqtdeploy(cfg)
+        ensure_pyqtdeploy_headless(cfg)
         download_sources(cfg)
         build_host_sip(cfg)
         build_python_static(cfg)
