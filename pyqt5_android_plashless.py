@@ -355,8 +355,7 @@ def _download_with_fallback(urls, dest):
                     remove(dest)
                 except OSError:
                     pass
-    raise RuntimeError(
-        'Failed to download {0} from any of: {1}'.format(basename(dest), urls))
+    raise RuntimeError('Failed to download {0} from any of: {1}'.format(basename(dest), urls))
 
 
 def _maybe_sudo(cmd_list):
