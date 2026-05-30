@@ -17,9 +17,18 @@ from json import loads
 if dirname(__file__) not in path:
     path.append(dirname(__file__))
 
+# NB: a failed *relative* import raises different exceptions depending on the
+# Python version:
+#   * Python 3.4 -> SystemError ("Parent module '' not loaded, ...")
+#   * Python 3.5+ -> ImportError
+#   * Older edge cases -> ValueError ("Attempted relative import in non-package")
+# This file is imported as a top-level module (the build scripts are run as
+# `python3.4 pyqt5_android_plashless.py`, with no parent package), so on
+# Python 3.4 the relative import below WILL raise SystemError. We must catch
+# all three so the absolute-import fallback can take over.
 try:
     from .build_utils import run, which
-except (ImportError, ValueError):
+except (ImportError, ValueError, SystemError):
     from build_utils import run, which
 
 # cmake PyPI package is optional -- only needed by getCmakeExecutable(), which
