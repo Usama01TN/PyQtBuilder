@@ -888,6 +888,40 @@ def _patch_pyqtdeploy_gui_import(init_path):
         return False
 
 
+def _patch_pyqtdeploy_freeze(init_path):
+    """ Make pyqtdeploy's freeze.py read source files as bytes so non-ASCII
+    Python sources freeze correctly under a POSIX/ASCII locale (Python 3.4's
+    open() otherwise defaults to ASCII and raises UnicodeDecodeError).  Passing
+    bytes to compile() lets it honour PEP 263 coding cookies / default to UTF-8,
+    exactly like CPython's own import machinery.  Idempotent.
+    :param init_path: str  -- path to pyqtdeploy/__init__.py (to locate the pkg)
+    :return: bool
+    """
+    pkg_dir = dirname(init_path)
+    freeze_path = join(pkg_dir, 'builder', 'lib', 'freeze.py')
+    if not isfile(freeze_path):
+        log.warning('freeze.py not found at %s; skipping freeze encoding patch.', freeze_path)
+        return False
+    with open(freeze_path, 'r') as fh:
+        src = fh.read()
+    if "open(py_filename, 'rb')" in src or 'open(py_filename, "rb")' in src:
+        log.info('pyqtdeploy freeze.py already reads source as bytes OK')
+        return True
+    anchor = 'source_file = open(py_filename)'
+    if anchor not in src:
+        log.warning('Could not find open() anchor in %s; skipping freeze patch.', freeze_path)
+        return False
+    patched = src.replace(anchor, "source_file = open(py_filename, 'rb')", 1)
+    try:
+        with open(freeze_path, 'w') as fh:
+            fh.write(patched)
+        log.info('Patched pyqtdeploy freeze.py to read source as bytes: %s', freeze_path)
+        return True
+    except (IOError, OSError) as exc:
+        log.warning('Could not write patched %s (%s).', freeze_path, exc)
+        return False
+
+
 def ensure_pyqtdeploy_headless(cfg):
     """ Step 3b: install the PyQt5 shim and patch pyqtdeploy so its command-line
     actions run without a host PyQt5.  Safe to call repeatedly.
@@ -895,12 +929,13 @@ def ensure_pyqtdeploy_headless(cfg):
     """
     step('Step 3b/15 -- Enabling head-less pyqtdeploy (PyQt5 shim)')
     if cfg.dry_run:
-        log.info('[DRY-RUN] would write PyQt5 shim + patch pyqtdeploy __init__')
+        log.info('[DRY-RUN] would write PyQt5 shim + patch pyqtdeploy __init__/freeze')
         return
     _write_pyqt5_shim(cfg)
     init_path = _locate_pyqtdeploy_init()
     if init_path:
         _patch_pyqtdeploy_gui_import(init_path)
+        _patch_pyqtdeploy_freeze(init_path)
     else:
         log.warning('Installed pyqtdeploy package not located; the PyQt5 shim '
                     'should still satisfy the QtCore imports.')
@@ -1756,7 +1791,7 @@ def run_pyqtdeploy_build(cfg):
     # option names.)  Correct form:  pyqtdeploy --project <app>.pdy --output <dir> build
     build_cmd = getattr(cfg, 'pyqtdeploycli', 'pyqtdeploycli')
     _makedirs(cfg.build_dir)
-    _run([build_cmd, '--project', cfg.pdy_file, '--output', cfg.build_dir, 'build'],
+    _run([build_cmd, '--project', cfg.pdy_file, '--output', cfg.build_dir, '--verbose', 'build'],
          cwd=cfg.build_dir, env=env, dry_run=cfg.dry_run)
     # Locate generated .pro file.
     pro_files = []
