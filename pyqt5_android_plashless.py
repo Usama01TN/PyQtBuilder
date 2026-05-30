@@ -1489,6 +1489,7 @@ def build_pyqt5_static(cfg):
     log.info('Running PyQt5 configure.py ...')
     configure_args = [
         getPythonExecutable(), 'configure.py',
+        '--confirm-license',
         '--static',
         '--verbose',
         '--sysroot={0}'.format(cfg.sysroot),
