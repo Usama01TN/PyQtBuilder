@@ -169,6 +169,7 @@ class BuildConfig(object):
             or realpath(join(self.ndk_root, '..', 'android-sdk')))
         self.android_platform = getattr(args, 'android_platform', '') or ''
         self.ant = expanduser(args.ant) if getattr(args, 'ant', '') else ''
+        self.target_sdk = int(getattr(args, 'target_sdk', 23) or 0)
         self.keep_build = args.keep_build
         self.jobs = args.jobs
         # Extra Python C extension modules to wire in.
@@ -2144,6 +2145,143 @@ def _detect_android_platform(cfg):
     return ''
 
 
+def _patch_manifest_target_sdk(cfg, *search_dirs):
+    """ Bump android:targetSdkVersion (and ensure a sane minSdkVersion) in any
+    AndroidManifest.xml found under the given dirs.
+
+    WHY: modern Android refuses to INSTALL apps that target an old API level --
+    Android 14 (API 34) blocks targetSdkVersion < 23, giving a bare
+    "App not installed" with no reason.  Qt 5.3 templates target a low API, so
+    we raise it.  Best-effort and idempotent; does nothing if cfg.target_sdk==0.
+    :param cfg: BuildConfig
+    :param search_dirs: directories to scan for AndroidManifest.xml
+    """
+    import re
+    if not cfg.target_sdk:
+        return
+    manifests = []
+    for d in search_dirs:
+        if d and isdir(d):
+            for root_dir, _dirs, files in walk(d):
+                if 'AndroidManifest.xml' in files:
+                    manifests.append(join(root_dir, 'AndroidManifest.xml'))
+    if not manifests:
+        log.warning('No AndroidManifest.xml found yet to set targetSdkVersion=%d; '
+                    'the APK may keep the Qt template default (which can be blocked '
+                    'from installing on Android 14+).', cfg.target_sdk)
+        return
+    for mf in manifests:
+        try:
+            with open(mf, 'r') as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        orig = text
+        if 'android:targetSdkVersion' in text:
+            text = re.sub(r'android:targetSdkVersion\s*=\s*"\d+"',
+                          'android:targetSdkVersion="{0}"'.format(cfg.target_sdk), text)
+        else:
+            # Add it next to minSdkVersion, or inside <uses-sdk .../>, or synthesize one.
+            if 'android:minSdkVersion' in text:
+                text = re.sub(r'(android:minSdkVersion\s*=\s*"\d+")',
+                              r'\1 android:targetSdkVersion="{0}"'.format(cfg.target_sdk), text, count=1)
+            elif '<uses-sdk' in text:
+                text = text.replace('<uses-sdk',
+                                    '<uses-sdk android:targetSdkVersion="{0}"'.format(cfg.target_sdk), 1)
+            else:
+                text = re.sub(r'(<manifest\b[^>]*>)',
+                              r'\1\n    <uses-sdk android:minSdkVersion="16" '
+                              r'android:targetSdkVersion="{0}" />'.format(cfg.target_sdk),
+                              text, count=1)
+        if text != orig and not cfg.dry_run:
+            try:
+                with open(mf, 'w') as fh:
+                    fh.write(text)
+                log.info('Set targetSdkVersion=%d in %s', cfg.target_sdk, mf)
+            except OSError as exc:
+                log.warning('Could not write %s: %s', mf, exc)
+
+
+def _diagnose_apk(cfg, apk, env):
+    """ Inspect a built APK and log the things that decide whether it will
+    INSTALL: package id, min/target SDK, contained native ABIs and signature.
+    Emits explicit warnings for the common "App not installed" gates.
+    :param cfg: BuildConfig
+    :param apk: str  -- path to the .apk
+    :param env: dict
+    """
+    from glob import glob
+    if cfg.dry_run or not isfile(apk):
+        return
+    sdk_root = cfg.sdk_root
+    aapt = ''
+    bt = join(sdk_root, 'build-tools') if sdk_root else ''
+    if bt and isdir(bt):
+        cands = sorted(glob(join(bt, '*', 'aapt')))
+        if cands:
+            aapt = cands[-1]
+    pkg = tgt = minsdk = ''
+    abis = []
+    if aapt:
+        try:
+            proc = _run([aapt, 'dump', 'badging', apk], env=env, check=False,
+                        capture=True, dry_run=cfg.dry_run)
+            out = proc.stdout.decode('utf-8', 'replace') if isinstance(proc.stdout, bytes) else (proc.stdout or '')
+            import re
+            m = re.search(r"package: name='([^']+)'", out)
+            pkg = m.group(1) if m else ''
+            m = re.search(r"sdkVersion:'(\d+)'", out)
+            minsdk = m.group(1) if m else ''
+            m = re.search(r"targetSdkVersion:'(\d+)'", out)
+            tgt = m.group(1) if m else ''
+            abis = re.findall(r"native-code:\s*(.*)", out)
+        except Exception as exc:
+            log.warning('aapt dump badging failed: %s', exc)
+    # ABIs from the zip entries as a fallback / cross-check.
+    try:
+        import zipfile
+        with zipfile.ZipFile(apk) as zf:
+            libdirs = set()
+            for n in zf.namelist():
+                if n.startswith('lib/') and n.count('/') >= 2:
+                    libdirs.add(n.split('/')[1])
+        if libdirs:
+            abis = abis or [' '.join(sorted(libdirs))]
+            zip_abis = sorted(libdirs)
+        else:
+            zip_abis = []
+    except Exception:
+        zip_abis = []
+
+    log.info('APK report: package=%s minSdk=%s targetSdk=%s abis=%s size=%dKB',
+             pkg or '?', minsdk or '?', tgt or '?',
+             (', '.join(zip_abis) if zip_abis else (abis[0] if abis else '?')),
+             getsize(apk) // 1024)
+
+    # Install-gate warnings.
+    try:
+        if tgt and int(tgt) < 23:
+            log.warning('targetSdkVersion=%s (<23): Android 14+ will refuse to install this APK. '
+                        'Rebuild with --target-sdk 23 (or higher).', tgt)
+    except ValueError:
+        pass
+    only_v7a = zip_abis and set(zip_abis) <= {'armeabi-v7a', 'armeabi'}
+    if only_v7a:
+        log.warning('APK contains only 32-bit ARM (%s): it will NOT install on x86/x86_64 '
+                    'emulators or x86 devices. Use a real ARM device or an arm64/armv7 emulator image.',
+                    ', '.join(zip_abis))
+    # Signature check (jarsigner ships with the JDK; v1/JAR signing is what Ant debug uses).
+    jarsigner = which('jarsigner')
+    if jarsigner:
+        proc = _run([jarsigner, '-verify', apk], env=env, check=False, capture=True, dry_run=cfg.dry_run)
+        out = proc.stdout.decode('utf-8', 'replace') if isinstance(proc.stdout, bytes) else (proc.stdout or '')
+        if 'jar verified' in out.lower():
+            log.info('APK signature: verified (debug-signed).')
+        else:
+            log.warning('APK does not appear to be signed; it will not install. '
+                        'The Ant "debug" build should sign it -- check the androiddeployqt/ant output.')
+
+
 def _build_apk(cfg, pro_file, pro_dir, env):
     """ Package the freshly-built libmain.so into an .apk.
 
@@ -2231,6 +2369,10 @@ def _build_apk(cfg, pro_file, pro_dir, env):
     _run([getMakeExecutable(), 'install', 'INSTALL_ROOT=' + android_build],
          cwd=pro_dir, env=penv, dry_run=cfg.dry_run, check=False)
 
+    # 2b) Ensure the manifest targets a modern-enough API so Android 14+ will
+    #     install it (target < 23 is blocked).  Best-effort.
+    _patch_manifest_target_sdk(cfg, android_build, pro_dir)
+
     # 3) Find the deployment-settings JSON (qmake emits it next to the Makefile).
     jsons = glob(join(pro_dir, '*deployment-settings*.json'))
     if not jsons:
@@ -2268,6 +2410,7 @@ def _build_apk(cfg, pro_file, pro_dir, env):
     if apks:
         apk = sorted(apks, key=getmtime)[-1]
         log.info('APK built: %s (%d KB)', apk, getsize(apk) // 1024)
+        _diagnose_apk(cfg, apk, penv)
     else:
         log.warning('androiddeployqt finished but no .apk was found under %s.', android_build)
 
@@ -2465,6 +2608,10 @@ def make_parser():
                              'highest installed, else android-21).')
     parser.add_argument('--ant', default='', metavar='PATH',
                         help='Path to the Ant executable used by androiddeployqt (default: ant on PATH).')
+    parser.add_argument('--target-sdk', type=int, default=23, metavar='API',
+                        help='android:targetSdkVersion written into the APK manifest (default: 23). '
+                             'Modern Android (14+/API 34+) refuses to INSTALL apps that target below 23, '
+                             'so keep this >= 23. Use 0 to leave the Qt template value untouched.')
     parser.add_argument('--keep-build', action='store_true', help='Retain intermediate build files.')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable debug-level output.')
