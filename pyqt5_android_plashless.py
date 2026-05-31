@@ -2110,27 +2110,38 @@ def build_with_qtcreator(cfg):
 
 
 def _detect_android_platform(cfg):
-    """ Pick an Android platform string (e.g. 'android-21') for androiddeployqt:
-    explicit cfg value, else the highest 'android-N' installed in the SDK, else
-    a sane default compatible with Qt 5.3 / NDK r10e.
+    """ Pick an Android platform string (e.g. 'android-21') for androiddeployqt.
+
+    Only platforms that are *actually installed* count -- a 'platforms/android-N'
+    directory must contain android.jar, otherwise the legacy `android update
+    project --target android-N` fails with "Target id ... is not valid".
+
+    Returns an explicit cfg.android_platform if given (and installed); else the
+    highest installed platform; else '' to signal that none are installed.
     :param cfg: BuildConfig
     :return: str
     """
-    if cfg.android_platform:
-        return cfg.android_platform
     platforms_dir = join(cfg.sdk_root, 'platforms') if cfg.sdk_root else ''
-    best = None
+    installed = []
     if platforms_dir and isdir(platforms_dir):
-        nums = []
         for name in listdir(platforms_dir):
-            if name.startswith('android-'):
+            if name.startswith('android-') and isfile(join(platforms_dir, name, 'android.jar')):
                 try:
-                    nums.append(int(name.split('-', 1)[1]))
+                    installed.append((int(name.split('-', 1)[1]), name))
                 except (ValueError, IndexError):
-                    pass
-        if nums:
-            best = 'android-{0}'.format(max(nums))
-    return best or 'android-21'
+                    installed.append((0, name))
+    installed_names = [n for _api, n in installed]
+    if cfg.android_platform:
+        # Trust an explicit choice if it is installed; otherwise warn and fall
+        # through to whatever is installed.
+        if not installed_names or cfg.android_platform in installed_names:
+            return cfg.android_platform
+        log.warning('Requested --android-platform %s is not installed in %s (have: %s); '
+                    'using an installed one instead.',
+                    cfg.android_platform, platforms_dir, ', '.join(installed_names) or '(none)')
+    if installed:
+        return sorted(installed)[-1][1]
+    return ''
 
 
 def _build_apk(cfg, pro_file, pro_dir, env):
@@ -2178,6 +2189,23 @@ def _build_apk(cfg, pro_file, pro_dir, env):
     java_exe = which('java')
     if not java_home and not java_exe:
         missing.append('a JDK (set $JAVA_HOME or put java on PATH)')
+    # A real, installed SDK platform (with android.jar) is required: the legacy
+    # `android update project --target android-N` rejects a non-installed target.
+    platform = _detect_android_platform(cfg)
+    if not platform:
+        missing.append("an installed SDK platform (e.g. {0}/platforms/android-21 containing "
+                       "android.jar)".format(sdk_root or '<sdk>'))
+    # build-tools (aapt/dx/zipalign) are needed to assemble the APK.
+    bt_dir = join(sdk_root, 'build-tools') if sdk_root else ''
+    has_build_tools = bool(bt_dir and isdir(bt_dir) and [d for d in listdir(bt_dir)
+                                                         if isdir(join(bt_dir, d))]) if bt_dir else False
+    if sdk_root and isdir(sdk_root) and not has_build_tools:
+        missing.append('SDK build-tools (e.g. {0}/build-tools/21.1.2)'.format(sdk_root))
+    # The legacy `tools/android` is what androiddeployqt (Qt 5.3) calls to
+    # generate the Ant project; flag it explicitly if absent.
+    if sdk_root and isdir(sdk_root) and not isfile(join(sdk_root, 'tools', 'android')):
+        missing.append("the legacy 'android' tool at {0}/tools/android "
+                       "(ships with SDK Tools r24.4.1/r25.2.5)".format(sdk_root))
     if missing:
         log.warning(
             'Skipping APK packaging -- the library built OK but these are missing:\n  - %s\n'
@@ -2218,7 +2246,6 @@ def _build_apk(cfg, pro_file, pro_dir, env):
     json_file = jsons[0]
 
     # 4) Run androiddeployqt to build the APK (Qt 5.3 uses Ant).
-    platform = _detect_android_platform(cfg)
     cmd = [deployqt,
            '--input', json_file,
            '--output', android_build,
