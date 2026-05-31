@@ -1416,19 +1416,64 @@ def _ensure_sip_header(cfg):
     log.info('Installed sip.h into sysroot: %s -> %s', src, dst)
 
 
+def _build_libsip_from_sources(cfg):
+    """ Deterministically compile libsip.a from the sip module C/C++ sources in
+    <sip_src>/siplib using the project's Android qmake (the same cross toolchain
+    that builds the PyQt5 static libs).  SIP's own --use-qmake build does not
+    reliably emit a static libsip.a, so we build it ourselves.
+    :param cfg: BuildConfig
+    :return: str | None  -- path to the built libsip.a, or None.
+    """
+    from glob import glob
+    siplib_dir = join(cfg.sip_src, 'siplib') if cfg.sip_src else ''
+    if not siplib_dir or not isdir(siplib_dir):
+        return None
+    srcs = sorted(basename(p) for p in glob(join(siplib_dir, '*.c')))
+    srcs += sorted(basename(p) for p in glob(join(siplib_dir, '*.cpp')))
+    if not srcs:
+        log.warning('No sip module sources (*.c/*.cpp) found in %s.', siplib_dir)
+        return None
+    majmin = '.'.join(PYTHON_VERSION.split('.')[:2])
+    py_inc = join(cfg.sysroot, 'include', 'python' + majmin)
+    pro_path = join(siplib_dir, 'sip_static_build.pro')
+    pro = (
+        'TEMPLATE = lib\n'
+        'CONFIG += staticlib warn_off release\n'
+        'TARGET = sip\n'
+        'DEFINES += NDEBUG\n'
+        'INCLUDEPATH += {inc}\n'
+        'INCLUDEPATH += .\n'
+        'QMAKE_CFLAGS += -fPIC\n'
+        'QMAKE_CXXFLAGS += -fPIC\n'
+        'SOURCES = {srcs}\n'
+    ).format(inc=py_inc, srcs=' '.join(srcs))
+    with open(pro_path, 'w') as fh:
+        fh.write(pro)
+    log.info('Compiling libsip.a from %d sip module sources in %s ...', len(srcs), siplib_dir)
+    env = cfg.build_env()
+    try:
+        _run([cfg.qmake, basename(pro_path)], cwd=siplib_dir, env=env, dry_run=cfg.dry_run)
+        _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)], cwd=siplib_dir, env=env,
+             dry_run=cfg.dry_run)
+    except Exception as exc:
+        log.warning('Building libsip.a from sources failed: %s', exc)
+        return None
+    built = join(siplib_dir, 'libsip.a')
+    return built if isfile(built) else None
+
+
 def _ensure_sip_lib(cfg):
     """ Ensure the static SIP library (libsip.a) lives in the target sysroot
     site-packages dir, where the final pyqtdeploy-generated link looks for it
     via `-L$SYSROOT/lib/pythonX.Y/site-packages -lsip`.
 
-    SIP's qmake-driven top-level 'make'/'make install' does not reliably build
-    or install the static sip module library, so we (1) search the build tree
-    and the sysroot for it, (2) build it directly inside siplib/ if it is
-    missing, and (3) copy it into site-packages.  Idempotent.
+    SIP's qmake-driven build does not reliably produce or install a static
+    libsip.a, so we (1) search the build tree and sysroot for it, (2) compile it
+    directly from the sip module sources if it is missing, and (3) copy it into
+    site-packages.  Idempotent.
     :param cfg: BuildConfig
     """
     from shutil import copyfile
-    from glob import glob
     majmin = '.'.join(PYTHON_VERSION.split('.')[:2])
     sp_dir = join(cfg.sysroot, 'lib', 'python' + majmin, 'site-packages')
     dst = join(sp_dir, 'libsip.a')
@@ -1452,27 +1497,10 @@ def _ensure_sip_lib(cfg):
 
     src = _find_libsip()
 
-    # If the static sip module library was never compiled, build it now,
-    # directly inside siplib/ (the top-level qmake build sometimes skips it).
-    if src is None and siplib_dir and isdir(siplib_dir):
-        env = cfg.build_env()
-        try:
-            if isfile(join(siplib_dir, 'Makefile')):
-                log.info('libsip.a missing; running make in %s ...', siplib_dir)
-                _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)],
-                     cwd=siplib_dir, env=env, dry_run=cfg.dry_run)
-            else:
-                pros = glob(join(siplib_dir, '*.pro'))
-                if pros:
-                    log.info('libsip.a missing; running qmake+make in %s ...', siplib_dir)
-                    _run([cfg.qmake, basename(pros[0])], cwd=siplib_dir, env=env,
-                         dry_run=cfg.dry_run)
-                    _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)],
-                         cwd=siplib_dir, env=env, dry_run=cfg.dry_run)
-                else:
-                    log.warning('No Makefile or .pro in %s to build libsip.a.', siplib_dir)
-        except Exception as exc:
-            log.warning('Attempt to build libsip.a in %s failed: %s', siplib_dir, exc)
+    # If the static sip module library was never produced, compile it ourselves.
+    if src is None:
+        src = _build_libsip_from_sources(cfg)
+    if src is None:
         src = _find_libsip()
 
     if src is None:
