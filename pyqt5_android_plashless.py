@@ -1419,34 +1419,74 @@ def _ensure_sip_header(cfg):
 def _ensure_sip_lib(cfg):
     """ Ensure the static SIP library (libsip.a) lives in the target sysroot
     site-packages dir, where the final pyqtdeploy-generated link looks for it
-    via `-L$SYSROOT/lib/pythonX.Y/site-packages -lsip`.  SIP's qmake-driven
-    'make install' does not reliably place the static lib there, so copy it
-    explicitly.  Idempotent.
+    via `-L$SYSROOT/lib/pythonX.Y/site-packages -lsip`.
+
+    SIP's qmake-driven top-level 'make'/'make install' does not reliably build
+    or install the static sip module library, so we (1) search the build tree
+    and the sysroot for it, (2) build it directly inside siplib/ if it is
+    missing, and (3) copy it into site-packages.  Idempotent.
     :param cfg: BuildConfig
     """
     from shutil import copyfile
+    from glob import glob
     majmin = '.'.join(PYTHON_VERSION.split('.')[:2])
     sp_dir = join(cfg.sysroot, 'lib', 'python' + majmin, 'site-packages')
     dst = join(sp_dir, 'libsip.a')
+    siplib_dir = join(cfg.sip_src, 'siplib') if cfg.sip_src else ''
+
+    def _find_libsip():
+        direct = [join(cfg.sip_src, 'siplib', 'libsip.a'),
+                  join(cfg.sip_src, 'libsip.a')] if cfg.sip_src else []
+        for c in direct:
+            if isfile(c):
+                return c
+        for root in [r for r in (cfg.sip_src, cfg.sysroot) if r and isdir(r)]:
+            for root_dir, _dirs, files in walk(root):
+                if 'libsip.a' in files:
+                    return join(root_dir, 'libsip.a')
+        return None
+
     if isfile(dst):
         log.info('libsip.a already present in sysroot site-packages: %s', dst)
         return
-    # libsip.a is produced by the static SIP build in the SIP source tree.
-    candidates = [join(cfg.sip_src, 'siplib', 'libsip.a'), join(cfg.sip_src, 'libsip.a')]
-    src = None
-    for c in candidates:
-        if isfile(c):
-            src = c
-            break
+
+    src = _find_libsip()
+
+    # If the static sip module library was never compiled, build it now,
+    # directly inside siplib/ (the top-level qmake build sometimes skips it).
+    if src is None and siplib_dir and isdir(siplib_dir):
+        env = cfg.build_env()
+        try:
+            if isfile(join(siplib_dir, 'Makefile')):
+                log.info('libsip.a missing; running make in %s ...', siplib_dir)
+                _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)],
+                     cwd=siplib_dir, env=env, dry_run=cfg.dry_run)
+            else:
+                pros = glob(join(siplib_dir, '*.pro'))
+                if pros:
+                    log.info('libsip.a missing; running qmake+make in %s ...', siplib_dir)
+                    _run([cfg.qmake, basename(pros[0])], cwd=siplib_dir, env=env,
+                         dry_run=cfg.dry_run)
+                    _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)],
+                         cwd=siplib_dir, env=env, dry_run=cfg.dry_run)
+                else:
+                    log.warning('No Makefile or .pro in %s to build libsip.a.', siplib_dir)
+        except Exception as exc:
+            log.warning('Attempt to build libsip.a in %s failed: %s', siplib_dir, exc)
+        src = _find_libsip()
+
     if src is None:
-        for root_dir, _dirs, files in walk(cfg.sip_src):
-            if 'libsip.a' in files:
-                src = join(root_dir, 'libsip.a')
-                break
-    if src is None:
-        log.warning('Could not find a built libsip.a under %s; the final link '
-                    'may fail with "cannot find -lsip".', cfg.sip_src)
+        try:
+            listing = ', '.join(sorted(listdir(siplib_dir))) if (siplib_dir and isdir(siplib_dir)) else '(no siplib dir)'
+        except OSError:
+            listing = '(unreadable)'
+        log.warning('Could not find or build libsip.a.\n'
+                    '  Searched (recursively): %s and %s\n'
+                    '  siplib/ contents: %s\n'
+                    '  The final link will fail with "cannot find -lsip".',
+                    cfg.sip_src, cfg.sysroot, listing)
         return
+
     _makedirs(sp_dir)
     copyfile(src, dst)
     log.info('Installed libsip.a into sysroot site-packages: %s -> %s', src, dst)
