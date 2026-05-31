@@ -163,6 +163,12 @@ class BuildConfig(object):
         self.dry_run = args.dry_run
         self.skip_static = args.skip_static_build
         self.install_apk = args.install_apk
+        # APK packaging (androiddeployqt) configuration.
+        self.sdk_root = expanduser(args.sdk_root) if getattr(args, 'sdk_root', '') else (
+            environ.get('ANDROID_SDK_ROOT') or environ.get('ANDROID_HOME')
+            or realpath(join(self.ndk_root, '..', 'android-sdk')))
+        self.android_platform = getattr(args, 'android_platform', '') or ''
+        self.ant = expanduser(args.ant) if getattr(args, 'ant', '') else ''
         self.keep_build = args.keep_build
         self.jobs = args.jobs
         # Extra Python C extension modules to wire in.
@@ -2080,6 +2086,9 @@ def build_with_qtcreator(cfg):
     _run([cfg.qmake, pro_file], cwd=pro_dir, env=env, dry_run=cfg.dry_run)
     log.info('Running make (-j%d) ...', cfg.jobs)
     _run([getMakeExecutable(), '-j{0}'.format(cfg.jobs)], cwd=pro_dir, env=env, dry_run=cfg.dry_run)
+    # The qmake+make above only builds the shared library (libmain.so).  Turn it
+    # into an .apk via `make install` + androiddeployqt.
+    _build_apk(cfg, pro_file, pro_dir, env)
     # Locate APK.
     apk_files = []
     for root, dirs, files in walk(cfg.build_dir):
@@ -2098,6 +2107,142 @@ def build_with_qtcreator(cfg):
             'No .apk produced by command-line build.\n'
             '  Open Qt Creator -> select the .pro -> configure for Android -> Build.\n  .pro file: %s', pro_file)
     log.info('Build step done OK')
+
+
+def _detect_android_platform(cfg):
+    """ Pick an Android platform string (e.g. 'android-21') for androiddeployqt:
+    explicit cfg value, else the highest 'android-N' installed in the SDK, else
+    a sane default compatible with Qt 5.3 / NDK r10e.
+    :param cfg: BuildConfig
+    :return: str
+    """
+    if cfg.android_platform:
+        return cfg.android_platform
+    platforms_dir = join(cfg.sdk_root, 'platforms') if cfg.sdk_root else ''
+    best = None
+    if platforms_dir and isdir(platforms_dir):
+        nums = []
+        for name in listdir(platforms_dir):
+            if name.startswith('android-'):
+                try:
+                    nums.append(int(name.split('-', 1)[1]))
+                except (ValueError, IndexError):
+                    pass
+        if nums:
+            best = 'android-{0}'.format(max(nums))
+    return best or 'android-21'
+
+
+def _build_apk(cfg, pro_file, pro_dir, env):
+    """ Package the freshly-built libmain.so into an .apk.
+
+    The pyqtdeploy-generated qmake project only builds the shared library; the
+    Android packaging is a separate Qt step:
+      1. `make install INSTALL_ROOT=<android-build>` -- copies libmain.so into
+         the Android build tree (qmake also emits a deployment-settings .json).
+      2. `androiddeployqt --input <json> --output <android-build> ...` -- builds
+         the .apk (Qt 5.3 drives this through Ant).
+
+    Requires an Android SDK, a JDK and Ant in the environment.  If any are
+    missing this logs precise guidance and returns without raising, so the
+    successful library build is not lost.
+    :param cfg: BuildConfig
+    :param pro_file: str
+    :param pro_dir: str
+    :param env: dict
+    :return: None
+    """
+    from glob import glob
+    if cfg.dry_run:
+        log.info('[DRY-RUN] Would run make install + androiddeployqt to build the APK.')
+        return
+
+    # 0) Sanity: the shared library must exist.
+    so_files = glob(join(pro_dir, 'lib*.so'))
+    if not so_files:
+        log.warning('No lib*.so found in %s after make; cannot package an APK.', pro_dir)
+        return
+
+    # 1) Resolve the toolchain needed by androiddeployqt.
+    deployqt = cfg.androiddeployqt
+    missing = []
+    if not isfile(deployqt):
+        missing.append('androiddeployqt (expected at {0})'.format(deployqt))
+    sdk_root = cfg.sdk_root
+    if not (sdk_root and isdir(sdk_root)):
+        missing.append('Android SDK (set --sdk-root or $ANDROID_SDK_ROOT; looked at {0})'.format(sdk_root))
+    ant = cfg.ant or which('ant')
+    if not ant:
+        missing.append('Ant (install "ant" or pass --ant)')
+    java_home = env.get('JAVA_HOME', '')
+    java_exe = which('java')
+    if not java_home and not java_exe:
+        missing.append('a JDK (set $JAVA_HOME or put java on PATH)')
+    if missing:
+        log.warning(
+            'Skipping APK packaging -- the library built OK but these are missing:\n  - %s\n'
+            '  libmain.so is at: %s\n'
+            '  Install the Android SDK + a JDK + Ant (see Dockerfile) and re-run, '
+            'or open the .pro in Qt Creator to build the APK.',
+            '\n  - '.join(missing), so_files[0])
+        return
+
+    # 2) Prepare a clean Android build tree and run `make install` into it.
+    android_build = join(pro_dir, 'android-build')
+    penv = dict(env)
+    penv['ANDROID_SDK_ROOT'] = sdk_root
+    penv['ANDROID_HOME'] = sdk_root
+    penv['ANDROID_NDK_ROOT'] = cfg.ndk_root
+    if java_home:
+        penv['JAVA_HOME'] = java_home
+    elif java_exe:
+        # Derive JAVA_HOME from the java binary (…/jre/bin/java or …/bin/java).
+        jdir = dirname(dirname(realpath(java_exe)))
+        penv['JAVA_HOME'] = jdir
+    log.info('Installing build tree for packaging: make install INSTALL_ROOT=%s', android_build)
+    _run([getMakeExecutable(), 'install', 'INSTALL_ROOT=' + android_build],
+         cwd=pro_dir, env=penv, dry_run=cfg.dry_run, check=False)
+
+    # 3) Find the deployment-settings JSON (qmake emits it next to the Makefile).
+    jsons = glob(join(pro_dir, '*deployment-settings*.json'))
+    if not jsons:
+        jsons = []
+        for root_dir, _dirs, files in walk(pro_dir):
+            for f in files:
+                if f.endswith('.json') and 'deployment-settings' in f:
+                    jsons.append(join(root_dir, f))
+    if not jsons:
+        log.warning('No *-deployment-settings.json found in %s; androiddeployqt cannot run.\n'
+                    '  (qmake should emit this for an Android app project.)', pro_dir)
+        return
+    json_file = jsons[0]
+
+    # 4) Run androiddeployqt to build the APK (Qt 5.3 uses Ant).
+    platform = _detect_android_platform(cfg)
+    cmd = [deployqt,
+           '--input', json_file,
+           '--output', android_build,
+           '--android-platform', platform,
+           '--ant', ant,
+           '--verbose']
+    log.info('Running androiddeployqt (platform=%s) ...', platform)
+    proc = _run(cmd, cwd=pro_dir, env=penv, dry_run=cfg.dry_run, check=False)
+    if getattr(proc, 'returncode', 1) != 0:
+        log.warning('androiddeployqt exited %s; inspect the output above. '
+                    'Common causes: missing SDK platform/build-tools, wrong JDK, or Ant errors.',
+                    getattr(proc, 'returncode', '?'))
+
+    # 5) Report any APK that was produced.
+    apks = []
+    for root_dir, _dirs, files in walk(android_build):
+        for f in files:
+            if f.lower().endswith('.apk'):
+                apks.append(join(root_dir, f))
+    if apks:
+        apk = sorted(apks, key=getmtime)[-1]
+        log.info('APK built: %s (%d KB)', apk, getsize(apk) // 1024)
+    else:
+        log.warning('androiddeployqt finished but no .apk was found under %s.', android_build)
 
 
 def _install_apk(cfg, apk_path):
@@ -2285,6 +2430,14 @@ def make_parser():
     parser.add_argument('--skip-static-build', action='store_true',
                         help='Skip Python/SIP/PyQt5 cross-compilation (use existing SYSROOT).')
     parser.add_argument('--install-apk', action='store_true', help='Install the APK on the first connected ADB device.')
+    parser.add_argument('--sdk-root', default='', metavar='DIR',
+                        help='Android SDK root (for androiddeployqt). Default: $ANDROID_SDK_ROOT / $ANDROID_HOME '
+                             'or <ndk-root>/../android-sdk.')
+    parser.add_argument('--android-platform', default='', metavar='API',
+                        help='Android platform for androiddeployqt, e.g. android-21 (default: auto-detect '
+                             'highest installed, else android-21).')
+    parser.add_argument('--ant', default='', metavar='PATH',
+                        help='Path to the Ant executable used by androiddeployqt (default: ant on PATH).')
     parser.add_argument('--keep-build', action='store_true', help='Retain intermediate build files.')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable debug-level output.')
