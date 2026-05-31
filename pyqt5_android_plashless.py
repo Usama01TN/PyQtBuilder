@@ -1450,6 +1450,21 @@ def _build_libsip_from_sources(cfg):
     with open(pro_path, 'w') as fh:
         fh.write(pro)
     log.info('Compiling libsip.a from %d sip module sources in %s ...', len(srcs), siplib_dir)
+    # CRITICAL: the host SIP build (Step 5) compiled these same sources into
+    # x86-64 *.o files in this very directory.  If we leave them, qmake's make
+    # finds them up-to-date and just archives the host objects, producing an
+    # archive the Android linker rejects as "incompatible".  Remove all stale
+    # objects (and any stale archive/Makefile) so the cross compiler rebuilds
+    # fresh armv7 objects.
+    from glob import glob as _glob
+    from os import remove as _remove
+    for stale in (_glob(join(siplib_dir, '*.o')) + _glob(join(siplib_dir, '*.lo'))
+                  + [join(siplib_dir, 'libsip.a'), join(siplib_dir, 'Makefile')]):
+        try:
+            if isfile(stale):
+                _remove(stale)
+        except OSError as exc:
+            log.warning('Could not remove stale build artifact %s: %s', stale, exc)
     env = cfg.build_env()
     try:
         _run([cfg.qmake, basename(pro_path)], cwd=siplib_dir, env=env, dry_run=cfg.dry_run)
