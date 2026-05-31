@@ -158,6 +158,43 @@ ENV ANDROID_NDK_ROOT=/root/android-ndk-r10e
 ENV PATH=/root/android-ndk-r10e:${PATH}
 
 # ----------------------------------------------------------------------------
+# 4b) JDK 8 + Ant + legacy Android SDK  (for androiddeployqt APK packaging)
+# ----------------------------------------------------------------------------
+# The pyqtdeploy qmake project only builds libmain.so; turning it into an .apk
+# is done by `make install` + androiddeployqt.  Qt 5.3.2's androiddeployqt
+# drives the packaging through Ant and the *legacy* `android` tool
+# (`android update project`), which modern SDKs removed.  SDK Tools r24.4.1 is
+# the period-correct release that still ships `tools/android`, so we use it to
+# pull platform-tools, an SDK platform (android-21) and matching build-tools
+# (21.1.2).  Java 8 is required by both Ant and the old SDK tooling.
+#
+# NOTE: these are deep-archive Google URLs/repos; if a download 404s in your
+# CI, install an equivalent SDK (platform-tools, platforms;android-21,
+# build-tools;21.1.2, plus a `tools/android`) any way you like and point the
+# build at it with --sdk-root or $ANDROID_SDK_ROOT.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openjdk-8-jdk-headless ant \
+ && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+
+ENV ANDROID_SDK_ROOT=/root/android-sdk
+ENV ANDROID_HOME=/root/android-sdk
+WORKDIR /root
+RUN set -e ; \
+    curl -fL --retry 3 -o sdk-tools.tgz \
+        https://dl.google.com/android/android-sdk_r24.4.1-linux.tgz ; \
+    tar xzf sdk-tools.tgz ; \
+    rm sdk-tools.tgz ; \
+    mv android-sdk-linux android-sdk ; \
+    ( yes | android-sdk/tools/android update sdk --no-ui --all \
+        --filter platform-tools,build-tools-21.1.2,android-21 ) || \
+      echo "::warning:: legacy 'android update sdk' failed; install the SDK packages manually (see note above)" ; \
+    ls -la android-sdk || true ; \
+    ls -la android-sdk/build-tools 2>/dev/null || true ; \
+    ls -la android-sdk/platforms 2>/dev/null || true
+ENV PATH=/root/android-sdk/tools:/root/android-sdk/platform-tools:${PATH}
+
+# ----------------------------------------------------------------------------
 # 5) Qt 5.3.2 Android armv7  (unattended install via QInstaller --script)
 # ----------------------------------------------------------------------------
 # The Qt Installer Framework supports a --script JavaScript argument for
