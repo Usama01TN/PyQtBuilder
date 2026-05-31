@@ -1462,6 +1462,39 @@ def _build_libsip_from_sources(cfg):
     return built if isfile(built) else None
 
 
+def _index_static_archive(cfg, archive):
+    """ Add/refresh a static archive's symbol table (index) so the linker will
+    accept it.  qmake's staticlib build can emit an archive without an index,
+    which fails the final link with "no archive symbol table (run ranlib)".
+    Symbol indexing is architecture-agnostic, but we prefer the NDK ranlib.
+    Idempotent (safe to run repeatedly).
+    :param cfg: BuildConfig
+    :param archive: str  -- path to the .a file
+    """
+    from glob import glob
+    if not isfile(archive):
+        return
+    ranlib = None
+    bin_dir = getattr(cfg, 'ndk_toolchain_bin', '')
+    if bin_dir and isdir(bin_dir):
+        cands = sorted(glob(join(bin_dir, '*-ranlib'))) + [join(bin_dir, 'ranlib')]
+        for c in cands:
+            if isfile(c):
+                ranlib = c
+                break
+    if ranlib is None:
+        ranlib = 'ranlib'  # host ranlib; indexing is arch-agnostic.
+    try:
+        _run([ranlib, archive], env=cfg.build_env(), dry_run=cfg.dry_run, check=False)
+        log.info('Indexed static archive (%s): %s', basename(ranlib), archive)
+    except Exception as exc:
+        log.warning('ranlib on %s failed (%s); attempting host ranlib.', archive, exc)
+        try:
+            _run(['ranlib', archive], dry_run=cfg.dry_run, check=False)
+        except Exception:
+            pass
+
+
 def _ensure_sip_lib(cfg):
     """ Ensure the static SIP library (libsip.a) lives in the target sysroot
     site-packages dir, where the final pyqtdeploy-generated link looks for it
@@ -1493,6 +1526,7 @@ def _ensure_sip_lib(cfg):
 
     if isfile(dst):
         log.info('libsip.a already present in sysroot site-packages: %s', dst)
+        _index_static_archive(cfg, dst)
         return
 
     src = _find_libsip()
@@ -1517,6 +1551,8 @@ def _ensure_sip_lib(cfg):
 
     _makedirs(sp_dir)
     copyfile(src, dst)
+    # Ensure the archive has a symbol table; qmake's staticlib build may omit it.
+    _index_static_archive(cfg, dst)
     log.info('Installed libsip.a into sysroot site-packages: %s -> %s', src, dst)
 
 
