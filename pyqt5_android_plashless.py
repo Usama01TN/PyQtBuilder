@@ -1462,37 +1462,94 @@ def _build_libsip_from_sources(cfg):
     return built if isfile(built) else None
 
 
+def _archive_has_symtab(cfg, archive):
+    """ Return True if the archive appears to have a symbol table (index).
+    Best-effort: uses the cross 'nm --print-armap' when available.
+    :param cfg: BuildConfig
+    :param archive: str
+    :return: bool | None  -- True/False, or None if it could not be determined.
+    """
+    from glob import glob
+    bin_dir = getattr(cfg, 'ndk_toolchain_bin', '')
+    nm = None
+    if bin_dir and isdir(bin_dir):
+        for c in sorted(glob(join(bin_dir, '*-nm'))):
+            if 'gcc' not in basename(c) and isfile(c):
+                nm = c
+                break
+    if nm is None:
+        nm = 'nm'
+    try:
+        proc = _run([nm, '--print-armap', archive], env=cfg.build_env(),
+                    check=False, capture=True, dry_run=cfg.dry_run)
+        if getattr(proc, 'returncode', 1) != 0:
+            return None
+        out = proc.stdout
+        if isinstance(out, bytes):
+            out = out.decode('utf-8', errors='replace')
+        return ('Archive index' in (out or '')) or ('in archive' in (out or ''))
+    except Exception:
+        return None
+
+
 def _index_static_archive(cfg, archive):
     """ Add/refresh a static archive's symbol table (index) so the linker will
-    accept it.  qmake's staticlib build can emit an archive without an index,
-    which fails the final link with "no archive symbol table (run ranlib)".
-    Symbol indexing is architecture-agnostic, but we prefer the NDK ranlib.
-    Idempotent (safe to run repeatedly).
+    accept it.  An archive without an index fails the final link with
+    "no archive symbol table (run ranlib)".
+
+    IMPORTANT: use the *plain* cross ranlib (e.g. arm-linux-androideabi-ranlib),
+    NOT the gcc-* LTO wrapper (arm-linux-androideabi-gcc-ranlib): on NDK r10e the
+    gcc wrapper writes an index the Android linker rejects, and running it on an
+    already-valid archive destroys the good symbol table.  Falls back to host
+    ranlib, then to `ar s`.  Idempotent.
     :param cfg: BuildConfig
     :param archive: str  -- path to the .a file
     """
     from glob import glob
     if not isfile(archive):
         return
-    ranlib = None
+
     bin_dir = getattr(cfg, 'ndk_toolchain_bin', '')
-    if bin_dir and isdir(bin_dir):
-        cands = sorted(glob(join(bin_dir, '*-ranlib'))) + [join(bin_dir, 'ranlib')]
-        for c in cands:
-            if isfile(c):
-                ranlib = c
-                break
-    if ranlib is None:
-        ranlib = 'ranlib'  # host ranlib; indexing is arch-agnostic.
-    try:
-        _run([ranlib, archive], env=cfg.build_env(), dry_run=cfg.dry_run, check=False)
-        log.info('Indexed static archive (%s): %s', basename(ranlib), archive)
-    except Exception as exc:
-        log.warning('ranlib on %s failed (%s); attempting host ranlib.', archive, exc)
+    cross = sorted(glob(join(bin_dir, '*-ranlib'))) if (bin_dir and isdir(bin_dir)) else []
+    # Reject any gcc-* wrapper; keep the plain cross ranlib first.
+    plain_cross = [c for c in cross if 'gcc' not in basename(c) and isfile(c)]
+    ranlibs = list(plain_cross)
+    if bin_dir and isfile(join(bin_dir, 'ranlib')):
+        ranlibs.append(join(bin_dir, 'ranlib'))
+    ranlibs.append('ranlib')  # host ranlib (symbol indexing is arch-agnostic)
+
+    env = cfg.build_env()
+    indexed = False
+    for rl in ranlibs:
         try:
-            _run(['ranlib', archive], dry_run=cfg.dry_run, check=False)
+            _run([rl, archive], env=env, dry_run=cfg.dry_run, check=False)
+        except Exception as exc:
+            log.warning('ranlib (%s) on %s failed: %s', basename(rl), archive, exc)
+            continue
+        if cfg.dry_run:
+            return
+        ok = _archive_has_symtab(cfg, archive)
+        if ok or ok is None:
+            # ok is None -> couldn't verify; trust the (non-gcc) ranlib.
+            log.info('Indexed static archive (%s): %s', basename(rl), archive)
+            indexed = True
+            break
+
+    if indexed:
+        return
+
+    # Last resort: ask the cross 'ar' to add a symbol table with the 's' op.
+    ars = sorted(glob(join(bin_dir, '*-ar'))) if (bin_dir and isdir(bin_dir)) else []
+    ars = [a for a in ars if 'gcc' not in basename(a) and isfile(a)] + ['ar']
+    for ar in ars:
+        try:
+            _run([ar, 's', archive], env=env, dry_run=cfg.dry_run, check=False)
+            log.info('Added archive symbol table via %s s: %s', basename(ar), archive)
+            return
         except Exception:
-            pass
+            continue
+    log.warning('Could not add a symbol table to %s; link may fail with '
+                '"no archive symbol table".', archive)
 
 
 def _ensure_sip_lib(cfg):
