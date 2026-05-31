@@ -171,8 +171,15 @@ ENV PATH=/root/android-ndk-r10e:${PATH}
 #   * SDK Tools r24.4.1  -> provides the legacy tools/android binary
 #   * platform android-21, build-tools 21.1.2, platform-tools
 # Java 8 is required by Ant and the old SDK tooling.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# 32-BIT RUNTIME: the 2014-era build-tools binaries (aapt, aidl, zipalign, ...)
+# are 32-bit ELF executables.  Without the i386 loader/libs they fail at APK
+# build time with: Cannot run ".../aidl": error=2, No such file or directory.
+# So we enable i386 multiarch and install the 32-bit C/C++/zlib runtimes.
+RUN dpkg --add-architecture i386 \
+ && apt-get update && apt-get install -y --no-install-recommends \
         openjdk-8-jdk-headless ant \
+        libc6:i386 libstdc++6:i386 zlib1g:i386 libncurses5:i386 \
  && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 
@@ -207,6 +214,15 @@ RUN set -eu ; \
     test -x "$SDK/tools/android"            || { echo "::error:: missing tools/android"; exit 1; } ; \
     test -f "$SDK/platforms/android-21/android.jar" || { echo "::error:: android-21 platform not installed"; exit 1; } ; \
     test -x "$SDK/build-tools/21.1.2/aapt"  || { echo "::error:: build-tools 21.1.2 not installed"; exit 1; } ; \
+    test -x "$SDK/build-tools/21.1.2/aidl"  || { echo "::error:: build-tools 21.1.2 aidl missing"; exit 1; } ; \
+    # the build-tools binaries are 32-bit; confirm they actually RUN (catches a
+    # missing i386 runtime here instead of deep in an androiddeployqt Ant build)
+    "$SDK/build-tools/21.1.2/aapt" version >/dev/null 2>&1 \
+        || { echo "::error:: aapt cannot execute (missing 32-bit runtime libs?)"; \
+             file "$SDK/build-tools/21.1.2/aapt" || true; exit 1; } ; \
+    rc=0 ; "$SDK/build-tools/21.1.2/aidl" >/dev/null 2>&1 || rc=$? ; \
+    if [ "$rc" -gt 1 ]; then echo "::error:: aidl cannot execute (missing 32-bit runtime libs?)"; \
+        file "$SDK/build-tools/21.1.2/aidl" || true; exit 1; fi ; \
     echo "Android SDK ready:" ; ls -la "$SDK" "$SDK/platforms" "$SDK/build-tools"
 ENV PATH=/root/android-sdk/tools:/root/android-sdk/platform-tools:/root/android-sdk/build-tools/21.1.2:${PATH}
 
