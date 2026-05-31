@@ -263,6 +263,31 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # The cross-compiled sysroot: static libpython3.4.a, libsip.a and the
+      # PyQt5 *.a libraries plus headers, built for android armv7.  This is the
+      # reusable "prebuilt Python + PyQt5 + sip for Android" output.  Uploaded
+      # even on failure (always()) because the sysroot is usually complete well
+      # before the final packaging step.
+      - name: Upload prebuilt Android sysroot (aRoot)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aroot-py34-pyqt532-armv7
+          path: workspace/aRoot
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The linked shared library produced by Step 15 (handy for inspection /
+      # repackaging without rebuilding the whole sysroot).
+      - name: Upload libmain.so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-libmain-so-armv7
+          path: workspace/**/libmain.so
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
