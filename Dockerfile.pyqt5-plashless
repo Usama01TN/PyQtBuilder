@@ -158,20 +158,19 @@ ENV ANDROID_NDK_ROOT=/root/android-ndk-r10e
 ENV PATH=/root/android-ndk-r10e:${PATH}
 
 # ----------------------------------------------------------------------------
-# 4b) JDK 8 + Ant + legacy Android SDK  (for androiddeployqt APK packaging)
+# 4b) JDK 8 + Ant + Android SDK  (for androiddeployqt APK packaging)
 # ----------------------------------------------------------------------------
 # The pyqtdeploy qmake project only builds libmain.so; turning it into an .apk
 # is done by `make install` + androiddeployqt.  Qt 5.3.2's androiddeployqt
 # drives the packaging through Ant and the *legacy* `android` tool
-# (`android update project`), which modern SDKs removed.  SDK Tools r24.4.1 is
-# the period-correct release that still ships `tools/android`, so we use it to
-# pull platform-tools, an SDK platform (android-21) and matching build-tools
-# (21.1.2).  Java 8 is required by both Ant and the old SDK tooling.
+# (`android update project --target android-21`), which modern SDKs removed.
 #
-# NOTE: these are deep-archive Google URLs/repos; if a download 404s in your
-# CI, install an equivalent SDK (platform-tools, platforms;android-21,
-# build-tools;21.1.2, plus a `tools/android`) any way you like and point the
-# build at it with --sdk-root or $ANDROID_SDK_ROOT.
+# We install the SDK from DIRECT static package ZIPs on
+# dl.google.com/android/repository (these individual files are stable, unlike
+# the long-dead 2014 `android update sdk` repository XML endpoints):
+#   * SDK Tools r24.4.1  -> provides the legacy tools/android binary
+#   * platform android-21, build-tools 21.1.2, platform-tools
+# Java 8 is required by Ant and the old SDK tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-8-jdk-headless ant \
  && rm -rf /var/lib/apt/lists/*
@@ -180,19 +179,36 @@ ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 ENV ANDROID_SDK_ROOT=/root/android-sdk
 ENV ANDROID_HOME=/root/android-sdk
 WORKDIR /root
-RUN set -e ; \
-    curl -fL --retry 3 -o sdk-tools.tgz \
+RUN set -eu ; \
+    SDK=/root/android-sdk ; mkdir -p "$SDK" ; cd "$SDK" ; \
+    REPO=https://dl.google.com/android/repository ; \
+    # move the single top-level dir from an unzipped package into $dest
+    place() { d="$1"; dest="$2"; inner=$(find "$d" -mindepth 1 -maxdepth 1 -type d | head -1) ; \
+              mkdir -p "$(dirname "$dest")" ; rm -rf "$dest" ; mv "$inner" "$dest" ; } ; \
+    # (a) legacy SDK Tools r24.4.1 -> $SDK/tools/android  (strip the wrapper dir)
+    curl -fL --retry 3 -o /tmp/tools.tgz \
         https://dl.google.com/android/android-sdk_r24.4.1-linux.tgz ; \
-    tar xzf sdk-tools.tgz ; \
-    rm sdk-tools.tgz ; \
-    mv android-sdk-linux android-sdk ; \
-    ( yes | android-sdk/tools/android update sdk --no-ui --all \
-        --filter platform-tools,build-tools-21.1.2,android-21 ) || \
-      echo "::warning:: legacy 'android update sdk' failed; install the SDK packages manually (see note above)" ; \
-    ls -la android-sdk || true ; \
-    ls -la android-sdk/build-tools 2>/dev/null || true ; \
-    ls -la android-sdk/platforms 2>/dev/null || true
-ENV PATH=/root/android-sdk/tools:/root/android-sdk/platform-tools:${PATH}
+    tar xzf /tmp/tools.tgz -C /tmp ; \
+    cp -a /tmp/android-sdk-linux/tools "$SDK/tools" ; \
+    rm -rf /tmp/tools.tgz /tmp/android-sdk-linux ; \
+    # (b) platform-tools (best-effort; only needed for adb install, not for APK build)
+    ( curl -fL --retry 3 -o /tmp/pt.zip "$REPO/platform-tools_r28.0.1-linux.zip" \
+        && unzip -q /tmp/pt.zip -d "$SDK" ) || echo "::warning:: platform-tools download failed (non-fatal)" ; \
+    rm -f /tmp/pt.zip ; \
+    # (c) build-tools 21.1.2 -> $SDK/build-tools/21.1.2
+    curl -fL --retry 3 -o /tmp/bt.zip "$REPO/build-tools_r21.1.2-linux.zip" ; \
+    rm -rf /tmp/bt && mkdir -p /tmp/bt && unzip -q /tmp/bt.zip -d /tmp/bt ; \
+    place /tmp/bt "$SDK/build-tools/21.1.2" ; rm -rf /tmp/bt /tmp/bt.zip ; \
+    # (d) platform android-21 -> $SDK/platforms/android-21
+    curl -fL --retry 3 -o /tmp/plat.zip "$REPO/android-21_r02.zip" ; \
+    rm -rf /tmp/plat && mkdir -p /tmp/plat && unzip -q /tmp/plat.zip -d /tmp/plat ; \
+    place /tmp/plat "$SDK/platforms/android-21" ; rm -rf /tmp/plat /tmp/plat.zip ; \
+    # ---- validate at build time (fail early, not at runtime) ----
+    test -x "$SDK/tools/android"            || { echo "::error:: missing tools/android"; exit 1; } ; \
+    test -f "$SDK/platforms/android-21/android.jar" || { echo "::error:: android-21 platform not installed"; exit 1; } ; \
+    test -x "$SDK/build-tools/21.1.2/aapt"  || { echo "::error:: build-tools 21.1.2 not installed"; exit 1; } ; \
+    echo "Android SDK ready:" ; ls -la "$SDK" "$SDK/platforms" "$SDK/build-tools"
+ENV PATH=/root/android-sdk/tools:/root/android-sdk/platform-tools:/root/android-sdk/build-tools/21.1.2:${PATH}
 
 # ----------------------------------------------------------------------------
 # 5) Qt 5.3.2 Android armv7  (unattended install via QInstaller --script)
