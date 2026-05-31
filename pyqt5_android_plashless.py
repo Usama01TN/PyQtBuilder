@@ -355,7 +355,8 @@ def _download_with_fallback(urls, dest):
                     remove(dest)
                 except OSError:
                     pass
-    raise RuntimeError('Failed to download {0} from any of: {1}'.format(basename(dest), urls))
+    raise RuntimeError(
+        'Failed to download {0} from any of: {1}'.format(basename(dest), urls))
 
 
 def _maybe_sudo(cmd_list):
@@ -1415,6 +1416,42 @@ def _ensure_sip_header(cfg):
     log.info('Installed sip.h into sysroot: %s -> %s', src, dst)
 
 
+def _ensure_sip_lib(cfg):
+    """ Ensure the static SIP library (libsip.a) lives in the target sysroot
+    site-packages dir, where the final pyqtdeploy-generated link looks for it
+    via `-L$SYSROOT/lib/pythonX.Y/site-packages -lsip`.  SIP's qmake-driven
+    'make install' does not reliably place the static lib there, so copy it
+    explicitly.  Idempotent.
+    :param cfg: BuildConfig
+    """
+    from shutil import copyfile
+    majmin = '.'.join(PYTHON_VERSION.split('.')[:2])
+    sp_dir = join(cfg.sysroot, 'lib', 'python' + majmin, 'site-packages')
+    dst = join(sp_dir, 'libsip.a')
+    if isfile(dst):
+        log.info('libsip.a already present in sysroot site-packages: %s', dst)
+        return
+    # libsip.a is produced by the static SIP build in the SIP source tree.
+    candidates = [join(cfg.sip_src, 'siplib', 'libsip.a'), join(cfg.sip_src, 'libsip.a')]
+    src = None
+    for c in candidates:
+        if isfile(c):
+            src = c
+            break
+    if src is None:
+        for root_dir, _dirs, files in walk(cfg.sip_src):
+            if 'libsip.a' in files:
+                src = join(root_dir, 'libsip.a')
+                break
+    if src is None:
+        log.warning('Could not find a built libsip.a under %s; the final link '
+                    'may fail with "cannot find -lsip".', cfg.sip_src)
+        return
+    _makedirs(sp_dir)
+    copyfile(src, dst)
+    log.info('Installed libsip.a into sysroot site-packages: %s -> %s', src, dst)
+
+
 def build_sip_static(cfg):
     """
     From plashless Part 1:
@@ -1464,6 +1501,7 @@ def build_sip_static(cfg):
     #    with -I$SYSROOT/include/pythonX.Y.  Install it explicitly.
     if not cfg.dry_run:
         _ensure_sip_header(cfg)
+        _ensure_sip_lib(cfg)
     log.info('Static SIP built OK')
 
 
@@ -1711,7 +1749,21 @@ def _write_pdy_with_project_api(cfg):
     # Target Python locations (produced in the sysroot by the earlier steps).
     proj.python_host_interpreter = getPythonExecutable()
     proj.python_target_include_dir = join(cfg.sysroot, 'include', 'python' + majmin)
-    proj.python_target_library = join(cfg.sysroot, 'lib', 'libpython' + majmin + 'm.a')
+    # pyqtdeploy's python.pro builds TARGET = python<maj>.<min> -> libpython3.4.a
+    # (no 'm' ABI suffix).  Probe the sysroot for whichever was actually built
+    # so the generated main.pro links the correct -lpython... name.
+    sysroot_lib = join(cfg.sysroot, 'lib')
+    py_lib = None
+    for cand in ('libpython{0}.a'.format(majmin), 'libpython{0}m.a'.format(majmin)):
+        if isfile(join(sysroot_lib, cand)):
+            py_lib = join(sysroot_lib, cand)
+            break
+    if py_lib is None:
+        # Fall back to the no-'m' name (matches python.pro's TARGET).
+        py_lib = join(sysroot_lib, 'libpython{0}.a'.format(majmin))
+        log.warning('No static Python lib found in %s; defaulting target library '
+                    'to %s', sysroot_lib, py_lib)
+    proj.python_target_library = py_lib
     proj.python_target_stdlib_dir = join(cfg.sysroot, 'lib', 'python' + majmin)
     proj.build_dir = cfg.build_dir
     proj.qmake = cfg.qmake
