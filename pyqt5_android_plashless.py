@@ -1089,18 +1089,48 @@ def build_python_static(cfg):
         log.info('Skipping static Python build (skip_static=%s, src=%s).', cfg.skip_static, cfg.python_src)
         return
     env = cfg.build_env()
-    # Check for .original files (already patched = second attempt)
-    originals = []
-    for root, dirs, files in walk(cfg.python_src):
-        for f in files:
-            if f.endswith('.original'):
-                originals.append(join(root, f))
-    if originals:
-        log.warning(
-            'Python source appears already patched (%d .original files found).\n'
-            'If you get patch errors, delete the Python source and re-extract:\n'
-            '  rm -rf %s && tar xzf %s -C %s',
-            len(originals), cfg.python_src, join(cfg.downloads_dir, 'Python-3.4.0.tgz'), cfg.work_dir)
+    # Detect .original files (pyqtdeploy copies each patched file to <name>.original).
+    # Their presence means this source tree was already patched by a previous run.
+    # pyqtdeploy's configure patch is NOT idempotent: re-patching an already-patched
+    # file fails with "line does not match diff context".  On a reused/cached
+    # workspace we must start from a pristine source, so re-extract it.
+    def _has_originals(root):
+        for r, _d, files in walk(root):
+            for f in files:
+                if f.endswith('.original'):
+                    return True
+        return False
+
+    if _has_originals(cfg.python_src):
+        from shutil import rmtree
+        from glob import glob as _glob
+        tarball = join(cfg.downloads_dir, 'Python-' + PYTHON_VERSION + '.tgz')
+        if not isfile(tarball):
+            cands = sorted(_glob(join(cfg.downloads_dir, 'Python-*.t*z')))
+            tarball = cands[0] if cands else ''
+        if tarball and isfile(tarball) and not cfg.dry_run:
+            log.warning('Python source already patched (re-used workspace); re-extracting a '
+                        'pristine copy from %s so pyqtdeploy can patch cleanly.', tarball)
+            rmtree(cfg.python_src, ignore_errors=True)
+            _extract_tgz(tarball, cfg.work_dir)
+            if not isdir(cfg.python_src):
+                # Tarball may unpack to a slightly different dir name; relocate it.
+                base = basename(cfg.python_src)
+                for name in listdir(cfg.work_dir):
+                    p = join(cfg.work_dir, name)
+                    if isdir(p) and name.lower().startswith('python-') and isfile(join(p, 'configure')):
+                        if p != cfg.python_src:
+                            from shutil import move
+                            move(p, cfg.python_src)
+                        break
+            if _has_originals(cfg.python_src):
+                log.error('Re-extracted Python source still looks patched; the tarball at %s '
+                          'may itself be a patched tree.', tarball)
+        else:
+            log.warning('Python source already patched but no pristine tarball found in %s.\n'
+                        'Delete the source and re-extract manually:\n'
+                        '  rm -rf %s && tar xzf <Python-%s.tgz> -C %s',
+                        cfg.downloads_dir, cfg.python_src, PYTHON_VERSION, cfg.work_dir)
     # 1. pyqtdeploycli --package python --target android-32 configure.
     log.info('Running pyqtdeploycli configure for Python ...')
     _run([cfg.pyqtdeploycli, '--package', 'python', '--target', TARGET, 'configure'], cwd=cfg.python_src, env=env,
