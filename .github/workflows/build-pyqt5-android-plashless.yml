@@ -149,6 +149,30 @@ jobs:
           '
 
       # ====================================================================
+      # 3b. Export the prebuilt Qt for Android (android_armv7) as an artifact
+      # ====================================================================
+      # Qt 5.3.2 for android_armv7 is baked into the image at
+      # /root/Qt/5.3/android_armv7.  Copy it out of the container so it can be
+      # uploaded as a downloadable artifact.  chmod so the runner (non-root)
+      # can read the root-owned files for the upload.
+      - name: Extract prebuilt Qt for Android (android_armv7) from image
+        run: |
+          mkdir -p qt-android-prebuilt
+          docker run --rm -v "${GITHUB_WORKSPACE}/qt-android-prebuilt:/out" \
+            pyqt5-plashless-builder:latest \
+            bash -lc 'cp -a /root/Qt/5.3/android_armv7 /out/ \
+                      && chmod -R a+rX /out/android_armv7 \
+                      && du -sh /out/android_armv7'
+
+      - name: Upload prebuilt Qt for Android
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-5.3.2-android-armv7-prebuilt
+          path: qt-android-prebuilt/android_armv7
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ====================================================================
       # 4. Cache the plashless work directory across runs
       # ====================================================================
       # The work_dir holds extracted SIP/PyQt5/Python sources + the aRoot
