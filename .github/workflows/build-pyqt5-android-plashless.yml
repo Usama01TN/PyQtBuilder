@@ -301,15 +301,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # The linked shared library produced by Step 15 (handy for inspection /
-      # repackaging without rebuilding the whole sysroot).
-      - name: Upload libmain.so
+      - name: Export prebuilt Qt for Android from the image
+        if: always()
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/work" pyqt5-plashless-builder:latest \
+            bash -lc 'tar czf /work/qt-5.3.2-android_armv7.tar.gz -C /root/Qt/5.3 android_armv7'
+      - name: Upload prebuilt Qt for Android
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-libmain-so-armv7
-          path: workspace/**/libmain.so
-          if-no-files-found: ignore
+          name: qt-5.3.2-android_armv7
+          path: qt-5.3.2-android_armv7.tar.gz
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Upload build log
