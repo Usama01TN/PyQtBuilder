@@ -148,8 +148,23 @@ DEFAULT_PYTHON_VERSION = '3.13'  # type: str
 DEFAULT_PYTHON_SUPPORT = '3.13-b13'  # type: str  # BeeWare Python-Apple-support release tag.
 PYSIDE6_IOS_REPO = 'https://github.com/patrickkidd/pyside6-ios'  # type: str
 PYSIDE_SETUP_REPO = 'https://code.qt.io/pyside/pyside-setup.git'  # type: str
+# BeeWare Python-Apple-support asset URL.
+# Release tag looks like '3.13-b13'; the *asset filename* uses only the build
+# suffix ('b13'), NOT the full tag.  i.e. the real asset is
+#   Python-3.13-iOS-support.b13.tar.gz   (under release tag 3.13-b13)
+# Using the full tag in the filename 404s.  We therefore template on {build}.
 PYTHON_SUPPORT_URL_TPL = (
-    'https://github.com/beeware/Python-Apple-support/releases/download/{tag}/Python-{pyver}-iOS-support.{tag}.tar.gz')
+    'https://github.com/beeware/Python-Apple-support/releases/download/{tag}/Python-{pyver}-iOS-support.{build}.tar.gz')
+
+
+def _support_build_suffix(tag):
+    """
+    Derive the asset build suffix (e.g. 'b13') from a Python-Apple-support
+    release tag (e.g. '3.13-b13').  The suffix is everything after the last '-'.
+    :param tag: str
+    :return: str
+    """
+    return tag.rsplit('-', 1)[-1] if '-' in tag else tag
 # Qt modules that can be cross-compiled for iOS with this toolchain.
 SUPPORTED_MODULES = ['QtCore', 'QtGui', 'QtWidgets', 'QtNetwork', 'QtQml', 'QtQuick']  # type: list[str]
 # N_PEXT mask -- Mach-O private-extern flag that must be cleared for re-export.
@@ -346,7 +361,8 @@ class BuildContext(object):
         self.python_support_tag = python_support_tag
         self.build_dir = join(self.root, 'build')
         self.venv_dir = join(self.root, '.venv')
-        # Qt paths.
+        # Qt paths.  Qt lives under the project root (referenced everywhere by
+        # the absolute QT_IOS path, so its location is independent of the tool).
         self.qt_lib_dir = join(self.build_dir, 'Qt-{}'.format(qt_version))
         if qt_ios_override:
             self.qt_ios_dir = qt_ios_override
@@ -355,17 +371,32 @@ class BuildContext(object):
         else:
             self.qt_ios_dir = join(self.qt_lib_dir, qt_version, 'ios')
         self.qt_macos_dir = join(self.qt_lib_dir, qt_version, 'macos')
-        # Python iOS framework.
-        self.python_dir = join(self.build_dir, 'python')
-        self.python_framework = join(self.python_dir, 'Python.xcframework')
-        # PySide6 sources.
-        self.pyside_src = join(self.build_dir, 'pyside-setup')
-        # pyside6-ios tool clone.
+        # ------------------------------------------------------------------
+        # pyside6-ios tool clone.  This directory IS "P6IOS_ROOT" as far as the
+        # upstream build scripts (scripts/env.sh) and the pyside6-ios CLI
+        # (src/pyside6_ios/config.py) are concerned.  Both hard-code their inputs
+        # and outputs relative to it:
+        #     <tool>/build/pyside-setup/sources/{pyside6,shiboken6}
+        #     <tool>/build/python/Python.xcframework  (+ VERSIONS sibling)
+        #     <tool>/build/QtRuntime.framework
+        #     <tool>/build/pyside6-ios-static/libPySide6_<Module>.a
+        #     <tool>/build/{libshiboken,libpyside,libpysideqml,shiboken}-ios
+        # so every build artifact below must live under it -- NOT under the
+        # project root -- or the scripts/CLI will not find them.
+        # ------------------------------------------------------------------
         self.tool_dir = join(self.build_dir, 'pyside6-ios-tool')
-        # Build outputs.
-        self.qtruntime_framework = join(self.root, 'QtRuntime.framework')
-        self.support_libs_dir = join(self.root, 'build', 'support_libs')
-        self.pyside6_modules_dir = join(self.root, 'build', 'pyside6_modules')
+        self.tool_build = join(self.tool_dir, 'build')
+        # Python iOS framework (extracted in-place; keep VERSIONS as a sibling).
+        self.python_dir = join(self.tool_build, 'python')
+        self.python_framework = join(self.python_dir, 'Python.xcframework')
+        # PySide6 sources (cloned so that sources/pyside6 + sources/shiboken6 exist).
+        self.pyside_src = join(self.tool_build, 'pyside-setup')
+        # Build outputs produced by the upstream scripts.
+        self.qtruntime_framework = join(self.tool_build, 'QtRuntime.framework')
+        self.pyside6_static_dir = join(self.tool_build, 'pyside6-ios-static')
+        # Back-compat aliases (older code/messages referenced these names).
+        self.support_libs_dir = self.tool_build
+        self.pyside6_modules_dir = self.pyside6_static_dir
 
     @property
     def uv(self):
@@ -384,13 +415,29 @@ class BuildContext(object):
 
     def env_with_qt(self):
         """
-        Return an environment dict with QT_IOS and related vars set.
+        Return an environment dict for the upstream build scripts.
+
+        Two things matter here:
+          1. Qt location vars (QT_IOS / QT_MACOS) -- scripts/env.sh auto-detects
+             versions from these.
+          2. venv activation -- the upstream scripts call bare ``python3`` (for
+             ``import shiboken6_generator``) and ``uv run python`` (globalize
+             step).  They are written to be run from an *activated* venv (see the
+             project README).  We replicate activation by exporting VIRTUAL_ENV
+             and prepending ``<venv>/bin`` to PATH so ``python3`` resolves to the
+             venv interpreter (which has shiboken6-generator installed) and
+             ``uv`` reuses the active environment instead of creating a new one.
         :return: dict[str, str]
         """
-        qt_env = {'QT_IOS': self.qt_ios_dir, 'QT_MACOS': self.qt_macos_dir, 'PYSIDE_VERSION': self.pyside_version,
-                  'QT_VERSION': self.qt_version}
-        qt_env.update(dict(environ))
-        return qt_env
+        env = dict(environ)
+        venv_bin = join(self.venv_dir, 'bin')
+        env['VIRTUAL_ENV'] = self.venv_dir
+        env['PATH'] = venv_bin + ':' + env.get('PATH', '')
+        # Let ``uv run`` use the already-active venv rather than syncing/creating one.
+        env['UV_PROJECT_ENVIRONMENT'] = self.venv_dir
+        env.update({'QT_IOS': self.qt_ios_dir, 'QT_MACOS': self.qt_macos_dir,
+                    'PYSIDE_VERSION': self.pyside_version, 'QT_VERSION': self.qt_version})
+        return env
 
     def summary(self):
         """
@@ -467,27 +514,33 @@ def install_python_framework(ctx):
     :return: None
     """
     log.info('========== Installing CPython %s iOS framework ==========', ctx.python_version)
-    if exists(ctx.python_framework):
+    if exists(ctx.python_framework) and exists(join(ctx.python_dir, 'VERSIONS')):
         log.info('  Python.xcframework already present -- skipping.')
         return
     _makedirs(ctx.python_dir)
     tag = ctx.python_support_tag
     pyver = ctx.python_version
-    url = PYTHON_SUPPORT_URL_TPL.format(tag=tag, pyver=pyver)
-    tarball = join(ctx.python_dir, 'Python-{}-iOS-support.{}.tar.gz'.format(pyver, tag))
+    build = _support_build_suffix(tag)
+    url = PYTHON_SUPPORT_URL_TPL.format(tag=tag, pyver=pyver, build=build)
+    tarball = join(ctx.python_dir, 'Python-{}-iOS-support.{}.tar.gz'.format(pyver, build))
     if not exists(tarball):
         download(url, tarball)
     log.info('  Extracting Python iOS support ...')
+    # The tarball unpacks its contents (Python.xcframework, VERSIONS, ...)
+    # directly into the target dir, so extract in-place: the scripts and the
+    # CLI both read the VERSIONS file as a sibling of Python.xcframework.
     with tarfile.open(tarball, 'r:gz') as tf:
         tf.extractall(ctx.python_dir)
     if not exists(ctx.python_framework):
-        # The tarball may unpack to a different name; find it.
+        # Some mirrors nest the framework one level deeper; relocate it.
         candidates = _rglob(ctx.python_dir, 'Python.xcframework')
         if not candidates:
             raise BuildError(
                 'Python.xcframework not found after extraction. Check tarball contents in {}'.format(ctx.python_dir))
-        # Use the first found, move it to the canonical location.
         rename(candidates[0], ctx.python_framework)
+    if not exists(join(ctx.python_dir, 'VERSIONS')):
+        log.warning('  VERSIONS file not found next to Python.xcframework -- '
+                    'sbkversion.h generation may fail.')
     log.info('  Python.xcframework: %s  :)', ctx.python_framework)
 
 
@@ -684,9 +737,14 @@ def build_qtruntime(ctx):
     if not exists(script):
         raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
     log.info('  This merges all Qt static libs -- ~5 min first run.')
-    _run(['bash', script], cwd=ctx.root, env=ctx.env_with_qt())
+    # Upstream script writes to ``build/QtRuntime.framework`` relative to its CWD
+    # and runs ``uv run python scripts/globalize_symbols.py`` (relative path), so
+    # it MUST run from the tool root.  Pass --qt-ios explicitly (env QT_IOS is
+    # also honoured but the flag is unambiguous).
+    _run(['bash', script, '--qt-ios', ctx.qt_ios_dir], cwd=ctx.tool_dir, env=ctx.env_with_qt())
     if not exists(ctx.qtruntime_framework):
-        raise BuildError('QtRuntime.framework was not created. Check output above for linker errors.')
+        raise BuildError('QtRuntime.framework was not created at {}. '
+                         'Check output above for linker errors.'.format(ctx.qtruntime_framework))
     log.info('  QtRuntime.framework built: %s  :)', ctx.qtruntime_framework)
 
 
@@ -703,22 +761,25 @@ def build_support_libs(ctx):
     :return: None
     """
     log.info('========== Building support libraries ==========')
-    done_marker = join(ctx.support_libs_dir, '.done')
-    if exists(done_marker):
+    shiboken_a = join(ctx.tool_build, 'libshiboken-ios', 'libshiboken6.a')
+    pyside_a = join(ctx.tool_build, 'libpyside-ios', 'libpyside6.a')
+    pysideqml_a = join(ctx.tool_build, 'libpysideqml-ios', 'libpysideqml.a')
+    if exists(shiboken_a) and exists(pyside_a) and exists(pysideqml_a):
         log.info('  Support libs already built -- skipping.')
         return
     script = join(ctx.tool_dir, 'scripts', 'build_support_libs.sh')
     if not exists(script):
         raise BuildError('build_support_libs.sh not found at: {}'.format(script))
     log.info('  Cross-compiling libshiboken6, libpyside6, libpysideqml ...  (~2 min)')
-    _makedirs(ctx.support_libs_dir)
-    env_dict = {}
-    env_dict.update(ctx.env_with_qt())
-    env_dict.update({'SUPPORT_LIBS_OUTDIR': ctx.support_libs_dir, 'PYSIDE_SRC': ctx.pyside_src,
-                     'PYTHON_XCFRAMEWORK': ctx.python_framework})
-    _run(['bash', script], cwd=ctx.root, env=env_dict)
-    _touch(done_marker)
-    log.info('  Support libs built: %s  :)', ctx.support_libs_dir)
+    # The upstream script sources scripts/env.sh, which derives every input and
+    # output path relative to the tool root (P6IOS_ROOT).  It does NOT read any
+    # SUPPORT_LIBS_OUTDIR / PYSIDE_SRC overrides, so we just run it in-place with
+    # QT vars + venv activation.
+    _run(['bash', script], cwd=ctx.tool_dir, env=ctx.env_with_qt())
+    for lib in (shiboken_a, pyside_a, pysideqml_a):
+        if not exists(lib):
+            raise BuildError('Expected support lib not produced: {}'.format(lib))
+    log.info('  Support libs built under: %s  :)', ctx.tool_build)
 
 
 # ---------------------------------------------------------------------------
@@ -747,28 +808,247 @@ def build_pyside6_modules(ctx, modules=None):
     script = join(ctx.tool_dir, 'scripts', 'build_pyside6_module.sh')
     if not exists(script):
         raise BuildError('build_pyside6_module.sh not found at: {}'.format(script))
-    _makedirs(ctx.pyside6_modules_dir)
-    env = {
-        'PYSIDE6_MODULES_OUTDIR': ctx.pyside6_modules_dir,
-        'PYSIDE_SRC': ctx.pyside_src,
-        'SUPPORT_LIBS_DIR': ctx.support_libs_dir,
-        'PYTHON_XCFRAMEWORK': ctx.python_framework,
-        'QTRUNTIME_FRAMEWORK': ctx.qtruntime_framework}
-    env.update(ctx.env_with_qt())
+    env = ctx.env_with_qt()
     for mod in modules:
-        done_marker = join(ctx.pyside6_modules_dir, ".{}.done".format(mod))
-        if exists(done_marker):
+        out_lib = join(ctx.pyside6_static_dir, 'libPySide6_{}.a'.format(mod))
+        if exists(out_lib):
             log.info('  %s already built -- skipping.', mod)
             continue
         log.info('  Building %s ...  (~2 min each)', mod)
-        _run(['bash', script, mod], cwd=ctx.root, env=env)
-        _touch(done_marker)
+        # env.sh inside the script hard-codes output to
+        # <tool>/build/pyside6-ios-static/libPySide6_<mod>.a, so run in-place.
+        _run(['bash', script, mod], cwd=ctx.tool_dir, env=env)
+        if not exists(out_lib):
+            raise BuildError('Module {} did not produce {}'.format(mod, out_lib))
         log.info('  %s  :)', mod)
     log.info('  All PySide6 modules built.')
 
 
 # ---------------------------------------------------------------------------
-# Step 10 - Generate pyside6-ios.toml config
+# Step 10a - Generate the iOS entry shim (scripts/app.py) that runs main.py.
+# ---------------------------------------------------------------------------
+
+# This is written verbatim into <app_dir>/scripts/app.py.  It lets this builder
+# accept the SAME project layout as the PyQt5/PySide6 *Android* builders in this
+# repo (pyqt5_android_builder.py, pyqt5_android_kviktor.py,
+# pyqt5_android_plashless.py, pyside6_android_builder.py, ...): a plain main.py
+# at the project root that builds its own QApplication and runs the event loop.
+#
+# On iOS the native host (main.mm) already owns the QApplication and the
+# UIApplicationMain run loop, so a desktop main.py cannot run unchanged.  This
+# shim bridges the two without touching the user's main.py:
+#   * QApplication()/QGuiApplication()/QCoreApplication(...) return the existing
+#     native instance instead of constructing (or erroring on) a second one.
+#   * .exec()/.exec_() are no-ops (the iOS run loop already pumps events).
+#   * sys.exit(...) raised from main() is swallowed.
+#   * top-level widgets are retained past main() and shown full-screen.
+#
+# NOTE: kept as a RAW string so the embedded "\n" escapes are written literally
+# into the generated file (and interpreted at runtime there), and so the body's
+# literal { } braces need no escaping.
+_ENTRY_SHIM_SRC = r'''"""
+scripts/app.py -- iOS entry shim (AUTO-GENERATED by pyside6_ios_builder.py).
+DO NOT EDIT.  Your real code lives in main.py and is left completely untouched.
+
+Why this file exists
+--------------------
+Your project uses the standard desktop PySide6/PyQt layout: a main.py at the
+project root that builds its own QApplication and runs the event loop, e.g.
+
+    def main():
+        app = QApplication(sys.argv)
+        ...
+        sys.exit(app.exec())
+
+    if __name__ == "__main__":
+        main()
+
+That runs as-is on desktop.  On iOS the native host (main.mm) already creates
+the QApplication and UIApplicationMain drives the Qt event loop, so this shim
+bridges your desktop main.py to the iOS host:
+
+  * QApplication()/QGuiApplication()/QCoreApplication(...) return the existing
+    native instance instead of constructing (or erroring on) a second one.
+  * .exec()/.exec_() become no-ops -- the iOS run loop already pumps events.
+  * sys.exit(...) raised by main() is swallowed (it must not tear down the app).
+  * Top-level widgets are kept alive past main() and shown full-screen
+    (a plain show() yields a blank screen on iOS).
+
+main.py is then executed unmodified, with __name__ == "__main__".
+"""
+import os
+import sys
+import runpy
+
+
+def _log(msg):
+    try:
+        os.write(1, (str(msg) + "\n").encode())
+    except Exception:
+        pass
+
+
+_log("=" * 60)
+_log("pyside6-ios entry shim: starting")
+_log("Python %s on %s" % (sys.version.split()[0], sys.platform))
+
+# This file is <bundle>/scripts/app.py; main.py is copied alongside it, and the
+# bundled packages live in <bundle>/packages.  Make all of them importable.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_MAIN_PY = os.path.join(_HERE, "main.py")
+for _p in (_HERE, os.path.dirname(_HERE), os.path.join(os.path.dirname(_HERE), "packages")):
+    if _p and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+# Capture the real classes before we shadow the constructors in their modules.
+_RealQCoreApplication = QtCore.QCoreApplication
+_RealQGuiApplication = QtGui.QGuiApplication
+_RealQApplication = QtWidgets.QApplication
+
+# Objects that must outlive main() (widgets, QML engines, windows).  Holding a
+# Python reference here stops PySide6 from deleting the underlying C++ object
+# when main()'s locals go out of scope.
+_KEEP_ALIVE = []
+
+
+def _present_top_level():
+    """Retain and full-screen every top-level widget; retain top-level windows."""
+    try:
+        for w in list(_RealQApplication.topLevelWidgets()):
+            if w not in _KEEP_ALIVE:
+                _KEEP_ALIVE.append(w)
+            try:
+                if w.isWindow():
+                    w.showFullScreen()
+            except Exception as exc:
+                _log("  present widget failed: %r" % (exc,))
+    except Exception as exc:
+        _log("  topLevelWidgets() unavailable: %r" % (exc,))
+    try:
+        for win in list(_RealQGuiApplication.topLevelWindows()):
+            if win not in _KEEP_ALIVE:
+                _KEEP_ALIVE.append(win)
+    except Exception:
+        pass
+
+
+def _harvest_caller_objects(start_depth):
+    """Walk the calling frames and retain every live QObject so that widgets and
+    QML engines created as locals in main() survive once main() returns/exits."""
+    try:
+        frame = sys._getframe(start_depth)
+    except Exception:
+        frame = None
+    while frame is not None:
+        try:
+            for val in list(frame.f_locals.values()):
+                if isinstance(val, QtCore.QObject) and val not in _KEEP_ALIVE:
+                    _KEEP_ALIVE.append(val)
+        except Exception:
+            pass
+        frame = frame.f_back
+    _present_top_level()
+
+
+class _AppInstanceProxy(object):
+    """Wraps the native application instance, forwarding everything except the
+    event-loop entry points, which are no-ops on iOS."""
+
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+
+    def exec(self, *args, **kwargs):
+        _log("app.exec() intercepted -- iOS run loop drives events (no-op)")
+        _harvest_caller_objects(2)
+        return 0
+
+    exec_ = exec
+
+    def exit(self, *args, **kwargs):
+        _log("app.exit() intercepted (no-op on iOS)")
+        return None
+
+    def quit(self, *args, **kwargs):
+        _log("app.quit() intercepted (no-op on iOS)")
+        return None
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_real"), name, value)
+
+
+class _AppClassProxy(object):
+    """Stands in for QApplication/QGuiApplication/QCoreApplication in user code.
+    Calling it returns the existing native instance (wrapped); attribute access
+    (static methods, enums, .instance()) forwards to the real class."""
+
+    def __init__(self, real_cls):
+        object.__setattr__(self, "_real_cls", real_cls)
+
+    def __call__(self, *args, **kwargs):
+        inst = _RealQCoreApplication.instance()
+        if inst is None:
+            # No native instance (e.g. running on desktop) -- construct normally.
+            inst = object.__getattribute__(self, "_real_cls")(*args, **kwargs)
+        return _AppInstanceProxy(inst)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real_cls"), name)
+
+
+# Shadow the constructors in their home modules so that
+# `from PySide6.QtWidgets import QApplication` (run when main.py is imported)
+# resolves to the proxy.
+QtWidgets.QApplication = _AppClassProxy(_RealQApplication)
+QtGui.QGuiApplication = _AppClassProxy(_RealQGuiApplication)
+QtCore.QCoreApplication = _AppClassProxy(_RealQCoreApplication)
+
+_log("native app instance: %r" % (_RealQCoreApplication.instance(),))
+
+if not os.path.exists(_MAIN_PY):
+    _log("ERROR: main.py not found next to app.py (%s)" % _MAIN_PY)
+else:
+    _log("running main.py ...")
+    try:
+        runpy.run_path(_MAIN_PY, run_name="__main__")
+    except SystemExit as exc:
+        _log("main.py raised SystemExit(%r) -- ignored on iOS" % (exc.code,))
+    except Exception:
+        _log("main.py raised an exception:")
+        import traceback
+        traceback.print_exc()
+    finally:
+        _present_top_level()
+    _log("main.py finished; %d top-level object(s) retained" % len(_KEEP_ALIVE))
+'''
+
+
+def generate_entry_shim(ctx, app_dir):
+    """
+    Write the iOS entry shim to ``<app_dir>/scripts/app.py``.
+
+    The shim runs the project's ``main.py`` under the iOS native host (see
+    ``_ENTRY_SHIM_SRC``).  It is regenerated every time so it always matches the
+    builder; the user's ``main.py`` is never read or modified.
+
+    :param ctx:     BuildContext (unused; kept for signature symmetry).
+    :param app_dir: str -- application/project directory (contains main.py).
+    :return: str -- path to the written scripts/app.py
+    """
+    scripts_dir = join(app_dir, 'scripts')
+    _makedirs(scripts_dir)
+    shim_path = join(scripts_dir, 'app.py')
+    _write_text(shim_path, _ENTRY_SHIM_SRC)
+    log.info("  Generated iOS entry shim: %s (runs main.py)", shim_path)
+    return shim_path
+
+
+# ---------------------------------------------------------------------------
+# Step 10b - Generate pyside6-ios.toml config
 # ---------------------------------------------------------------------------
 
 
@@ -795,74 +1075,155 @@ def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode='widg
         modules = (['QtCore', 'QtGui', 'QtWidgets'] if ui_mode == 'widgets' else [
             'QtCore', 'QtGui', 'QtNetwork', 'QtQml', 'QtQuick'])
     toml_path = join(app_dir, 'pyside6-ios.toml')
-    modules_list = "\n".join('    "{}",'.format(m) for m in modules)
-    team_line = 'team_id = "{}"'.format(
-        team_id) if team_id else '# team_id = "XXXXXXXXXX"  # Set your Apple Developer Team ID here'
-    toml_content = dedent("""\
+
+    # -- Determine the application entry point -----------------------------
+    # We accept the SAME project layout as this repo's Android builders: a plain
+    # main.py at the project root (a normal desktop app that builds its own
+    # QApplication and runs the event loop).  We then auto-generate
+    # scripts/app.py as an iOS bridge that runs that main.py under the native
+    # host (see generate_entry_shim / _ENTRY_SHIM_SRC).  main.py is never
+    # modified.  A hand-written scripts/app.py (the pyside6-ios native style) is
+    # still honoured for backwards compatibility.
+    main_py = join(app_dir, 'main.py')
+    native_app_py = join(app_dir, 'scripts', 'app.py')
+    if exists(main_py):
+        generate_entry_shim(ctx, app_dir)
+        script_files = ['scripts/app.py', 'main.py']
+        # Bundle any other loose top-level .py modules so main.py can import
+        # them (they land in <bundle>/scripts, which is on sys.path).
+        for py in sorted(glob(join(app_dir, '*.py'))):
+            name = basename(py)
+            if name != 'main.py' and not name.startswith('.') and name not in script_files:
+                script_files.append(name)
+        log.info("  Entry point: main.py (desktop layout) -> bridged via scripts/app.py")
+    elif exists(native_app_py):
+        script_files = ['scripts/app.py']
+        log.info("  Entry point: scripts/app.py (pyside6-ios native layout)")
+    else:
+        raise BuildError(
+            "No entry point found in {0}.\n"
+            "  Provide a main.py at the project root (recommended -- same layout "
+            "as the Android builders),\n"
+            "  e.g. {0}/main.py, or a pyside6-ios-style {0}/scripts/app.py."
+            .format(app_dir))
+    scripts_inline = ", ".join('"{}"'.format(s) for s in script_files)
+
+    # -- Auto-detect bundled Python packages -------------------------------
+    # Any top-level directory in the app that has an __init__.py is bundled as
+    # a package (mirrors the [python] packages entries in the pyside6-ios test
+    # apps).  'scripts'/'qml'/etc. are reserved layout dirs, never packages.
+    reserved = set(['scripts', 'qml', 'resources', 'vendor', 'native', 'generated'])
+    pkg_names = []
+    for init_path in sorted(glob(join(app_dir, '*', '__init__.py'))):
+        name = basename(dirname(init_path))
+        if name not in reserved and name not in pkg_names:
+            pkg_names.append(name)
+    if pkg_names:
+        pkg_lines = "\n".join(
+            '    {{ src = "{}", exclude = ["*.pyc", "__pycache__"] }},'.format(n)
+            for n in pkg_names)
+        packages_block = "packages = [\n{}\n]\n".format(pkg_lines)
+    else:
+        packages_block = "packages = []\n"
+
+    modules_inline = ", ".join('"{}"'.format(m) for m in modules)
+    team_line = 'team-id    = "{}"'.format(team_id) if team_id else 'team-id    = ""'
+
+    # -- [app], [paths], [pyside6], [python] -------------------------------
+    header = dedent("""\
         # pyside6-ios.toml -- Auto-generated by pyside6_ios_builder.py
         # -------------------------------------------------------------
-        # Config for pyside6-ios CLI: https://github.com/patrickkidd/pyside6-ios
-        # Edit paths below if you have a custom Qt/Python install location.
+        # Config schema for the pyside6-ios CLI:
+        #   https://github.com/patrickkidd/pyside6-ios
+        # Keys are kebab-case.  Paths under [paths] resolve relative to this
+        # file unless absolute.  QT_IOS in the environment overrides
+        # [paths] qt-ios.
         # -------------------------------------------------------------
 
         [app]
         name       = "{app_name}"
-        bundle_id  = "{bundle_id}"
+        bundle-id  = "{bundle_id}"
         version    = "1.0"
+        entry-point = ""
         {team_line}
+        deployment-target = "16.0"
 
-        # Entrypoint: ObjC++ host that owns UIApplicationMain,
-        # inits CPython, imports your app's Python module, and
-        # reparents Qt's UIView into the iOS UIWindow.
-        main_mm = "main.mm"
-
-        # Your Python application packages
-        [app.packages]
-        # paths = ["myapp/"]   # Python source packages to bundle
-
-        # Vendor (pure-Python) packages
-        # [app.vendor]
-        # packages = ["dateutil"]
-
-        # QML files (QML mode only)
-        # [app.qml]
-        # source_dirs = ["qml/"]
+        [paths]
+        pyside6-ios = "{tool_dir}"
+        qt-ios      = "{qt_ios_dir}"
+        output-dir  = "generated"
 
         [pyside6]
-        modules = [
-        {modules_list}
-        ]
-        # Paths to cross-compiled static module archives
-        modules_dir = "{modules_dir}"
-
-        [qt]
-        ios_sdk  = "{qt_ios_dir}"
-        runtime_framework = "{qtruntime_framework}"
+        modules = [{modules_inline}]
 
         [python]
-        xcframework = "{python_framework}"
-
-        [shiboken]
-        support_libs_dir = "{support_libs_dir}"
-
-        [xcode]
-        # Deployment target for the generated Xcode project
-        ios_deployment_target = "16.0"
-        # output_dir = "build-ios"
-
-        [resources]
-        # assets_xcassets = "Assets.xcassets"
-        # settings_bundle = "Settings.bundle"
+        {packages_block}scripts = [{scripts_inline}]
     """).format(
         app_name=app_name,
         bundle_id=bundle_id,
         team_line=team_line,
-        modules_list=modules_list,
-        modules_dir=ctx.pyside6_modules_dir,
+        tool_dir=ctx.tool_dir,
         qt_ios_dir=ctx.qt_ios_dir,
-        qtruntime_framework=ctx.qtruntime_framework,
-        python_framework=ctx.python_framework,
-        support_libs_dir=ctx.support_libs_dir)
+        modules_inline=modules_inline,
+        scripts_inline=scripts_inline,
+        packages_block=packages_block)
+
+    # -- [qml] (QML mode only) --------------------------------------------
+    if ui_mode == 'qml':
+        qml_modules = [m for m in modules
+                       if m in ('QtQuick', 'QtQml', 'QtCore', 'QtQuickControls2', 'QtQuickLayouts')]
+        if 'QtQuick' not in qml_modules:
+            qml_modules = ['QtQuick', 'QtQml', 'QtCore']
+        qml_modules_inline = ", ".join('"{}"'.format(m) for m in qml_modules)
+        qml_block = dedent("""\
+
+            [qml]
+            dirs = ["qml"]
+            qt-modules = [{qml_modules_inline}]
+        """).format(qml_modules_inline=qml_modules_inline)
+    else:
+        qml_block = ''
+
+    # -- [sources] : custom main.mm for widgets; QML uses the CLI's
+    #    auto-generated (QGuiApplication) main.mm, so omit main-mm there.
+    if ui_mode == 'widgets':
+        sources_block = dedent("""\
+
+            [sources]
+            main-mm = "main.mm"
+        """)
+    else:
+        sources_block = ''
+
+    # -- [signing] + ad-hoc CI [build-settings] ----------------------------
+    if team_id:
+        signing_block = dedent("""\
+
+            [signing]
+            style = "Automatic"
+        """)
+        build_settings_block = ''
+    else:
+        # No Apple Team -> unsigned / ad-hoc signing so the project builds on
+        # CI without an Apple Developer account.  The workflow also passes
+        # these on the xcodebuild command line (which wins), but keeping them
+        # here makes a bare `pyside6-ios build` self-consistent too.
+        signing_block = dedent("""\
+
+            [signing]
+            style = "Manual"
+        """)
+        build_settings_block = dedent("""\
+
+            [build-settings]
+            CODE_SIGN_IDENTITY = "-"
+            CODE_SIGNING_REQUIRED = "NO"
+            CODE_SIGNING_ALLOWED = "YES"
+            AD_HOC_CODE_SIGNING_ALLOWED = "YES"
+            DEVELOPMENT_TEAM = ""
+        """)
+
+    toml_content = header + qml_block + sources_block + signing_block + build_settings_block
     _write_text(toml_path, toml_content)
     log.info("  Written: %s", toml_path)
     return toml_path
@@ -873,140 +1234,215 @@ def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode='widg
 # ---------------------------------------------------------------------------
 
 
-def generate_main_mm(app_dir, app_module, ui_mode='widgets'):
+def generate_main_mm(ctx, app_dir, app_name, modules=None):
     """
-    Write a main.mm ObjC++ host application stub.
-    Critical iOS integration points (from the pyside6-ios technical report):
-    - Host app owns UIApplicationMain (Qt does NOT call it).
-    - Qt uses QIOSEventDispatcher (non-jumping) to integrate with CFRunLoop.
-    - QtWidgets: use showFullScreen() -- show() produces a blank window.
-    - QtWidgets: resize top-level QWidgets from main.mm after reparenting the
-      Qt UIView into the iOS UIWindow.
-    - QLayout(parent) is broken in static PySide6 modules; use setLayout().
-    :param app_dir:    (str) Path to application directory.
-    :param app_module: str
-    :param ui_mode:    str  ('widgets' or 'qml')
-    :return: (str) Path to the written main.mm
+    Write a QtWidgets host ``main.mm`` (ObjC++).
+
+    This mirrors the pyside6-ios reference ``test/test_widgets/main.mm`` and is
+    only used in **widgets** mode -- in QML mode the pyside6-ios CLI emits its
+    own (QGuiApplication-based) ``main.mm`` automatically, so we omit
+    ``[sources] main-mm`` from the TOML and never call this function.
+
+    Critical iOS integration points (verified against the reference host):
+    - ``#pragma push_macro("slots")`` / ``#undef slots`` around ``<Python.h>``
+      (Qt's ``slots`` keyword collides with CPython headers).
+    - Use **QApplication** (not QGuiApplication) for QtWidgets.
+    - Modern ``PyConfig`` / ``Py_InitializeFromConfig`` isolated config -- NOT
+      the deprecated ``Py_SetPythonHome``/``Py_Initialize``.
+    - PySide6 modules are registered as built-ins **before** Python init.  The
+      C init symbol is ``PyInit_<Module>`` (basename, e.g. ``PyInit_QtCore``)
+      but it is registered under the dotted name ``PySide6.<Module>`` so that
+      cross-module shiboken type resolution works.
+    - ``Q_IMPORT_PLUGIN(QIOSIntegrationPlugin)`` statically links the iOS
+      platform plugin.
+    - The app entry point is ``scripts/app.py`` (run via ``PyRun_SimpleFile``).
+    - Reparent Qt's root ``UIView`` into the iOS ``UIWindow`` and resize the
+      top-level ``QWidget``s to fill the screen.
+
+    :param ctx:      BuildContext (used for the bundled Python version).
+    :param app_dir:  str -- path to application directory.
+    :param app_name: str -- product name (used as argv[0]).
+    :param modules:  list[str] | None -- PySide6 modules to register as
+                     built-ins.  Defaults to the widgets set.
+    :return: str -- path to the written main.mm
     """
+    if modules is None:
+        modules = ['QtCore', 'QtGui', 'QtWidgets']
     mm_path = join(app_dir, 'main.mm')
-    if ui_mode == 'widgets':
-        qt_init_code = dedent("""\
-            // --- QtWidgets host ---
-            // IMPORTANT: use QApplication, not QGuiApplication
-            int argc = 0;
-            char *argv[] = {{nullptr}};
-            QApplication app(argc, argv);
 
-            // Import your Python app module
-            PyObject *mod = PyImport_ImportModule("{module}");
-            if (!mod) {{
-                PyErr_Print();
-                return;
-            }}
-            // Call your app's _run() function
-            PyObject *result = PyObject_CallMethod(mod, "run", nullptr);
-            if (!result) {{ PyErr_Print(); }}
-            Py_XDECREF(result);
-            Py_DECREF(mod);
-        """).format(module=app_module)
-        qt_includes = "#include <QtWidgets/QApplication>"
-    else:
-        qt_init_code = dedent("""\
-            // --- QML host ---
-            int argc = 0;
-            char *argv[] = {{nullptr}};
-            QGuiApplication app(argc, argv);
-            QQmlApplicationEngine engine;
+    extern_lines = []
+    inittab_lines = []
+    for mod in modules:
+        extern_lines.append('extern "C" PyObject *PyInit_{}();'.format(mod))
+        inittab_lines.append(
+            '    PyImport_AppendInittab("PySide6.{m}", PyInit_{m});'.format(m=mod))
+    # shiboken6 runtime module
+    extern_lines.append('extern "C" PyObject *PyInit_Shiboken();')
+    inittab_lines.append(
+        '    PyImport_AppendInittab("shiboken6.Shiboken", PyInit_Shiboken);')
 
-            PyObject *mod = PyImport_ImportModule("{module}");
-            if (!mod) {{
-                PyErr_Print();
-                return;
-            }}
-            PyObject *result = PyObject_CallMethod(mod, "run", "O",
-                PySide6_PyObject(&engine));
-            if (!result) {{ PyErr_Print(); }}
-            Py_XDECREF(result);
-            Py_DECREF(mod);
-        """).format(module=app_module)
-        qt_includes = '#include <QtGui/QGuiApplication>\n#include <QtQml/QQmlApplicationEngine>'
-    content = dedent("""\
-        // main.mm -- Host application entry point
-        // Auto-generated by pyside6_ios_builder.py
-        //
-        // Architecture notes (from pyside6-ios technical report):
-        //   - Host app owns UIApplicationMain; Qt does NOT call it.
-        //   - Qt integrates via QIOSEventDispatcher (non-jumping CFRunLoop).
-        //   - For QtWidgets use showFullScreen(), NOT show().
-        //   - Use widget->setLayout(layout) NOT QLayout(parent) constructor.
-        //   - QProcess is unavailable on iOS (QT_CONFIG(process) == false).
+    # NOTE: built with str token substitution (NOT str.format) because the
+    # ObjC++ body is full of literal { } braces.
+    template = """\
+// main.mm -- QtWidgets host (auto-generated by pyside6_ios_builder.py)
+// Mirrors the pyside6-ios reference test_widgets host.
+//
+// Runtime contract (handled for you by the auto-generated scripts/app.py):
+//   * The host runs scripts/app.py (via PyRun_SimpleFile), which is a generated
+//     bridge that runs your project's main.py.  Your main.py is NOT modified.
+//   * The bridge already makes QApplication.instance() reuse this C++ instance,
+//     turns app.exec() into a no-op, and shows top-level widgets full-screen,
+//     so a standard desktop main.py works unchanged.
+//   * Use widget.setLayout(layout) -- the QLayout(parent) ctor is broken in
+//     static PySide6 modules.
+//   * QProcess is unavailable on iOS (QT_CONFIG(process) == 0).
 
-        #import <UIKit/UIKit.h>
-        #include <Python.h>
-        {qt_includes}
+#pragma push_macro("slots")
+#undef slots
+#include <Python.h>
+#pragma pop_macro("slots")
 
-        // -- Forward declarations for PySide6 static built-in modules --
-        // Each module must be registered before Py_Initialize so CPython
-        // treats it as a built-in and skips dynamic loading.
-        extern "C" {{
-            PyObject *PyInit_PySide6_QtCore(void);
-            PyObject *PyInit_PySide6_QtGui(void);
-            PyObject *PyInit_PySide6_QtWidgets(void);
-            // Add more as needed: PyInit_PySide6_QtNetwork, etc.
-        }}
+#import <UIKit/UIKit.h>
 
-        @interface AppDelegate : UIResponder <UIApplicationDelegate>
-        @property (strong, nonatomic) UIWindow *window;
-        @end
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QWidget>
+#include <QtGui/QWindow>
+#include <QtCore/QDebug>
+#include <QtCore/QtPlugin>
 
-        @implementation AppDelegate
+Q_IMPORT_PLUGIN(QIOSIntegrationPlugin)
 
-        - (BOOL)application:(UIApplication *)application
-            didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
-        {{
-            // 1. Register PySide6 static modules BEFORE Py_Initialize
-            //    PyModuleDef.m_name must be "PySide6.QtCore" (not "QtCore")
-            //    for cross-module type resolution to work.
-            PyImport_AppendInittab("PySide6.QtCore",    &PyInit_PySide6_QtCore);
-            PyImport_AppendInittab("PySide6.QtGui",     &PyInit_PySide6_QtGui);
-            PyImport_AppendInittab("PySide6.QtWidgets", &PyInit_PySide6_QtWidgets);
+// PySide6 built-in modules (static).
+__EXTERN_DECLS__
 
-            // 2. Set Python home to the bundled stdlib
-            NSString *resourcePath = [[NSBundle mainBundle] resourcePath];
-            NSString *stdlibPath   = [resourcePath stringByAppendingPathComponent:@"python"];
-            Py_SetPythonHome((wchar_t *)[stdlibPath UTF8String]);
+static QApplication *qtApp = nullptr;
 
-            // 3. Initialize CPython
-            Py_Initialize();
-            if (!Py_IsInitialized()) {{
-                NSLog(@"[pyside6-ios] ERROR: Py_Initialize() failed");
-                return NO;
-            }}
+static void initPython() {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSString *stdlibPath = [bundlePath stringByAppendingPathComponent:@"lib/python__PYVER__"];
+    NSString *dynloadPath = [stdlibPath stringByAppendingPathComponent:@"lib-dynload"];
+    NSString *appScriptsPath = [bundlePath stringByAppendingPathComponent:@"scripts"];
+    NSString *appPackagesPath = [bundlePath stringByAppendingPathComponent:@"packages"];
 
-            // 4. Append app bundle resource path to sys.path
-            PyObject *sys  = PyImport_ImportModule("sys");
-            PyObject *path = PyObject_GetAttrString(sys, "path");
-            PyList_Append(path, PyUnicode_FromString([resourcePath UTF8String]));
-            Py_DECREF(path);
-            Py_DECREF(sys);
+__INITTAB_CALLS__
 
-            // 5. Run Qt + Python application
-            {qt_init_code}
+    PyConfig config;
+    PyConfig_InitIsolatedConfig(&config);
+    config.write_bytecode = 0;
+    config.home = Py_DecodeLocale([bundlePath UTF8String], NULL);
 
-            return YES;
-        }}
+    config.module_search_paths_set = 1;
+    PyWideStringList_Append(&config.module_search_paths,
+        Py_DecodeLocale([stdlibPath UTF8String], NULL));
+    PyWideStringList_Append(&config.module_search_paths,
+        Py_DecodeLocale([dynloadPath UTF8String], NULL));
+    PyWideStringList_Append(&config.module_search_paths,
+        Py_DecodeLocale([appScriptsPath UTF8String], NULL));
+    PyWideStringList_Append(&config.module_search_paths,
+        Py_DecodeLocale([appPackagesPath UTF8String], NULL));
 
-        @end
+    PyStatus status = Py_InitializeFromConfig(&config);
+    if (PyStatus_Exception(status)) {
+        NSLog(@"Python init failed: %s", status.err_msg);
+        return;
+    }
+    NSLog(@"Python %s initialized", Py_GetVersion());
+}
 
-        int main(int argc, char *argv[])
-        {{
-            // Host app owns UIApplicationMain -- Qt integrates via QIOSEventDispatcher
-            @autoreleasepool {{
-                return UIApplicationMain(argc, argv, nil,
-                    NSStringFromClass([AppDelegate class]));
-            }}
-        }}
-    """).format(qt_includes=qt_includes, qt_init_code=qt_init_code)
+static void runPythonApp() {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSString *scriptPath = [bundlePath stringByAppendingPathComponent:@"scripts/app.py"];
+
+    FILE *fp = fopen([scriptPath UTF8String], "r");
+    if (!fp) {
+        NSLog(@"Failed to open %@", scriptPath);
+        return;
+    }
+    NSLog(@"Running Python script...");
+    int result = PyRun_SimpleFile(fp, [scriptPath UTF8String]);
+    fclose(fp);
+    if (result != 0) {
+        NSLog(@"Python script failed with code %d", result);
+        if (PyErr_Occurred()) PyErr_Print();
+    }
+}
+
+@interface SceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property (strong, nonatomic) UIWindow *window;
+@end
+
+@implementation SceneDelegate
+- (void)scene:(UIScene *)scene
+    willConnectToSession:(UISceneSession *)session
+    options:(UISceneConnectionOptions *)connectionOptions {
+
+    UIWindowScene *windowScene = (UIWindowScene *)scene;
+    self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
+    self.window.backgroundColor = [UIColor blackColor];
+    self.window.rootViewController = [[UIViewController alloc] init];
+    [self.window makeKeyAndVisible];
+
+    initPython();
+
+    static int argc = 1;
+    static const char *argv[] = {"__APP_NAME__", nullptr};
+    qtApp = new QApplication(argc, const_cast<char **>(argv));
+    qDebug() << "Qt" << qVersion() << "platform:" << qtApp->platformName();
+
+    runPythonApp();
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        QWindowList windows = QGuiApplication::topLevelWindows();
+        if (!windows.isEmpty()) {
+            QWindow *qtWindow = windows.first();
+            WId nativeId = qtWindow->winId();
+            UIView *qtView = (__bridge UIView *)(void *)nativeId;
+            if (qtView) {
+                CGRect bounds = self.window.bounds;
+                qtView.frame = bounds;
+                qtView.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                          UIViewAutoresizingFlexibleHeight;
+                [self.window.rootViewController.view addSubview:qtView];
+                QWidgetList topWidgets = QApplication::topLevelWidgets();
+                for (QWidget *w : topWidgets) {
+                    w->resize((int)bounds.size.width, (int)bounds.size.height);
+                }
+                qDebug() << "Reparented Qt view into iOS window"
+                         << bounds.size.width << "x" << bounds.size.height
+                         << "widgets:" << topWidgets.size();
+            }
+        }
+    });
+}
+@end
+
+@interface AppDelegate : UIResponder <UIApplicationDelegate>
+@end
+
+@implementation AppDelegate
+- (UISceneConfiguration *)application:(UIApplication *)application
+    configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession
+    options:(UISceneConnectionOptions *)options {
+    UISceneConfiguration *config =
+        [[UISceneConfiguration alloc] initWithName:@"Default"
+                                       sessionRole:connectingSceneSession.role];
+    config.delegateClass = [SceneDelegate class];
+    return config;
+}
+@end
+
+int main(int argc, char *argv[]) {
+    @autoreleasepool {
+        return UIApplicationMain(argc, argv, nil,
+            NSStringFromClass([AppDelegate class]));
+    }
+}
+"""
+    content = (template
+               .replace('__EXTERN_DECLS__', "\n".join(extern_lines))
+               .replace('__INITTAB_CALLS__', "\n".join(inittab_lines))
+               .replace('__PYVER__', ctx.python_version)
+               .replace('__APP_NAME__', app_name.replace('"', '\\"').replace(' ', '')))
     _write_text(mm_path, content)
     log.info('  Written: %s', mm_path)
     return mm_path
@@ -1120,10 +1556,13 @@ def bootstrap(ctx):
     log.info('========================================')
     ctx.summary()
     setup_venv(ctx)
+    # Clone the tool FIRST: its directory IS the build root, and the steps below
+    # populate <tool>/build/...  ``git clone`` refuses a non-empty target, so it
+    # must happen before we create any <tool>/build subdirectories.
+    install_pyside6_ios_tool(ctx)
     install_qt(ctx)
     install_python_framework(ctx)
     clone_pyside_sources(ctx)
-    install_pyside6_ios_tool(ctx)
     log.info('Bootstrap complete.  Next: --build-qtruntime')
 
 
@@ -1166,21 +1605,24 @@ def full_pipeline(ctx, app_dir, app_name, bundle_id, app_module, ui_mode='widget
     build_all(ctx, modules)
     _makedirs(app_dir)
     toml_path = generate_toml(ctx, app_dir, app_name, bundle_id, modules, ui_mode, team_id)
-    generate_main_mm(app_dir, app_module, ui_mode)
+    # Widgets mode needs a QApplication host; QML mode lets the pyside6-ios CLI
+    # auto-generate its (QGuiApplication) main.mm during `generate`.
+    if ui_mode == 'widgets':
+        generate_main_mm(ctx, app_dir, app_name, modules)
     xcodeproj = generate_xcodeproj(ctx, app_dir, toml_path)
     log.info('')
-    log.info('╔══════════════════════════════════════════════════════════╗')
-    log.info('║          Xcode project generated  :)                     ║')
-    log.info('╠══════════════════════════════════════════════════════════╣')
-    log.info('║  %s', xcodeproj)
-    log.info('╠══════════════════════════════════════════════════════════╣')
-    log.info('║  Important iOS runtime notes:                            ║')
-    log.info('║  * Use showFullScreen() -- show() produces blank window  ║')
-    log.info('║  * Use widget.setLayout(l) -- NOT QLayout(parent)        ║')
-    log.info('║  * QProcess unavailable on iOS (QT_CONFIG(process)==0)   ║')
-    log.info('║  * Trust your developer cert on device (first run):      ║')
-    log.info('║    Settings > General > VPN & Device Management > Trust  ║')
-    log.info('╚══════════════════════════════════════════════════════════╝')
+    log.info('â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??')
+    log.info('â??          Xcode project generated  :)                     â??')
+    log.info('â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??')
+    log.info('â??  %s', xcodeproj)
+    log.info('â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??')
+    log.info('â??  Important iOS runtime notes:                            â??')
+    log.info('â??  * Use showFullScreen() -- show() produces blank window  â??')
+    log.info('â??  * Use widget.setLayout(l) -- NOT QLayout(parent)        â??')
+    log.info('â??  * QProcess unavailable on iOS (QT_CONFIG(process)==0)   â??')
+    log.info('â??  * Trust your developer cert on device (first run):      â??')
+    log.info('â??    Settings > General > VPN & Device Management > Trust  â??')
+    log.info('â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??â??')
     if deploy:
         if not xcode_udid or not coredevice_uuid:
             log.warning(
@@ -1213,11 +1655,23 @@ def parse_args():
             Tested: PySide6 6.8.3 / Qt 6.8.3 / CPython 3.13 / Xcode 16 / Apple Silicon
         """),
         epilog=dedent("""\
+            Project layout (same as the Android builders in this repo):
+              Your app is a directory with a plain main.py at its root, e.g.
+
+                  myapp/
+                    main.py            # standard desktop entry: builds its own
+                                       #   QApplication and calls app.exec()
+                    mypkg/             # (optional) packages -> bundled to packages/
+                      __init__.py
+
+              The builder generates myapp/scripts/app.py automatically -- a small
+              bridge that runs your main.py under the iOS host.  Your main.py is
+              never modified.  (A hand-written scripts/app.py is also accepted.)
+
             Examples:
-              # Full pipeline for a new app
+              # Full pipeline for an app (myapp/main.py exists)
               python pyside6_ios_builder.py \\
-                  --app myapp/ --app-name "My App" --bundle-id com.example.myapp \\
-                  --app-module myapp.main
+                  --app myapp/ --app-name "My App" --bundle-id com.example.myapp
 
               # Bootstrap + library build (no app yet)
               python pyside6_ios_builder.py --bootstrap
@@ -1254,10 +1708,11 @@ def parse_args():
     ag.add_argument('--list-devices', action='store_true', help='List connected iOS devices and exit.')
     # -- App configuration --
     app_grp = p.add_argument_group('App configuration')
-    app_grp.add_argument('--app', metavar='DIR', help='App source directory.')
+    app_grp.add_argument('--app', metavar='DIR', help='App project directory (must contain main.py at its root).')
     app_grp.add_argument('--app-name', metavar='NAME', default='MyPySide6App', help='Human-readable app name.')
     app_grp.add_argument('--bundle-id', metavar='ID', default='com.example.myapp', help='iOS bundle identifier.')
-    app_grp.add_argument('--app-module', metavar='MOD', default='main', help='Python module containing _run().')
+    app_grp.add_argument('--app-module', metavar='MOD', default='main',
+                         help='(Deprecated/unused) the entry point is main.py at the project root.')
     app_grp.add_argument(
         '--ui-mode', choices=['widgets', 'qml'], default='widgets',
         help="UI toolkit: 'widgets' (QtWidgets) or 'qml' (QML). Default: widgets.")
@@ -1334,7 +1789,8 @@ def main():
             if not exists(toml_path):
                 toml_path = generate_toml(
                     ctx, app_dir, args.app_name, args.bundle_id, args.modules, args.ui_mode, args.team_id)
-                generate_main_mm(app_dir, args.app_module, args.ui_mode)
+                if args.ui_mode == 'widgets':
+                    generate_main_mm(ctx, app_dir, args.app_name, args.modules)
             xcodeproj = generate_xcodeproj(ctx, app_dir, toml_path)
             log.info('Xcode project: %s', xcodeproj)
             exit(0)
