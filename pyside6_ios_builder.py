@@ -1613,7 +1613,13 @@ def generate_xcodeproj(ctx, app_dir, toml_path):
     if not exists(pyside6_ios_bin):
         raise BuildError('pyside6-ios CLI not found at {}. Run --install-tool first.'.format(pyside6_ios_bin))
     _run([pyside6_ios_bin, '-c', toml_path, 'generate'], cwd=app_dir, env=ctx.env_with_qt())
-    xcodeproj_candidates = _rglob(app_dir, '*.xcodeproj')
+    # The CLI writes the project into the TOML's output-dir ("generated"), and a
+    # .xcodeproj is a *directory* (bundle), not a file -- so _rglob (which only
+    # walks files) never finds it.  Look in the output dir first, then fall back
+    # to a recursive directory glob.
+    xcodeproj_candidates = sorted(glob(join(app_dir, 'generated', '*.xcodeproj')))
+    if not xcodeproj_candidates:
+        xcodeproj_candidates = sorted(glob(join(app_dir, '**', '*.xcodeproj'), recursive=True))
     if not xcodeproj_candidates:
         raise BuildError('No .xcodeproj found in {} after generate.'.format(app_dir))
     xcodeproj = xcodeproj_candidates[0]
