@@ -129,21 +129,32 @@ jobs:
             p6ios-prebuilt-${{ env.CACHE_VERSION }}-${{ runner.os }}-
 
       - name: Bootstrap + cross-compile libraries
-        # Idempotent: if the cache already provided the static modules we skip the
-        # whole 1–2 h build. Otherwise run bootstrap (venv, Qt via aqt, CPython
-        # framework, pyside-setup sources, tool clone) then build-all (globalize
-        # symbols → QtRuntime.framework → shiboken/pyside support libs → per-module
-        # static .a files).
+        # Skip the heavy build ONLY on an *exact* cache hit.  The cache key embeds
+        # a hash of the builder scripts, so a mere prefix `restore-keys` match means
+        # the builder changed since that cache was saved => the builder-derived
+        # libraries (PySide6 modules, shiboken/pyside support libs, generated
+        # wrappers) are STALE.  We delete just those (keeping the expensive Qt SDK,
+        # Python.xcframework, QtRuntime.framework, pyside-setup sources, tool clone
+        # and venv) and rebuild, so a fix in pyside6_ios_builder.py actually
+        # propagates into the .a files instead of silently reusing the old ones.
+        env:
+          EXACT_HIT: ${{ steps.prebuilt-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          # The builder re-roots all of its outputs under the cloned tool dir:
-          #   $ROOT_DIR/build/pyside6-ios-tool/build/...
           TB="$ROOT_DIR/build/pyside6-ios-tool/build"
           SENTINEL="$TB/pyside6-ios-static/libPySide6_QtCore.a"
-          if [ -f "$SENTINEL" ]; then
-            echo "✓ Cache hit — cross-compiled libraries already present, skipping heavy build."
+          if [ "$EXACT_HIT" = "true" ] && [ -f "$SENTINEL" ]; then
+            echo "✓ Exact cache hit — prebuilt matches the current builder; skipping heavy build."
           else
-            echo "→ Cache miss — running full bootstrap + library build."
+            if [ -d "$TB" ]; then
+              echo "→ Non-exact cache restore (builder changed) — clearing builder-derived"
+              echo "  libraries so the current builder rebuilds them. Keeping Qt SDK, Python,"
+              echo "  QtRuntime, pyside-setup sources, tool clone and venv."
+              rm -rf "$TB/pyside6-ios-static" "$TB/pyside6-ios-gen" \
+                     "$TB/libpyside-ios" "$TB/libshiboken-ios" \
+                     "$TB/libpysideqml-ios" "$TB/shiboken-ios"
+            fi
+            echo "→ Running bootstrap + library build."
             python pyside6_ios_builder.py --bootstrap  --root "$ROOT_DIR" --debug
             python pyside6_ios_builder.py --build-all   --root "$ROOT_DIR" --debug
           fi
