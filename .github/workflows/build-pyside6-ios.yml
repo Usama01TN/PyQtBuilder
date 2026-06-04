@@ -136,7 +136,10 @@ jobs:
         # static .a files).
         run: |
           set -euo pipefail
-          SENTINEL="$ROOT_DIR/build/pyside6-ios-static/libPySide6_QtCore.a"
+          # The builder re-roots all of its outputs under the cloned tool dir:
+          #   $ROOT_DIR/build/pyside6-ios-tool/build/...
+          TB="$ROOT_DIR/build/pyside6-ios-tool/build"
+          SENTINEL="$TB/pyside6-ios-static/libPySide6_QtCore.a"
           if [ -f "$SENTINEL" ]; then
             echo "✓ Cache hit — cross-compiled libraries already present, skipping heavy build."
           else
@@ -150,7 +153,9 @@ jobs:
         # silently produced nothing.
         run: |
           set -euo pipefail
-          B="$ROOT_DIR/build"
+          # All tool outputs live under the cloned tool's build dir (the builder
+          # re-roots everything there so the upstream scripts' relative paths work).
+          B="$ROOT_DIR/build/pyside6-ios-tool/build"
           echo "Contents of $B:"; ls -la "$B" || true
           test -d "$B/QtRuntime.framework"              || { echo "::error::QtRuntime.framework missing"; exit 1; }
           test -d "$B/pyside6-ios-static"               || { echo "::error::pyside6-ios-static missing"; exit 1; }
@@ -166,7 +171,7 @@ jobs:
         # SDK (that is just an aqt download).
         run: |
           set -euo pipefail
-          B="$ROOT_DIR/build"
+          B="$ROOT_DIR/build/pyside6-ios-tool/build"
           OUT="$GITHUB_WORKSPACE/prebuilt-qt-ios.tar.gz"
           ITEMS=""
           for d in QtRuntime.framework pyside6-ios-static pyside6-ios-gen \
@@ -244,7 +249,7 @@ jobs:
         # entry was evicted), rebuild them rather than failing the app build.
         run: |
           set -euo pipefail
-          if [ ! -f "$ROOT_DIR/build/pyside6-ios-static/libPySide6_QtCore.a" ]; then
+          if [ ! -f "$ROOT_DIR/build/pyside6-ios-tool/build/pyside6-ios-static/libPySide6_QtCore.a" ]; then
             echo "::warning::Prebuilt libraries not found in cache — rebuilding (slow)."
             python pyside6_ios_builder.py --bootstrap --root "$ROOT_DIR" --debug
             python pyside6_ios_builder.py --build-all  --root "$ROOT_DIR" --debug
