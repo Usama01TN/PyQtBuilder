@@ -928,6 +928,101 @@ def build_support_libs(ctx):
 # ---------------------------------------------------------------------------
 
 
+def patch_module_build_script(ctx):
+    """
+    Patch the cloned ``build_pyside6_module.sh`` so each PySide6 module also
+    compiles its **hand-written glue/helper sources** (and the moc those need).
+
+    The upstream script compiles only the shiboken-generated ``*_wrapper.cpp``
+    plus a couple of per-module extras.  It omits the hand-written ``glue/*.cpp``
+    sources (e.g. QtCore's ``core_snippets.cpp``/``qtcorehelper.cpp``/
+    ``qiopipe.cpp``/``qeasingcurve_glue.cpp`` and QtGui's ``qpytextobject.cpp``)
+    and does not run AUTOMOC.  The generated wrappers reference those symbols, so
+    without them the app fails to link with hundreds of ``Undefined symbols``
+    (``QtCoreHelper::*``, ``invokeMetaMethod``, ``qObjectFindChild``,
+    ``QVariant_*``, ``PyDate_ImportAndCheck``, ``PySideEasingCurveFunctor``,
+    ``QPyTextObject``, ...).
+
+    We append the missing sources to the script's existing ``EXTRA_SOURCES``
+    array and generate the AUTOMOC-equivalent output with the host ``moc`` (passed
+    in via the ``MOC`` env var).  Idempotent via a sentinel comment.
+
+    :param ctx: BuildContext
+    :return: None
+    """
+    script = join(ctx.tool_dir, 'scripts', 'build_pyside6_module.sh')
+    if not exists(script):
+        raise BuildError('build_pyside6_module.sh not found at: {}'.format(script))
+    with open(script, 'r', encoding='utf-8') as fh:
+        text = fh.read()
+    if _MODULE_GLUE_SENTINEL in text:
+        log.info('  build_pyside6_module.sh already patched for glue sources.')
+        return
+    anchor = '    *) echo "Unknown module: $MODULE"; exit 1 ;;\nesac\n'
+    if anchor not in text:
+        raise BuildError(
+            'Could not find the module-case anchor in build_pyside6_module.sh; '
+            'upstream layout may have changed.')
+    text = text.replace(anchor, anchor + _MODULE_GLUE_PATCH, 1)
+    # Make the wrapper-compile loop fail loudly.  Upstream only counts failures
+    # and proceeds, archiving a broken .a: a wrapper that fails to compile is
+    # dropped, leaving its `init_<Class>` undefined, which then breaks the app
+    # link with a confusing message far from the real cause (e.g. init_QThread).
+    summary = 'echo "    Compiled: $COMPILED, Failed: $FAILED"\n'
+    if summary in text:
+        strict = (summary +
+                  'if [ "$FAILED" -gt 0 ]; then\n'
+                  '    echo "ERROR: $FAILED source(s) failed to compile for $MODULE '
+                  '(see verbose errors above)." >&2\n'
+                  '    echo "       A dropped wrapper leaves an undefined init_<Class>, '
+                  'which breaks the final app link." >&2\n'
+                  '    exit 1\n'
+                  'fi\n')
+        text = text.replace(summary, strict, 1)
+    _write_text(script, text)
+    log.info('  Patched build_pyside6_module.sh to compile hand-written glue + moc sources.')
+
+
+_MODULE_GLUE_SENTINEL = 'pyside6_ios_builder: hand-written glue'
+
+# Appended right after the module `case ... esac`.  Uses qt_header_flags() and
+# the path vars from env.sh, plus $MOC (path to the host Qt moc) from the env.
+_MODULE_GLUE_PATCH = r'''
+# >>> pyside6_ios_builder: hand-written glue + AUTOMOC-equivalent sources >>>
+# Upstream compiles only shiboken-generated *_wrapper.cpp and omits the
+# hand-written glue/helper sources (and their moc) each module needs, which
+# surfaces as "Undefined symbols" when the app is linked.  Add them here.
+: "${MOC:?MOC must be set (path to Qt moc) to build PySide6 glue sources}"
+GLUE_MOC_FLAGS=(-DQT_LEAN_HEADERS=1 -DQT_NO_DEBUG -F "$QT_IOS/lib" \
+    -I "$QT_IOS/include" $(qt_header_flags QtCore) \
+    -I "$LIBSHIBOKEN_SRC" -I "$LIBPYSIDE_SRC" -I "$PYSIDE6_SRC" \
+    -I "$PYTHON_FW/Headers")
+case "$MODULE" in
+    QtCore)
+        GD="$PYSIDE6_SRC/QtCore/glue"
+        "$MOC" "${GLUE_MOC_FLAGS[@]}" "$PYSIDE6_SRC/qiopipe.h" -o "$GD/moc_qiopipe.cpp"
+        "$MOC" "${GLUE_MOC_FLAGS[@]}" "$GD/qiopipe.cpp"        -o "$GD/qiopipe.moc"
+        EXTRA_SOURCES+=("$GD/qeasingcurve_glue.cpp" "$GD/core_snippets.cpp" \
+                        "$GD/qtcorehelper.cpp" "$GD/qiopipe.cpp" "$GD/moc_qiopipe.cpp")
+        ;;
+    QtGui)
+        "$MOC" "${GLUE_MOC_FLAGS[@]}" $(qt_header_flags QtGui) \
+            "$PYSIDE6_SRC/qpytextobject.h" -o "$PYSIDE6_SRC/moc_qpytextobject.cpp"
+        EXTRA_SOURCES+=("$PYSIDE6_SRC/qpytextobject.cpp" "$PYSIDE6_SRC/moc_qpytextobject.cpp")
+        ;;
+    QtQml)
+        for _h in qpyqmlparserstatus qpyqmlpropertyvaluesource; do
+            "$MOC" "${GLUE_MOC_FLAGS[@]}" $(qt_header_flags QtQml) \
+                -I "$QT_IOS/lib/QtNetwork.framework/Headers" \
+                "$PYSIDE6_SRC/$_h.h" -o "$PYSIDE6_SRC/moc_$_h.cpp"
+            EXTRA_SOURCES+=("$PYSIDE6_SRC/moc_$_h.cpp")
+        done
+        ;;
+esac
+# <<< pyside6_ios_builder <<<
+'''
+
+
 def build_pyside6_modules(ctx, modules=None):
     """
     Cross-compile each PySide6 Python extension module (QtCore, QtGui, etc.)
@@ -949,7 +1044,12 @@ def build_pyside6_modules(ctx, modules=None):
     script = join(ctx.tool_dir, 'scripts', 'build_pyside6_module.sh')
     if not exists(script):
         raise BuildError('build_pyside6_module.sh not found at: {}'.format(script))
+    # Ensure each module also compiles its hand-written glue/helper sources
+    # (+ moc); the upstream script only compiles the generated wrappers.
+    patch_module_build_script(ctx)
     env = ctx.env_with_qt()
+    # The patched script generates AUTOMOC-equivalent output with the host moc.
+    env['MOC'] = _find_moc(ctx)
     for mod in modules:
         out_lib = join(ctx.pyside6_static_dir, 'libPySide6_{}.a'.format(mod))
         if exists(out_lib):
