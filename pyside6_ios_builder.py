@@ -800,6 +800,93 @@ def generate_shiboken_embedding(ctx):
     log.info('  shiboken embed headers generated under: %s', embed_dir)
 
 
+def _find_moc(ctx):
+    """
+    Locate the host Qt ``moc`` binary.  install_qt fetches the desktop (macOS) Qt
+    alongside the iOS one specifically so host tools like moc are available.
+
+    :param ctx: BuildContext
+    :return: str -- path to moc
+    """
+    candidates = [join(ctx.qt_macos_dir, 'libexec', 'moc'),
+                  join(ctx.qt_macos_dir, 'bin', 'moc')]
+    for c in candidates:
+        if exists(c):
+            return c
+    for base in (ctx.qt_macos_dir, ctx.qt_ios_dir):
+        hits = sorted(glob(join(base, '**', 'moc'), recursive=True))
+        if hits:
+            return hits[0]
+    raise BuildError(
+        'Qt moc not found under {} or {}.\n'
+        '  moc is required to generate the .moc sources that libpyside includes; '
+        'install_qt should have fetched the desktop Qt that ships it.'
+        .format(ctx.qt_macos_dir, ctx.qt_ios_dir))
+
+
+def generate_moc_files(ctx):
+    """
+    Generate Qt meta-object (``moc``) output for any libpyside/libpysideqml
+    source that ``#include``s a ``"<name>.moc"``.
+
+    For example libpyside/dynamicslot.cpp defines an inline ``QObject`` subclass
+    guarded by ``Q_OBJECT`` and ends with ``#include "dynamicslot.moc"``.  A normal
+    PySide6 build runs moc through CMake/AUTOMOC; the minimal build_support_libs.sh
+    does not, so the .moc is missing and the compile dies with
+    ``'dynamicslot.moc' file not found``.
+
+    We run the host Qt's moc on each such source and write ``<name>.moc`` next to
+    it (the ``#include`` uses quotes, so it resolves against the source dir first).
+
+    :param ctx: BuildContext
+    :return: None
+    """
+    import re
+    moc = _find_moc(ctx)
+    py6 = join(ctx.pyside_src, 'sources', 'pyside6')
+    libpyside = join(py6, 'libpyside')
+    libpysideqml = join(py6, 'libpysideqml')
+    libshiboken = join(ctx.pyside_src, 'sources', 'shiboken6', 'libshiboken')
+    py_headers = join(ctx.python_framework, 'ios-arm64', 'Python.framework', 'Headers')
+
+    def _qt_fw(mod):
+        base = join(ctx.qt_ios_dir, 'lib', mod + '.framework', 'Headers')
+        return ['-I', base, '-I', join(base, ctx.qt_version), '-I', join(base, ctx.qt_version, mod)]
+
+    # Mirror the support-libs compile so moc preprocesses the sources the same way.
+    moc_flags = ['-DQT_LEAN_HEADERS=1', '-DQT_NO_DEBUG', '-DSHIBOKEN_NO_EMBEDDING_PYC',
+                 '-DNDEBUG', '-DBUILD_LIBPYSIDE',
+                 '-F', join(ctx.qt_ios_dir, 'lib'),
+                 '-I', join(ctx.qt_ios_dir, 'include'),
+                 '-I', join(ctx.qt_ios_dir, 'mkspecs', 'macx-ios-clang'),
+                 '-I', libshiboken, '-I', py_headers]
+    moc_flags += _qt_fw('QtCore')
+
+    pat = re.compile(r'#include\s+"([A-Za-z0-9_]+)\.moc"')
+    total = 0
+    log.info('  Generating moc sources (host moc: %s)...', moc)
+    for srcdir in (libpyside, libpysideqml):
+        if not exists(srcdir):
+            continue
+        for cpp in sorted(glob(join(srcdir, '*.cpp'))):
+            try:
+                with open(cpp, 'r', encoding='utf-8', errors='ignore') as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for base in pat.findall(text):
+                out = join(srcdir, base + '.moc')
+                if exists(out):
+                    continue
+                _run([moc] + moc_flags + ['-I', srcdir, cpp, '-o', out],
+                     cwd=srcdir, env=ctx.env_with_qt())
+                if not exists(out):
+                    raise BuildError('moc did not produce: {}'.format(out))
+                log.info('    moc: %s -> %s', basename(cpp), basename(out))
+                total += 1
+    log.info('  Generated %d moc file(s).', total)
+
+
 def build_support_libs(ctx):
     """
     Cross-compile libshiboken6, libpyside6, and libpysideqml for arm64-iOS.
@@ -822,6 +909,9 @@ def build_support_libs(ctx):
     # headers; produce them first (the minimal upstream script never runs the
     # shiboken CMake step that normally generates these).
     generate_shiboken_embedding(ctx)
+    # libpyside sources (e.g. dynamicslot.cpp) #include moc output; the minimal
+    # script has no AUTOMOC, so generate the .moc files first.
+    generate_moc_files(ctx)
     # The upstream script sources scripts/env.sh, which derives every input and
     # output path relative to the tool root (P6IOS_ROOT).  It does NOT read any
     # SUPPORT_LIBS_OUTDIR / PYSIDE_SRC overrides, so we just run it in-place with
