@@ -58,7 +58,10 @@ env:
   # Single source of truth for the build root (build/ + .venv live here).
   ROOT_DIR: ${{ github.workspace }}/build-root
   # Bump this token to deliberately invalidate the prebuilt cache.
-  CACHE_VERSION: v1
+  # v2: previous v1 caches were poisoned with glue-less PySide6 module archives
+  #     (built before the hand-written-glue fix), which an exact key hit kept
+  #     reusing.  Bumping forces a clean rebuild with the glue sources.
+  CACHE_VERSION: v2
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
@@ -114,11 +117,12 @@ jobs:
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
           echo "Cache key: $KEY"
 
-      # The killer optimisation. On a hit, the heavy build below is skipped
-      # entirely. On a miss, it runs and this same entry is saved on job exit.
-      - name: Cache cross-compiled Qt/PySide6/Python + venv
+      # Restore only.  The matching SAVE happens in a later step gated on
+      # success + a glue-presence check, so a FAILED or glue-less build is never
+      # written to the cache (which is exactly what poisoned v1 before).
+      - name: Restore cross-compiled Qt/PySide6/Python + venv
         id: prebuilt-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.ROOT_DIR }}/build
@@ -175,6 +179,38 @@ jobs:
           echo "Cross-compiled PySide6 module archives: $COUNT"
           [ "$COUNT" -ge 1 ] || { echo "::error::no libPySide6_*.a produced"; exit 1; }
           ls -la "$B/pyside6-ios-static"
+          # Crucial: the modules must contain the hand-written glue, or the app
+          # link fails (undefined QtCoreHelper::*, PySideEasingCurveFunctor, ...).
+          # A glue-less archive must NEVER be cached and reused, so fail here.
+          QTCORE_A="$B/pyside6-ios-static/libPySide6_QtCore.a"
+          QTCORE_SYMS="$(nm "$QTCORE_A" 2>/dev/null || true)"
+          if ! printf '%s' "$QTCORE_SYMS" | grep -q "EasingCurveFunctor"; then
+            echo "::error::libPySide6_QtCore.a lacks hand-written glue (PySideEasingCurveFunctor absent)."
+            echo "          The per-module glue patch did not take effect — refusing to cache a broken build."
+            exit 1
+          fi
+          QTGUI_A="$B/pyside6-ios-static/libPySide6_QtGui.a"
+          if [ -f "$QTGUI_A" ]; then
+            QTGUI_SYMS="$(nm "$QTGUI_A" 2>/dev/null || true)"
+            if ! printf '%s' "$QTGUI_SYMS" | grep -q "QPyTextObject"; then
+              echo "::error::libPySide6_QtGui.a lacks hand-written glue (QPyTextObject absent)."
+              exit 1
+            fi
+          fi
+          echo "✓ Module glue symbols present (QtCore: EasingCurveFunctor, QtGui: QPyTextObject)."
+
+      - name: Save prebuilt cache (success + glue verified only)
+        # Split save (not the combined cache action) so a FAILED or glue-less
+        # build is NEVER written to the cache — that exact-key poisoning is what
+        # made earlier glue fixes silently ineffective.  Runs only if every prior
+        # step (including the glue check above) succeeded.
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.ROOT_DIR }}/build
+            ${{ env.ROOT_DIR }}/.venv
+          key: ${{ steps.cachekey.outputs.key }}
 
       - name: Package prebuilt Qt iOS artifact
         # tar (bsdtar on macOS) preserves the framework symlinks. We ship the
