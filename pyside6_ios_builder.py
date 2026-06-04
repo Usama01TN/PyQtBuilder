@@ -755,6 +755,51 @@ def build_qtruntime(ctx):
 # ---------------------------------------------------------------------------
 
 
+def generate_shiboken_embedding(ctx):
+    """
+    Generate the shiboken6 ``embed`` headers that libshiboken's
+    ``signature/signature_globals.cpp`` ``#include``s:
+    ``embed/signature_inc.h`` and ``embed/signature_bootstrap_inc.h``.
+
+    In a normal PySide6 build these are produced by a CMake custom command that
+    runs shiboken6's own ``embedding_generator.py``.  The minimal pyside6-ios
+    ``build_support_libs.sh`` compiles the sources directly and never runs that
+    CMake step, so the headers are missing and the libshiboken6 compile dies with
+    ``fatal error: 'embed/signature_inc.h' file not found``.
+
+    We run the upstream generator straight out of the cloned ``pyside-setup`` (so
+    it matches the exact version) to emit both headers into
+    ``<pyside-setup>/sources/shiboken6/libshiboken/embed/`` -- which is on the
+    compiler include path (``-I $LIBSHIBOKEN_SRC``).  ``--use-pyc no`` embeds the
+    Python *source* (architecture-independent, host-Python-agnostic), matching the
+    ``-DSHIBOKEN_NO_EMBEDDING_PYC`` the support-libs build compiles with.
+
+    :param ctx: BuildContext
+    :return: None
+    """
+    embed_dir = join(ctx.pyside_src, 'sources', 'shiboken6', 'libshiboken', 'embed')
+    generator = join(embed_dir, 'embedding_generator.py')
+    inc = join(embed_dir, 'signature_inc.h')
+    boot_inc = join(embed_dir, 'signature_bootstrap_inc.h')
+    if exists(inc) and exists(boot_inc):
+        log.info('  shiboken embed headers already present -- skipping.')
+        return
+    if not exists(generator):
+        raise BuildError(
+            'shiboken embedding_generator.py not found at: {}\n'
+            '  (expected inside the cloned pyside-setup sources).'.format(generator))
+    log.info('  Generating shiboken embed headers (signature_inc.h, signature_bootstrap_inc.h)...')
+    # The generator chdir's into --cmake-dir and writes both headers there.  It
+    # also imports build_scripts/utils.py from the pyside-setup root and zips the
+    # shibokensupport sources, so it must run from inside the cloned tree.
+    _run([ctx.python, '-E', generator, '--cmake-dir', embed_dir, '--use-pyc', 'no', '--quiet'],
+         cwd=embed_dir, env=ctx.env_with_qt())
+    for h in (inc, boot_inc):
+        if not exists(h):
+            raise BuildError('shiboken embed header was not generated: {}'.format(h))
+    log.info('  shiboken embed headers generated under: %s', embed_dir)
+
+
 def build_support_libs(ctx):
     """
     Cross-compile libshiboken6, libpyside6, and libpysideqml for arm64-iOS.
@@ -773,6 +818,10 @@ def build_support_libs(ctx):
     if not exists(script):
         raise BuildError('build_support_libs.sh not found at: {}'.format(script))
     log.info('  Cross-compiling libshiboken6, libpyside6, libpysideqml ...  (~2 min)')
+    # libshiboken/signature/signature_globals.cpp #includes generated embed
+    # headers; produce them first (the minimal upstream script never runs the
+    # shiboken CMake step that normally generates these).
+    generate_shiboken_embedding(ctx)
     # The upstream script sources scripts/env.sh, which derives every input and
     # output path relative to the tool root (P6IOS_ROOT).  It does NOT read any
     # SUPPORT_LIBS_OUTDIR / PYSIDE_SRC overrides, so we just run it in-place with
