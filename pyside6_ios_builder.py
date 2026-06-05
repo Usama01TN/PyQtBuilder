@@ -577,16 +577,47 @@ def install_pyside6_ios_tool(ctx):
     """
     Clone patrickkidd/pyside6-ios and install the pyside6-ios CLI into the venv.
     The tool generates Xcode projects from a pyside6-ios.toml config.
+
+    The tool directory is cached between CI runs, and we patch several of its
+    upstream shell scripts in place (build_pyside6_module.sh, build_support_libs.sh).
+    Our patch functions are idempotent via sentinel comments, so a previously
+    patched script that survives in the cache would be re-used *and skipped* even
+    after the builder's patch logic changed -- silently shipping stale patches.
+    To stay robust, we keep a pristine copy of the upstream ``scripts/`` and
+    restore it before every run so the current builder always patches from a
+    clean baseline.  The cached scripts can't be trusted as that baseline (they
+    may already be patched), so the pristine copy is seeded from a fresh clone.
+
     :param ctx: BuildContext
     :return: None
     """
+    import shutil
+    import tempfile
     log.info('========== Installing pyside6-ios build tool ==========')
-    if exists(ctx.tool_dir):
-        log.info('  pyside6-ios repo already cloned -- reinstalling tool ...')
-    else:
+    if not exists(ctx.tool_dir):
         which_required('git')
         _makedirs(dirname(ctx.tool_dir))
         _run([getGitExecutable(), 'clone', '--depth', '1', PYSIDE6_IOS_REPO, ctx.tool_dir])
+    else:
+        log.info('  pyside6-ios repo already cloned -- reinstalling tool ...')
+    scripts_dir = join(ctx.tool_dir, 'scripts')
+    pristine_dir = join(ctx.tool_dir, 'scripts.pristine')
+    if not exists(pristine_dir):
+        # Seed the pristine baseline from a throwaway fresh clone -- the scripts
+        # already in tool_dir may have been patched by an earlier cached run.
+        which_required('git')
+        tmp = tempfile.mkdtemp(prefix='p6ios-pristine-')
+        try:
+            _run([getGitExecutable(), 'clone', '--depth', '1', PYSIDE6_IOS_REPO, tmp])
+            shutil.copytree(join(tmp, 'scripts'), pristine_dir)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        log.info('  Seeded pristine upstream scripts baseline.')
+    # Restore scripts to the pristine baseline so this run's patches apply clean.
+    if exists(scripts_dir):
+        shutil.rmtree(scripts_dir)
+    shutil.copytree(pristine_dir, scripts_dir)
+    log.info('  Reset upstream scripts to pristine baseline (patches re-applied fresh).')
     _run([ctx.uv, 'pip', 'install', '--python', ctx.python, '-e', ctx.tool_dir], cwd=ctx.tool_dir)
     log.info('  pyside6-ios tool installed.')
 
@@ -739,14 +770,6 @@ def build_qtruntime(ctx):
     if not exists(script):
         raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
     log.info('  This merges all Qt static libs -- ~5 min first run.')
-    # Stop QtRuntime from exporting the weak Qt metatype template instantiations
-    # (QMetaTypeInterfaceWrapper<T>::metaType, QMetaTypeId<T>::qt_metatype_id).
-    # The static PySide6 libs instantiate those weak symbols too and reference
-    # them with direct (ADRP/ADD) addressing; if the dylib also exports them the
-    # linker rebinds the reference as a dylib import (which needs GOT-indirect)
-    # and fails with "invalid use of ADRP/imm12".  Not exporting them keeps the
-    # static libs' local copies in use.
-    patch_qtruntime_build_script(ctx)
     # Upstream script writes to ``build/QtRuntime.framework`` relative to its CWD
     # and runs ``uv run python scripts/globalize_symbols.py`` (relative path), so
     # it MUST run from the tool root.  Pass --qt-ios explicitly (env QT_IOS is
@@ -895,6 +918,50 @@ def generate_moc_files(ctx):
     log.info('  Generated %d moc file(s).', total)
 
 
+_SUPPORT_GOT_SENTINEL = 'pyside6_ios_builder: GOT-indirect external data'
+
+
+def patch_support_libs_build_script(ctx):
+    """
+    Patch the cloned ``build_support_libs.sh`` so the support libraries are
+    compiled with ``-fno-direct-access-external-data``.
+
+    libpyside6 / libshiboken6 reference the extern-template Qt metatype data
+    (``QtPrivate::QMetaTypeInterfaceWrapper<T>::metaType``) that is instantiated
+    once inside QtCore — which now lives in the QtRuntime dylib.  The default
+    arm64 codegen reaches such const data with direct ADRP/ADD addressing, which
+    is invalid for a dylib import and would otherwise surface as undefined
+    symbols (or, when QtRuntime exports them, "invalid use of ADRP/imm12").
+    Forcing GOT-indirect external-data access lets those references bind to
+    QtRuntime at link time.  Idempotent via a sentinel comment.
+
+    :param ctx: BuildContext
+    :return: None
+    """
+    script = join(ctx.tool_dir, 'scripts', 'build_support_libs.sh')
+    if not exists(script):
+        raise BuildError('build_support_libs.sh not found at: {}'.format(script))
+    with open(script, 'r', encoding='utf-8') as fh:
+        text = fh.read()
+    if _SUPPORT_GOT_SENTINEL in text:
+        log.info('  build_support_libs.sh already patched for GOT-indirect data.')
+        return
+    anchor = '-DNDEBUG -O2 -fPIC)\n'
+    if anchor not in text:
+        raise BuildError(
+            'Could not find the BASE_CXXFLAGS anchor in build_support_libs.sh; '
+            'upstream layout may have changed.')
+    addition = (
+        anchor +
+        '# ' + _SUPPORT_GOT_SENTINEL + ': QtRuntime is a dylib, so external Qt\n'
+        '# data symbols (extern-template QMetaTypeInterfaceWrapper<T>::metaType)\n'
+        '# must be reached GOT-indirect, not via direct ADRP/ADD.\n'
+        'BASE_CXXFLAGS+=(-fno-direct-access-external-data)\n')
+    text = text.replace(anchor, addition, 1)
+    _write_text(script, text)
+    log.info('  Patched build_support_libs.sh to use GOT-indirect external-data access.')
+
+
 def build_support_libs(ctx):
     """
     Cross-compile libshiboken6, libpyside6, and libpysideqml for arm64-iOS.
@@ -920,6 +987,10 @@ def build_support_libs(ctx):
     # libpyside sources (e.g. dynamicslot.cpp) #include moc output; the minimal
     # script has no AUTOMOC, so generate the .moc files first.
     generate_moc_files(ctx)
+    # libpyside6/libshiboken6 reference the same extern-template Qt metatype data
+    # (QMetaTypeInterfaceWrapper<T>::metaType) that now lives in the QtRuntime
+    # dylib; force GOT-indirect external-data access so those references link.
+    patch_support_libs_build_script(ctx)
     # The upstream script sources scripts/env.sh, which derives every input and
     # output path relative to the tool root (P6IOS_ROOT).  It does NOT read any
     # SUPPORT_LIBS_OUTDIR / PYSIDE_SRC overrides, so we just run it in-place with
@@ -1007,7 +1078,14 @@ def patch_module_build_script(ctx):
             '# (pyside6_ios_builder) shiboken now generates with --avoid-protected-hack,\n'
             '# so wrappers use exec_protected() accessors guarded by AVOID_PROTECTED_HACK;\n'
             '# every TU must define it (matches PySide6 AVOID_PROTECTED_HACK=ON builds).\n'
-            'CXXFLAGS+=(-DAVOID_PROTECTED_HACK)\n',
+            'CXXFLAGS+=(-DAVOID_PROTECTED_HACK)\n'
+            '# Qt declares QMetaTypeInterfaceWrapper<T>::metaType (and friends) as\n'
+            '# extern-template constexpr data instantiated once inside QtCore, which\n'
+            '# now lives in the QtRuntime *dylib*.  The default arm64 codegen accesses\n'
+            '# such const data directly (ADRP/ADD), which is illegal for a dylib import\n'
+            '# ("invalid use of ADRP/imm12"); forcing GOT-indirect external-data access\n'
+            '# makes those references bind correctly to QtRuntime at link time.\n'
+            'CXXFLAGS+=(-fno-direct-access-external-data)\n',
             1)
     _write_text(script, text)
     log.info('  Patched build_pyside6_module.sh to compile hand-written glue + moc sources.')
@@ -1051,56 +1129,6 @@ case "$MODULE" in
 esac
 # <<< pyside6_ios_builder <<<
 '''
-
-
-def patch_qtruntime_build_script(ctx):
-    """
-    Patch the cloned ``build_qtruntime.sh`` so the merged QtRuntime dynamic
-    framework does NOT export the weak Qt metatype template symbols.
-
-    Upstream builds the export list from ``nm -gU`` of every Qt static archive
-    and exports all of it.  That includes weak, header-instantiated template
-    data such as ``QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType`` and
-    ``QMetaTypeId<T>::qt_metatype_id()``.  The static PySide6 module libs
-    instantiate the very same weak symbols (they include the same Qt headers)
-    and reference them with direct ADRP/ADD addressing.  When QtRuntime also
-    exports them, the app linker treats those references as dylib imports —
-    which on arm64 must be GOT-indirect — and aborts with
-    ``invalid use of ADRP/imm12``.  Filtering them out of the export list keeps
-    them internal to QtRuntime, so the static libs resolve to their own local
-    copies (valid direct addressing).  Idempotent via a sentinel comment.
-
-    :param ctx: BuildContext
-    :return: None
-    """
-    script = join(ctx.tool_dir, 'scripts', 'build_qtruntime.sh')
-    if not exists(script):
-        raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
-    with open(script, 'r', encoding='utf-8') as fh:
-        text = fh.read()
-    if _QTRUNTIME_EXPORT_SENTINEL in text:
-        log.info('  build_qtruntime.sh already patched to filter metatype exports.')
-        return
-    anchor = 'done | sort -u > "$EXPORT_LIST"\n'
-    if anchor not in text:
-        raise BuildError(
-            'Could not find the export-list anchor in build_qtruntime.sh; '
-            'upstream layout may have changed.')
-    replacement = (
-        'done | sort -u \\\n'
-        '  | grep -vE \'' + _QTRUNTIME_EXPORT_FILTER + '\' > "$EXPORT_LIST"  '
-        '# ' + _QTRUNTIME_EXPORT_SENTINEL + '\n')
-    text = text.replace(anchor, replacement, 1)
-    _write_text(script, text)
-    log.info('  Patched build_qtruntime.sh to exclude weak metatype symbols from QtRuntime exports.')
-
-
-_QTRUNTIME_EXPORT_SENTINEL = 'pyside6_ios_builder: drop weak metatype exports'
-
-# Weak, header-instantiated Qt template symbols that the static PySide6 libs also
-# define and reference with direct addressing.  Excluding them from QtRuntime's
-# export list prevents "invalid use of ADRP/imm12" at the final app link.
-_QTRUNTIME_EXPORT_FILTER = 'QMetaTypeInterfaceWrapper|QMetaTypeId'
 
 
 def build_pyside6_modules(ctx, modules=None):
