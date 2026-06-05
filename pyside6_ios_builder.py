@@ -739,6 +739,14 @@ def build_qtruntime(ctx):
     if not exists(script):
         raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
     log.info('  This merges all Qt static libs -- ~5 min first run.')
+    # Stop QtRuntime from exporting the weak Qt metatype template instantiations
+    # (QMetaTypeInterfaceWrapper<T>::metaType, QMetaTypeId<T>::qt_metatype_id).
+    # The static PySide6 libs instantiate those weak symbols too and reference
+    # them with direct (ADRP/ADD) addressing; if the dylib also exports them the
+    # linker rebinds the reference as a dylib import (which needs GOT-indirect)
+    # and fails with "invalid use of ADRP/imm12".  Not exporting them keeps the
+    # static libs' local copies in use.
+    patch_qtruntime_build_script(ctx)
     # Upstream script writes to ``build/QtRuntime.framework`` relative to its CWD
     # and runs ``uv run python scripts/globalize_symbols.py`` (relative path), so
     # it MUST run from the tool root.  Pass --qt-ios explicitly (env QT_IOS is
@@ -1043,6 +1051,56 @@ case "$MODULE" in
 esac
 # <<< pyside6_ios_builder <<<
 '''
+
+
+def patch_qtruntime_build_script(ctx):
+    """
+    Patch the cloned ``build_qtruntime.sh`` so the merged QtRuntime dynamic
+    framework does NOT export the weak Qt metatype template symbols.
+
+    Upstream builds the export list from ``nm -gU`` of every Qt static archive
+    and exports all of it.  That includes weak, header-instantiated template
+    data such as ``QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType`` and
+    ``QMetaTypeId<T>::qt_metatype_id()``.  The static PySide6 module libs
+    instantiate the very same weak symbols (they include the same Qt headers)
+    and reference them with direct ADRP/ADD addressing.  When QtRuntime also
+    exports them, the app linker treats those references as dylib imports —
+    which on arm64 must be GOT-indirect — and aborts with
+    ``invalid use of ADRP/imm12``.  Filtering them out of the export list keeps
+    them internal to QtRuntime, so the static libs resolve to their own local
+    copies (valid direct addressing).  Idempotent via a sentinel comment.
+
+    :param ctx: BuildContext
+    :return: None
+    """
+    script = join(ctx.tool_dir, 'scripts', 'build_qtruntime.sh')
+    if not exists(script):
+        raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
+    with open(script, 'r', encoding='utf-8') as fh:
+        text = fh.read()
+    if _QTRUNTIME_EXPORT_SENTINEL in text:
+        log.info('  build_qtruntime.sh already patched to filter metatype exports.')
+        return
+    anchor = 'done | sort -u > "$EXPORT_LIST"\n'
+    if anchor not in text:
+        raise BuildError(
+            'Could not find the export-list anchor in build_qtruntime.sh; '
+            'upstream layout may have changed.')
+    replacement = (
+        'done | sort -u \\\n'
+        '  | grep -vE \'' + _QTRUNTIME_EXPORT_FILTER + '\' > "$EXPORT_LIST"  '
+        '# ' + _QTRUNTIME_EXPORT_SENTINEL + '\n')
+    text = text.replace(anchor, replacement, 1)
+    _write_text(script, text)
+    log.info('  Patched build_qtruntime.sh to exclude weak metatype symbols from QtRuntime exports.')
+
+
+_QTRUNTIME_EXPORT_SENTINEL = 'pyside6_ios_builder: drop weak metatype exports'
+
+# Weak, header-instantiated Qt template symbols that the static PySide6 libs also
+# define and reference with direct addressing.  Excluding them from QtRuntime's
+# export list prevents "invalid use of ADRP/imm12" at the final app link.
+_QTRUNTIME_EXPORT_FILTER = 'QMetaTypeInterfaceWrapper|QMetaTypeId'
 
 
 def build_pyside6_modules(ctx, modules=None):
