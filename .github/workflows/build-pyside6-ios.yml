@@ -179,24 +179,28 @@ jobs:
           echo "Cross-compiled PySide6 module archives: $COUNT"
           [ "$COUNT" -ge 1 ] || { echo "::error::no libPySide6_*.a produced"; exit 1; }
           ls -la "$B/pyside6-ios-static"
-          # Crucial: the modules must contain the hand-written glue, or the app
-          # link fails (undefined QtCoreHelper::*, PySideEasingCurveFunctor, ...).
-          # A glue-less archive must NEVER be cached and reused, so fail here.
+          # Confirm the modules actually contain the hand-written glue, else the
+          # app link fails (undefined QtCoreHelper::*, PySideEasingCurveFunctor).
+          # Grep a temp file rather than `nm | grep -q`: grep -q closes the pipe on
+          # the first match, nm then dies with SIGPIPE, and `set -o pipefail` would
+          # turn a SUCCESSFUL match into a false "absent" failure (broken pipe).
+          NM_OUT="$(mktemp)"
           QTCORE_A="$B/pyside6-ios-static/libPySide6_QtCore.a"
-          QTCORE_SYMS="$(nm "$QTCORE_A" 2>/dev/null || true)"
-          if ! printf '%s' "$QTCORE_SYMS" | grep -q "EasingCurveFunctor"; then
+          nm "$QTCORE_A" > "$NM_OUT" 2>/dev/null || true
+          if ! grep -q "EasingCurveFunctor" "$NM_OUT"; then
             echo "::error::libPySide6_QtCore.a lacks hand-written glue (PySideEasingCurveFunctor absent)."
             echo "          The per-module glue patch did not take effect — refusing to cache a broken build."
             exit 1
           fi
           QTGUI_A="$B/pyside6-ios-static/libPySide6_QtGui.a"
           if [ -f "$QTGUI_A" ]; then
-            QTGUI_SYMS="$(nm "$QTGUI_A" 2>/dev/null || true)"
-            if ! printf '%s' "$QTGUI_SYMS" | grep -q "QPyTextObject"; then
+            nm "$QTGUI_A" > "$NM_OUT" 2>/dev/null || true
+            if ! grep -q "QPyTextObject" "$NM_OUT"; then
               echo "::error::libPySide6_QtGui.a lacks hand-written glue (QPyTextObject absent)."
               exit 1
             fi
           fi
+          rm -f "$NM_OUT"
           echo "✓ Module glue symbols present (QtCore: EasingCurveFunctor, QtGui: QPyTextObject)."
 
       - name: Save prebuilt cache (success + glue verified only)
