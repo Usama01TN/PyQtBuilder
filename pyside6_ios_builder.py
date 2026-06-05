@@ -979,6 +979,28 @@ def patch_module_build_script(ctx):
                   '    exit 1\n'
                   'fi\n')
         text = text.replace(summary, strict, 1)
+    # Fix the shiboken generate-vs-compile mismatch that breaks qthread_wrapper
+    # ("no member named 'exec_protected' in 'QThreadWrapper'").  PySide6's own
+    # build (PySideHelpers.cmake) only ever passes --avoid-protected-hack to the
+    # generator *together with* -DAVOID_PROTECTED_HACK at compile.  Upstream here
+    # compiled qthread_wrapper with the macro but generated WITHOUT the flag, so
+    # the exec_protected() accessor was never emitted.  Restore the coupling:
+    #   (a) generate every module with --avoid-protected-hack, and
+    #   (b) define AVOID_PROTECTED_HACK for *every* compile (wrappers, module
+    #       wrapper, glue) so the generated accessor branch is the one used.
+    gen_anchor = '    --lean-headers "--api-version=$API_VERSION" "--platform=darwin" \\\n'
+    if gen_anchor in text and '--avoid-protected-hack' not in text:
+        text = text.replace(gen_anchor, '    --avoid-protected-hack \\\n' + gen_anchor, 1)
+    cxx_anchor = 'CXXFLAGS+=("${EXTRA_CXXFLAGS[@]+"${EXTRA_CXXFLAGS[@]}"}")\n'
+    if cxx_anchor in text:
+        text = text.replace(
+            cxx_anchor,
+            cxx_anchor +
+            '# (pyside6_ios_builder) shiboken now generates with --avoid-protected-hack,\n'
+            '# so wrappers use exec_protected() accessors guarded by AVOID_PROTECTED_HACK;\n'
+            '# every TU must define it (matches PySide6 AVOID_PROTECTED_HACK=ON builds).\n'
+            'CXXFLAGS+=(-DAVOID_PROTECTED_HACK)\n',
+            1)
     _write_text(script, text)
     log.info('  Patched build_pyside6_module.sh to compile hand-written glue + moc sources.')
 
