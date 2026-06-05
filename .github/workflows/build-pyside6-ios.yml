@@ -151,12 +151,13 @@ jobs:
             echo "✓ Exact cache hit — prebuilt matches the current builder; skipping heavy build."
           else
             if [ -d "$TB" ]; then
-              echo "→ Non-exact cache restore (builder changed) — clearing builder-derived"
-              echo "  libraries so the current builder rebuilds them. Keeping Qt SDK, Python,"
-              echo "  QtRuntime, pyside-setup sources, tool clone and venv."
-              rm -rf "$TB/pyside6-ios-static" "$TB/pyside6-ios-gen" \
-                     "$TB/libpyside-ios" "$TB/libshiboken-ios" \
-                     "$TB/libpysideqml-ios" "$TB/shiboken-ios"
+              echo "→ Non-exact cache restore (builder changed) — clearing ALL builder-derived"
+              echo "  outputs under the tool build dir so the current builder rebuilds them"
+              echo "  (QtRuntime, shiboken/pyside support libs, generated wrappers, module .a)."
+              echo "  Keeping the expensive cloned pyside-setup sources and Python.xcframework"
+              echo "  (the Qt SDK, tool clone and venv live outside this dir and are kept too)."
+              find "$TB" -mindepth 1 -maxdepth 1 \
+                   ! -name pyside-setup ! -name python -exec rm -rf {} +
             fi
             echo "→ Running bootstrap + library build."
             python pyside6_ios_builder.py --bootstrap  --root "$ROOT_DIR" --debug
