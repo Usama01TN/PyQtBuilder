@@ -1552,33 +1552,61 @@ def generate_toml(ctx, app_dir, app_name, bundle_id, modules=None, ui_mode='widg
     else:
         sources_block = ''
 
-    # -- [signing] + ad-hoc CI [build-settings] ----------------------------
+    # -- [signing] + [build-settings] --------------------------------------
+    #
+    # OTHER_CPLUSPLUSFLAGS / OTHER_CFLAGS pin the APP target's own translation
+    # units (the host main.mm -> main.o, plus any native [sources] files) to
+    # GOT-indirect access for *external* data symbols.
+    #
+    # Why this is required: QtCore is merged into the QtRuntime *dylib*, so
+    # Qt's extern-template constexpr metatype data -- e.g.
+    #     QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType
+    # reached from the inline QMetaTypeId<QList<int>>::qt_metatype_id() that Qt
+    # headers instantiate while compiling main.mm -- is a *dynamic* import at
+    # link time. On arm64 a dynamic data import MUST be reached through the GOT;
+    # the default direct ADRP/ADD addressing is illegal across images and ld
+    # rejects it with:
+    #     ld: invalid use of ADRP/imm12 in '...::qt_metatype_id()' to '...::metaType'
+    # The cross-compiled PySide6 module archives are already built with this
+    # flag (see patch_module_build_script); main.mm is compiled by Xcode, so the
+    # generated app target needs it too, or the final link fails.
+    #
+    # The pyside6-ios tool writes [build-settings] at the *project* level; the
+    # target's OTHER_CPLUSPLUSFLAGS = ("$(inherited)", ...) inherits it, so
+    # main.mm picks the flag up. Emit it unconditionally -- signed and unsigned
+    # builds hit the same dylib-data relocation.
+    got_settings = dedent("""\
+        OTHER_CPLUSPLUSFLAGS = "-fno-direct-access-external-data"
+        OTHER_CFLAGS = "-fno-direct-access-external-data"
+    """)
     if team_id:
         signing_block = dedent("""\
 
             [signing]
             style = "Automatic"
         """)
-        build_settings_block = ''
+        build_settings_block = "\n[build-settings]\n" + got_settings
     else:
-        # No Apple Team -> unsigned / ad-hoc signing so the project builds on
-        # CI without an Apple Developer account.  The workflow also passes
-        # these on the xcodebuild command line (which wins), but keeping them
-        # here makes a bare `pyside6-ios build` self-consistent too.
+        # No Apple Team -> ad-hoc signing so the project builds on CI without an
+        # Apple Developer account.  The workflow also passes these on the
+        # xcodebuild command line (which wins), but keeping them here makes a
+        # bare `pyside6-ios build` self-consistent too.
         signing_block = dedent("""\
 
             [signing]
             style = "Manual"
         """)
-        build_settings_block = dedent("""\
-
-            [build-settings]
-            CODE_SIGN_IDENTITY = "-"
-            CODE_SIGNING_REQUIRED = "NO"
-            CODE_SIGNING_ALLOWED = "YES"
-            AD_HOC_CODE_SIGNING_ALLOWED = "YES"
-            DEVELOPMENT_TEAM = ""
-        """)
+        build_settings_block = (
+            "\n[build-settings]\n"
+            + got_settings
+            + dedent("""\
+                CODE_SIGN_IDENTITY = "-"
+                CODE_SIGNING_REQUIRED = "NO"
+                CODE_SIGNING_ALLOWED = "YES"
+                AD_HOC_CODE_SIGNING_ALLOWED = "YES"
+                DEVELOPMENT_TEAM = ""
+            """)
+        )
 
     toml_content = header + qml_block + sources_block + signing_block + build_settings_block
     _write_text(toml_path, toml_content)
