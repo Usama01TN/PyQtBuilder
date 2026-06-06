@@ -1,76 +1,86 @@
 name: build-pyside6-ios
 
-# Day 1: trigger manually from the Actions tab.
-# Day 5+: the same workflow gets triggered via repository_dispatch from Django,
-#         and the trailing steps can POST results back to your webhook.
+# Build a PySide6 app into a sideloadable iOS .ipa.
 #
-# iOS is fundamentally different from the Android pipeline:
-#   * It MUST run on macOS (Xcode / xcodebuild are macOS-only) and on Apple
-#     Silicon (the builder hard-asserts Darwin arm64 at preflight).
-#   * The expensive part — merging Qt's static libs into QtRuntime.framework and
-#     cross-compiling every PySide6 module to a static .a — is split into its own
-#     `prebuild-qt-ios` job and cached, so app rebuilds are fast.
-#   * There is intentionally NO Dockerfile: Apple does not allow building/signing
-#     iOS apps inside a Linux container, so a Docker image cannot help here.
+# Default target is the repo's own testapp/ (the attached example: a minimal
+# QtWidgets "Hello World"):
 #
-# Two artifacts are published (as requested):
-#   1. prebuilt-qt-ios-*  — the cross-compiled Qt/PySide6/Python pieces.
-#   2. ios-app-*          — the built, ad-hoc-signed .ipa (sideload-ready).
+#     testapp/main.py  ->  bridged to the iOS host  ->  .ipa in the Actions tab
+#
+# Override `project_url` to build ANY public .zip that has a main.py at its root
+# (same project layout the Android builders in this repo use). The iOS builder
+# auto-generates scripts/app.py (the bridge) and a QtWidgets main.mm; your
+# main.py is never modified.
+#
+# Why this is macOS-only and has NO Dockerfile:
+#   xcodebuild / xcrun are macOS-only, and Apple does not allow building or
+#   signing iOS apps inside a Linux container -- so a Docker image cannot help.
+#   The builder also hard-asserts Darwin arm64 at preflight.
+#
+# Two jobs:
+#   prebuild-qt-ios  the slow part -- merge Qt's static libs into
+#                    QtRuntime.framework and cross-compile every PySide6 module
+#                    to a static .a. Cached, so app rebuilds are fast.
+#   build-app        generate the Xcode project for the app and build the .ipa.
+#
+# Two artifacts:
+#   prebuilt-qt-ios-*  the cross-compiled Qt / PySide6 / Python pieces.
+#   ios-app-*          the built, ad-hoc-signed .ipa (sideload-ready).
+
 on:
   workflow_dispatch:
     inputs:
       project_url:
-        description: "Optional public URL to a project .zip containing main.py. Leave blank to build the repo's own testapp/ directory."
+        description: "Public URL to a project .zip with main.py at its root. Blank = build the repo's own testapp/."
         required: false
         default: ""
       ui_mode:
-        description: "UI toolkit of the app (testapp is widgets)"
+        description: "UI toolkit of the app (the testapp is widgets)."
         required: true
         default: "widgets"
         type: choice
         options: [widgets, qml]
       app_name:
-        description: "Human-readable app name (product/scheme name = this with spaces removed)"
+        description: "Human-readable app name (Xcode product/scheme = this with spaces removed)."
         required: false
         default: "Hello World"
       bundle_id:
-        description: "iOS bundle identifier"
+        description: "iOS bundle identifier."
         required: false
         default: "com.example.helloworld"
       build_id:
-        description: "Optional build ID for tracking (leave blank when running by hand)"
+        description: "Optional build ID for tracking (leave blank when running by hand)."
         required: false
         default: ""
 
-  # Wired up in Phase 2 — Django dispatches with these same inputs.
+  # Phase 2 -- Django dispatches with these same inputs via client_payload.*.
   repository_dispatch:
     types: [pyside6-ios-build]
 
 # Pin every job to the same versions and the same on-disk root. The generated
 # Xcode project and pyside6-ios.toml embed ABSOLUTE paths to the cross-compiled
-# libraries, so the prebuild job and the app job MUST agree on $ROOT_DIR — which
-# they do because both check out into the identical $GITHUB_WORKSPACE on the same
-# runner image.
+# libraries, so the prebuild job and the app job MUST agree on $ROOT_DIR -- which
+# they do, because both check out into the identical $GITHUB_WORKSPACE on the
+# same runner image.
 env:
   QT_VERSION: "6.8.3"
   PYSIDE_VERSION: "6.8.3"
   PY_VERSION: "3.13"
-  # Single source of truth for the build root (build/ + .venv live here).
+  # Single source of truth for the build root (build/ + .venv live under it).
   ROOT_DIR: ${{ github.workspace }}/build-root
-  # Bump this token to deliberately invalidate the prebuilt cache.
-  # v2: previous v1 caches were poisoned with glue-less PySide6 module archives
-  #     (built before the hand-written-glue fix), which an exact key hit kept
-  #     reusing.  Bumping forces a clean rebuild with the glue sources.
+  # Bump this to deliberately invalidate the prebuilt cache. The key also hashes
+  # the builder scripts, so a change to pyside6_ios_builder.py already forces a
+  # clean rebuild on its own -- this is only for manual cache busting.
   CACHE_VERSION: v2
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 1 — Cross-compile Qt + PySide6 + CPython for iOS device (arm64).
-  # This is the slow, expensive job (first run ~60–120 min). Everything it
-  # produces is cached under $ROOT_DIR/build so JOB 2 (and future runs) reuse it.
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ===========================================================================
+  # JOB 1 -- Cross-compile Qt + PySide6 + CPython for iOS device (arm64).
+  # The slow, expensive job (first run ~60-120 min). Everything it produces is
+  # cached under $ROOT_DIR/build so JOB 2 (and future runs) reuse it.
+  # ===========================================================================
   prebuild-qt-ios:
-    runs-on: macos-14          # Apple Silicon (arm64) — required by the builder.
+    runs-on: macos-14          # Apple Silicon (arm64) -- required by the builder.
     timeout-minutes: 150
 
     outputs:
@@ -82,7 +92,7 @@ jobs:
 
       - name: Select latest stable Xcode
         # pyside6-ios targets Xcode 16; latest-stable picks the newest Xcode on
-        # the image. xcodebuild/xcrun come from the selected toolchain.
+        # the image. xcodebuild / xcrun then come from the selected toolchain.
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
@@ -117,9 +127,10 @@ jobs:
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
           echo "Cache key: $KEY"
 
-      # Restore only.  The matching SAVE happens in a later step gated on
-      # success + a glue-presence check, so a FAILED or glue-less build is never
-      # written to the cache (which is exactly what poisoned v1 before).
+      # Restore only. The matching SAVE happens in a later step gated on success
+      # + a glue-presence check, so a FAILED or glue-less build is never written
+      # to the cache (an exact-key hit on a poisoned entry is what made earlier
+      # glue fixes silently ineffective).
       - name: Restore cross-compiled Qt/PySide6/Python + venv
         id: prebuilt-cache
         uses: actions/cache/restore@v4
@@ -133,11 +144,11 @@ jobs:
             p6ios-prebuilt-${{ env.CACHE_VERSION }}-${{ runner.os }}-
 
       - name: Bootstrap + cross-compile libraries
-        # Skip the heavy build ONLY on an *exact* cache hit.  The cache key embeds
-        # a hash of the builder scripts, so a mere prefix `restore-keys` match means
-        # the builder changed since that cache was saved => the builder-derived
+        # Skip the heavy build ONLY on an *exact* cache hit. The key embeds a hash
+        # of the builder scripts, so a mere prefix `restore-keys` match means the
+        # builder changed since that cache was saved => the builder-derived
         # libraries (PySide6 modules, shiboken/pyside support libs, generated
-        # wrappers) are STALE.  We delete just those (keeping the expensive Qt SDK,
+        # wrappers) are STALE. We delete just those (keeping the expensive Qt SDK,
         # Python.xcframework, QtRuntime.framework, pyside-setup sources, tool clone
         # and venv) and rebuild, so a fix in pyside6_ios_builder.py actually
         # propagates into the .a files instead of silently reusing the old ones.
@@ -148,49 +159,46 @@ jobs:
           TB="$ROOT_DIR/build/pyside6-ios-tool/build"
           SENTINEL="$TB/pyside6-ios-static/libPySide6_QtCore.a"
           if [ "$EXACT_HIT" = "true" ] && [ -f "$SENTINEL" ]; then
-            echo "✓ Exact cache hit — prebuilt matches the current builder; skipping heavy build."
+            echo "Exact cache hit -- prebuilt matches the current builder; skipping heavy build."
           else
             if [ -d "$TB" ]; then
-              echo "→ Non-exact cache restore (builder changed) — clearing ALL builder-derived"
-              echo "  outputs under the tool build dir so the current builder rebuilds them"
-              echo "  (QtRuntime, shiboken/pyside support libs, generated wrappers, module .a)."
-              echo "  Keeping the expensive cloned pyside-setup sources and Python.xcframework"
-              echo "  (the Qt SDK, tool clone and venv live outside this dir and are kept too)."
+              echo "Non-exact cache restore (builder changed) -- clearing builder-derived"
+              echo "outputs under the tool build dir so the current builder rebuilds them"
+              echo "(QtRuntime, shiboken/pyside support libs, generated wrappers, module .a)."
+              echo "Keeping the cloned pyside-setup sources and Python.xcframework."
               find "$TB" -mindepth 1 -maxdepth 1 \
                    ! -name pyside-setup ! -name python -exec rm -rf {} +
             fi
-            echo "→ Running bootstrap + library build."
-            python pyside6_ios_builder.py --bootstrap  --root "$ROOT_DIR" --debug
-            python pyside6_ios_builder.py --build-all   --root "$ROOT_DIR" --debug
+            echo "Running bootstrap + library build."
+            python pyside6_ios_builder.py --bootstrap --root "$ROOT_DIR" --debug
+            python pyside6_ios_builder.py --build-all  --root "$ROOT_DIR" --debug
           fi
 
       - name: Verify prebuilt outputs
-        # Fail loudly here (rather than deep inside JOB 2) if a build stage
-        # silently produced nothing.
+        # Fail loudly here (rather than deep inside JOB 2) if a stage silently
+        # produced nothing or produced glue-less module archives.
         run: |
           set -euo pipefail
-          # All tool outputs live under the cloned tool's build dir (the builder
-          # re-roots everything there so the upstream scripts' relative paths work).
           B="$ROOT_DIR/build/pyside6-ios-tool/build"
           echo "Contents of $B:"; ls -la "$B" || true
-          test -d "$B/QtRuntime.framework"              || { echo "::error::QtRuntime.framework missing"; exit 1; }
-          test -d "$B/pyside6-ios-static"               || { echo "::error::pyside6-ios-static missing"; exit 1; }
-          test -d "$B/python/Python.xcframework"        || { echo "::error::Python.xcframework missing"; exit 1; }
+          test -d "$B/QtRuntime.framework"       || { echo "::error::QtRuntime.framework missing"; exit 1; }
+          test -d "$B/pyside6-ios-static"        || { echo "::error::pyside6-ios-static missing"; exit 1; }
+          test -d "$B/python/Python.xcframework" || { echo "::error::Python.xcframework missing"; exit 1; }
           COUNT=$(ls -1 "$B/pyside6-ios-static"/libPySide6_*.a 2>/dev/null | wc -l | tr -d ' ')
           echo "Cross-compiled PySide6 module archives: $COUNT"
           [ "$COUNT" -ge 1 ] || { echo "::error::no libPySide6_*.a produced"; exit 1; }
           ls -la "$B/pyside6-ios-static"
           # Confirm the modules actually contain the hand-written glue, else the
-          # app link fails (undefined QtCoreHelper::*, PySideEasingCurveFunctor).
-          # Grep a temp file rather than `nm | grep -q`: grep -q closes the pipe on
-          # the first match, nm then dies with SIGPIPE, and `set -o pipefail` would
-          # turn a SUCCESSFUL match into a false "absent" failure (broken pipe).
+          # app link fails (undefined QtCoreHelper::*, PySideEasingCurveFunctor,
+          # QPyTextObject). Grep a temp file rather than `nm | grep -q`: grep -q
+          # closes the pipe on the first match, nm then dies with SIGPIPE, and
+          # `set -o pipefail` would turn a SUCCESSFUL match into a false failure.
           NM_OUT="$(mktemp)"
           QTCORE_A="$B/pyside6-ios-static/libPySide6_QtCore.a"
           nm "$QTCORE_A" > "$NM_OUT" 2>/dev/null || true
           if ! grep -q "EasingCurveFunctor" "$NM_OUT"; then
             echo "::error::libPySide6_QtCore.a lacks hand-written glue (PySideEasingCurveFunctor absent)."
-            echo "          The per-module glue patch did not take effect — refusing to cache a broken build."
+            echo "          The per-module glue patch did not take effect -- refusing to cache a broken build."
             exit 1
           fi
           QTGUI_A="$B/pyside6-ios-static/libPySide6_QtGui.a"
@@ -202,13 +210,12 @@ jobs:
             fi
           fi
           rm -f "$NM_OUT"
-          echo "✓ Module glue symbols present (QtCore: EasingCurveFunctor, QtGui: QPyTextObject)."
+          echo "Module glue symbols present (QtCore: EasingCurveFunctor, QtGui: QPyTextObject)."
 
       - name: Save prebuilt cache (success + glue verified only)
         # Split save (not the combined cache action) so a FAILED or glue-less
-        # build is NEVER written to the cache — that exact-key poisoning is what
-        # made earlier glue fixes silently ineffective.  Runs only if every prior
-        # step (including the glue check above) succeeded.
+        # build is NEVER written to the cache. Runs only if every prior step
+        # (including the glue check above) succeeded.
         if: success()
         uses: actions/cache/save@v4
         with:
@@ -219,7 +226,7 @@ jobs:
 
       - name: Package prebuilt Qt iOS artifact
         # tar (bsdtar on macOS) preserves the framework symlinks. We ship the
-        # genuinely expensive, non-trivially-reproducible pieces — NOT the raw Qt
+        # genuinely expensive, non-trivially-reproducible pieces -- NOT the raw Qt
         # SDK (that is just an aqt download).
         run: |
           set -euo pipefail
@@ -241,10 +248,10 @@ jobs:
           path: ${{ github.workspace }}/prebuilt-qt-ios.tar.gz
           retention-days: 7
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 2 — Generate the Xcode project for the user app and build the .ipa.
+  # ===========================================================================
+  # JOB 2 -- Generate the Xcode project for the app and build the .ipa.
   # Reuses JOB 1's cache; fast because the libraries already exist.
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ===========================================================================
   build-app:
     needs: prebuild-qt-ios
     runs-on: macos-14
@@ -297,16 +304,16 @@ jobs:
             p6ios-prebuilt-${{ env.CACHE_VERSION }}-${{ runner.os }}-
 
       - name: Self-heal if cache missed
-        # Robustness: if for any reason the libraries are absent (e.g. the cache
-        # entry was evicted), rebuild them rather than failing the app build.
+        # Robustness: if the libraries are absent (e.g. the cache entry was
+        # evicted), rebuild them rather than failing the app build.
         run: |
           set -euo pipefail
           if [ ! -f "$ROOT_DIR/build/pyside6-ios-tool/build/pyside6-ios-static/libPySide6_QtCore.a" ]; then
-            echo "::warning::Prebuilt libraries not found in cache — rebuilding (slow)."
+            echo "::warning::Prebuilt libraries not found in cache -- rebuilding (slow)."
             python pyside6_ios_builder.py --bootstrap --root "$ROOT_DIR" --debug
             python pyside6_ios_builder.py --build-all  --root "$ROOT_DIR" --debug
           else
-            echo "✓ Prebuilt libraries restored from cache."
+            echo "Prebuilt libraries restored from cache."
           fi
 
       - name: Resolve app project (main.py at its root)
@@ -322,9 +329,8 @@ jobs:
             echo "No project_url provided -- building the repo's own testapp/ directory."
             SEARCH_ROOT="$GITHUB_WORKSPACE/testapp"
           fi
-          # Locate the project root = the SHALLOWEST directory containing main.py.
-          # This is exactly the contract the Android builders use (a main.py at the
-          # project root). The iOS builder then auto-generates scripts/app.py.
+          # Project root = the SHALLOWEST directory containing main.py. This is the
+          # same contract the Android builders use (a main.py at the project root).
           HIT="$(find "$SEARCH_ROOT" -maxdepth 6 -type f -name main.py \
                   | awk -F/ '{print NF, $0}' | sort -n | head -1 | cut -d' ' -f2-)"
           if [ -z "$HIT" ]; then
@@ -337,9 +343,10 @@ jobs:
           ls -la "$APP_DIR"
 
       - name: Generate Xcode project
-        # --generate-only writes pyside6-ios.toml (kebab-case schema), a widgets
-        # main.mm when needed (QML lets the CLI emit its own), runs the pyside6-ios
-        # CLI `generate`, and produces <APP_DIR>/generated/<Product>.xcodeproj.
+        # --generate-only writes pyside6-ios.toml (kebab-case schema), the iOS
+        # bridge scripts/app.py, a widgets main.mm when needed (QML lets the CLI
+        # emit its own), then runs the pyside6-ios CLI `generate` to produce
+        # <APP_DIR>/generated/<Product>.xcodeproj.
         run: |
           set -euo pipefail
           python pyside6_ios_builder.py --generate-only \
@@ -354,17 +361,23 @@ jobs:
 
       - name: Build .app with xcodebuild (ad-hoc signed)
         # Device (iphoneos) build. We force ad-hoc signing on the command line so
-        # it works with no Apple Developer account. NOTE: we use CODE_SIGN_IDENTITY=-
+        # it works with no Apple Developer account. NOTE: CODE_SIGN_IDENTITY=-
         # (NOT CODE_SIGNING_ALLOWED=NO) because the generated project's run-script
-        # phases codesign each bundled .so with $EXPANDED_CODE_SIGN_IDENTITY — which
-        # is empty under CODE_SIGNING_ALLOWED=NO but resolves to "-" under ad-hoc.
+        # phases codesign each bundled .so with $EXPANDED_CODE_SIGN_IDENTITY --
+        # empty under CODE_SIGNING_ALLOWED=NO but "-" under ad-hoc.
         id: xcb
         run: |
           set -euo pipefail
-          PRODUCT_NAME="$(echo "$APP_NAME" | tr -d ' ')"
-          PROJ="$APP_DIR/generated/${PRODUCT_NAME}.xcodeproj"
-          DERIVED="$APP_DIR/generated/DerivedData"
-          echo "Project: $PROJ  Scheme: $PRODUCT_NAME"
+          GENERATED="$APP_DIR/generated"
+          # Discover the .xcodeproj and scheme rather than assuming a name -- this
+          # is robust to app names that contain spaces (e.g. "Hello World").
+          PROJ="$(find "$GENERATED" -maxdepth 1 -name '*.xcodeproj' | head -1)"
+          test -n "$PROJ" || { echo "::error::no .xcodeproj under $GENERATED"; exit 1; }
+          SCHEME="$(xcodebuild -project "$PROJ" -list -json \
+                      | python3 -c 'import json,sys; print(json.load(sys.stdin)["project"]["schemes"][0])')"
+          DERIVED="$GENERATED/DerivedData"
+          echo "Project: $PROJ"
+          echo "Scheme:  $SCHEME"
 
           SIGN_ARGS=(
             CODE_SIGN_IDENTITY=-
@@ -376,7 +389,7 @@ jobs:
 
           xcodebuild \
             -project "$PROJ" \
-            -scheme "$PRODUCT_NAME" \
+            -scheme "$SCHEME" \
             -configuration "$CONFIGURATION" \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$DERIVED" \
@@ -384,8 +397,8 @@ jobs:
             build
 
           # Resolve the real product path from build settings (robust against
-          # path layout changes).
-          SETTINGS="$(xcodebuild -project "$PROJ" -scheme "$PRODUCT_NAME" \
+          # path-layout changes).
+          SETTINGS="$(xcodebuild -project "$PROJ" -scheme "$SCHEME" \
                         -configuration "$CONFIGURATION" \
                         -destination 'generic/platform=iOS' \
                         -derivedDataPath "$DERIVED" \
@@ -396,34 +409,34 @@ jobs:
           echo "Built app: $APP_PATH"
           test -d "$APP_PATH" || { echo "::error::.app not found at $APP_PATH"; exit 1; }
           echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
-          echo "product_name=$PRODUCT_NAME" >> "$GITHUB_OUTPUT"
+          # Sanitised name for the .ipa filename (no spaces).
+          echo "ipa_name=$(echo "$APP_NAME" | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Package .ipa
-        # Standard Payload/<App>.app → .ipa layout for sideloading (AltStore,
+        # Standard Payload/<App>.app -> .ipa layout for sideloading (AltStore,
         # Sideloadly, etc., which re-sign with the user's own certificate).
         id: ipa
         run: |
           set -euo pipefail
           APP_PATH="${{ steps.xcb.outputs.app_path }}"
-          PRODUCT_NAME="${{ steps.xcb.outputs.product_name }}"
+          IPA_NAME="${{ steps.xcb.outputs.ipa_name }}"
           STAGE="$RUNNER_TEMP/ipa-stage"
           rm -rf "$STAGE" && mkdir -p "$STAGE/Payload"
           cp -R "$APP_PATH" "$STAGE/Payload/"
-          OUT="$GITHUB_WORKSPACE/${PRODUCT_NAME}.ipa"
+          OUT="$GITHUB_WORKSPACE/${IPA_NAME}.ipa"
           ( cd "$STAGE" && zip -qr "$OUT" Payload )
           echo "ipa_path=$OUT" >> "$GITHUB_OUTPUT"
           ls -lah "$OUT"
 
       - name: Sanity-check the .ipa
-        # Confirm the binary actually links the PySide6 static modules and that
-        # the Python stdlib + app scripts made it into the bundle.
+        # Confirm the Python stdlib + the app entry script made it into the bundle.
         run: |
           set -euo pipefail
           echo "Top-level bundle contents:"
           unzip -l "${{ steps.ipa.outputs.ipa_path }}" | grep -E 'Payload/[^/]+\.app/' | head -40 || true
           echo "App entry script present?"
           unzip -l "${{ steps.ipa.outputs.ipa_path }}" | grep -q 'scripts/app.py' \
-            && echo "✓ scripts/app.py bundled" \
+            && echo "scripts/app.py bundled" \
             || echo "::warning::scripts/app.py not found in bundle"
 
       - name: Upload iOS app artifact (download from the Actions tab)
@@ -433,10 +446,10 @@ jobs:
           path: ${{ steps.ipa.outputs.ipa_path }}
           retention-days: 7
 
-      # ──────────────────────────────────────────────────────────────────────
+      # ----------------------------------------------------------------------
       # Phase 2 hooks: uncomment once Django + R2 + webhook are wired up.
-      # Day 1 stops at "ipa in the artifacts tab" — that's enough.
-      # ──────────────────────────────────────────────────────────────────────
+      # Day 1 stops at "ipa in the artifacts tab" -- that's enough.
+      # ----------------------------------------------------------------------
       # - name: Upload IPA to R2 (Phase 2)
       #   if: env.BUILD_ID != ''
       #   run: |
