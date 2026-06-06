@@ -1249,12 +1249,18 @@ for _p in (_HERE, os.path.dirname(_HERE), os.path.join(os.path.dirname(_HERE), "
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui
+# QtWidgets is only linked for widgets apps; a QML-only app does not include it,
+# so import it defensively -- this shim must work unchanged in both UI modes.
+try:
+    from PySide6 import QtWidgets
+except Exception:
+    QtWidgets = None
 
 # Capture the real classes before we shadow the constructors in their modules.
 _RealQCoreApplication = QtCore.QCoreApplication
 _RealQGuiApplication = QtGui.QGuiApplication
-_RealQApplication = QtWidgets.QApplication
+_RealQApplication = QtWidgets.QApplication if QtWidgets is not None else None
 
 # Objects that must outlive main() (widgets, QML engines, windows).  Holding a
 # Python reference here stops PySide6 from deleting the underlying C++ object
@@ -1264,17 +1270,18 @@ _KEEP_ALIVE = []
 
 def _present_top_level():
     """Retain and full-screen every top-level widget; retain top-level windows."""
-    try:
-        for w in list(_RealQApplication.topLevelWidgets()):
-            if w not in _KEEP_ALIVE:
-                _KEEP_ALIVE.append(w)
-            try:
-                if w.isWindow():
-                    w.showFullScreen()
-            except Exception as exc:
-                _log("  present widget failed: %r" % (exc,))
-    except Exception as exc:
-        _log("  topLevelWidgets() unavailable: %r" % (exc,))
+    if _RealQApplication is not None:
+        try:
+            for w in list(_RealQApplication.topLevelWidgets()):
+                if w not in _KEEP_ALIVE:
+                    _KEEP_ALIVE.append(w)
+                try:
+                    if w.isWindow():
+                        w.showFullScreen()
+                except Exception as exc:
+                    _log("  present widget failed: %r" % (exc,))
+        except Exception as exc:
+            _log("  topLevelWidgets() unavailable: %r" % (exc,))
     try:
         for win in list(_RealQGuiApplication.topLevelWindows()):
             if win not in _KEEP_ALIVE:
@@ -1352,7 +1359,8 @@ class _AppClassProxy(object):
 # Shadow the constructors in their home modules so that
 # `from PySide6.QtWidgets import QApplication` (run when main.py is imported)
 # resolves to the proxy.
-QtWidgets.QApplication = _AppClassProxy(_RealQApplication)
+if QtWidgets is not None:
+    QtWidgets.QApplication = _AppClassProxy(_RealQApplication)
 QtGui.QGuiApplication = _AppClassProxy(_RealQGuiApplication)
 QtCore.QCoreApplication = _AppClassProxy(_RealQCoreApplication)
 
