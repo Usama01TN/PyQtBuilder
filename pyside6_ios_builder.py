@@ -753,6 +753,72 @@ def globalize_qt_symbols(ctx):
 # ---------------------------------------------------------------------------
 
 
+_QTRUNTIME_EXPORT_SENTINEL = 'pyside6_ios_builder: metatype export filter'
+
+
+def patch_qtruntime_build_script(ctx):
+    """
+    Patch the cloned ``build_qtruntime.sh`` so the QtRuntime dylib does NOT
+    export Qt's coalesced metatype-interface const-data symbols
+    (``QtPrivate::QMetaTypeInterfaceWrapper<T>::metaType``).
+
+    Upstream builds the dylib's export list from *every* global symbol in the Qt
+    static archives (``nm -gU``).  That re-exports the
+    ``QMetaTypeInterfaceWrapper<T>::metaType`` objects, which are inline-variable
+    / template instantiations: every consuming translation unit (the PySide6
+    module wrappers, libpyside, ...) already emits its OWN copy and addresses it
+    *directly* (ADRP/ADD).  When the dylib also exports them, the linker binds
+    those direct references to the dylib's copy instead -- a direct ADRP/ADD
+    relocation that now crosses an image boundary, which arm64 forbids:
+
+        ld: invalid use of ADRP/imm12 in 'QMetaTypeId<QList<int>>::qt_metatype_id()'
+            to 'QtPrivate::QMetaTypeInterfaceWrapper<int>::metaType'
+
+    This is why ``-fno-direct-access-external-data`` on the consumers does not
+    help: the symbol is a *local* (weak) definition in each consumer, not an
+    external reference, so the flag has nothing to redirect to the GOT.
+
+    Dropping these symbols from the export list makes each consumer resolve them
+    to its own in-image copy, so direct addressing is valid again.  Nothing goes
+    undefined -- every consumer already has its own copy (proven by the fact that
+    the compiler emitted *direct* addressing for them) -- and Qt's QMetaType
+    registry deduplicates the per-image QMetaTypeInterface instances by type id,
+    so this behaves exactly like a normal static Qt link (where the same symbols
+    live in the single app image).  Idempotent via a sentinel comment.
+
+    :param ctx: BuildContext
+    :return: None
+    """
+    script = join(ctx.tool_dir, 'scripts', 'build_qtruntime.sh')
+    if not exists(script):
+        raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
+    with open(script, 'r', encoding='utf-8') as fh:
+        text = fh.read()
+    if _QTRUNTIME_EXPORT_SENTINEL in text:
+        log.info('  build_qtruntime.sh already patched for metatype export filtering.')
+        return
+    anchor = 'done | sort -u > "$EXPORT_LIST"\n'
+    if anchor not in text:
+        raise BuildError(
+            'Could not find the export-list anchor in build_qtruntime.sh; '
+            'upstream layout may have changed.')
+    replacement = (
+        '# >>> ' + _QTRUNTIME_EXPORT_SENTINEL + ' >>>\n'
+        '# Do NOT export Qt\'s coalesced QMetaTypeInterfaceWrapper<T>::metaType\n'
+        '# const-data objects from this dylib.  Each consumer (PySide6 module\n'
+        '# wrappers, libpyside) emits its own copy and addresses it directly;\n'
+        '# re-exporting them here makes those direct ADRP/ADD refs cross an image\n'
+        '# boundary at app-link ("invalid use of ADRP/imm12 ... ::metaType").\n'
+        '# Filtering them out lets each consumer bind to its own in-image copy.\n'
+        'done | sort -u | grep -v "QMetaTypeInterfaceWrapper" > "$EXPORT_LIST"\n'
+        '# <<< ' + _QTRUNTIME_EXPORT_SENTINEL + ' <<<\n'
+    )
+    text = text.replace(anchor, replacement, 1)
+    _write_text(script, text)
+    log.info('  Patched build_qtruntime.sh: dropped metatype-wrapper symbols '
+             'from the dylib export list.')
+
+
 def build_qtruntime(ctx):
     """
     Merge all Qt static libs for iOS into a single dynamic framework
@@ -769,6 +835,11 @@ def build_qtruntime(ctx):
     script = join(ctx.tool_dir, 'scripts', 'build_qtruntime.sh')
     if not exists(script):
         raise BuildError('build_qtruntime.sh not found at: {}'.format(script))
+    # QtRuntime is a dylib; stop it from re-exporting Qt's coalesced metatype
+    # const-data symbols, or the *app* link fails with "invalid use of
+    # ADRP/imm12 ... QMetaTypeInterfaceWrapper<T>::metaType" (see the function
+    # docstring for the full mechanism).
+    patch_qtruntime_build_script(ctx)
     log.info('  This merges all Qt static libs -- ~5 min first run.')
     # Upstream script writes to ``build/QtRuntime.framework`` relative to its CWD
     # and runs ``uv run python scripts/globalize_symbols.py`` (relative path), so
